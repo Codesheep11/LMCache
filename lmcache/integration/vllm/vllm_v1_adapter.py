@@ -706,14 +706,14 @@ class LMCacheConnectorV1Impl:
             store_mask = torch.ones_like(token_ids, dtype=torch.bool)
             store_mask[:skip_leading_tokens] = False
 
-            logger.info(
-                "Storing KV cache for %d out of %d tokens "
-                "(skip_leading_tokens=%d) for request %s",
-                len(token_ids) - skip_leading_tokens,
-                len(token_ids),
-                skip_leading_tokens,
-                request.req_id,
-            )
+            # logger.info(
+            #     "Storing KV cache for %d out of %d tokens "
+            #     "(skip_leading_tokens=%d) for request %s",
+            #     len(token_ids) - skip_leading_tokens,
+            #     len(token_ids),
+            #     skip_leading_tokens,
+            #     request.req_id,
+            # )
 
             is_last_prefill = request.is_last_prefill
             if is_last_prefill:
@@ -800,13 +800,13 @@ class LMCacheConnectorV1Impl:
         if num_external_hit_tokens == request.num_tokens:
             need_to_allocate -= 1
 
-        logger.info(
-            "Reqid: %s, Total tokens %d, LMCache hit tokens: %d, need to load: %d",
-            request.request_id,
-            request.num_tokens,
-            num_external_hit_tokens,
-            need_to_allocate,
-        )
+        # logger.info(
+        #     "Reqid: %s, Total tokens %d, LMCache hit tokens: %d, need to load: %d",
+        #     request.request_id,
+        #     request.num_tokens,
+        #     num_external_hit_tokens,
+        #     need_to_allocate,
+        # )
 
         self.load_specs[request.request_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,

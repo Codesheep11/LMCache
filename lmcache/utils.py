@@ -41,6 +41,26 @@ class DiskCacheMetadata:
     def is_pinned(self) -> bool:
         return self.pin_count > 0
 
+@dataclass
+class SpdkBlobMetadata:
+    blob_handle: int
+    size: int  # in bytes
+    shape: Optional[torch.Size] = None
+    dtype: Optional[torch.dtype] = None
+    fmt: MemoryFormat = None
+    is_pin: bool = False
+    
+    def pin(self) -> bool:
+        self.is_pin = True
+        return True
+    
+    def unpin(self) -> bool:
+        self.is_pin = False
+        return True
+    
+    @property
+    def is_pinned(self) -> bool:
+        return self.is_pin
 
 TORCH_DTYPE_TO_STR_DTYPE = {
     torch.half: "half",

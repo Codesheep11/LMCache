@@ -12,6 +12,7 @@ import threading
 # Third Party
 import sortedcontainers
 import torch
+import spdk_controller as spdk
 
 # First Party
 from lmcache.logging import init_logger
@@ -1365,35 +1366,39 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
               (2) byte_array buffer memory.
     """
 
-    def __init__(self, size: int, use_paging: bool = False, **kwargs):
+    def __init__(self, size: int, use_paging: bool = False, use_dma: bool = False, **kwargs):
         """
         :param int size: The size of the pinned memory in bytes.
         """
-
-        self.buffer = torch.empty(size, dtype=torch.uint8)
-        ptr = self.buffer.data_ptr()
-        err = torch.cuda.cudart().cudaHostRegister(ptr, size, 0)
-        assert err == 0, (
-            f"cudaHostRegister failed: {torch.cuda.cudart().cudaGetErrorString(err)}"
-        )
-        self._unregistered = False
-
-        if use_paging:
-            assert "shape" in kwargs, (
-                "shape must be specified for paged memory allocator"
-            )
-            assert "dtype" in kwargs, (
-                "dtype must be specified for paged memory allocator"
-            )
-            assert "fmt" in kwargs, "fmt must be specified for paged memory allocator"
-            self.pin_allocator = PagedTensorMemoryAllocator(
-                tensor=self.buffer,
-                shape=kwargs["shape"],
-                dtype=kwargs["dtype"],
-                fmt=kwargs["fmt"],
-            )
+        if use_dma:
+            mem_view, ptr = spdk.alloc_io_buffer_view(size)
+            self.buffer = torch.frombuffer(mem_view, dtype=torch.uint8).pin_memory().flatten()
+            self.pin_allocator = SpdkDmaAllocator(self.buffer, ptr)
         else:
-            self.pin_allocator = TensorMemoryAllocator(self.buffer)
+            self.buffer = torch.empty(size, dtype=torch.uint8)
+            ptr = self.buffer.data_ptr()
+            err = torch.cuda.cudart().cudaHostRegister(ptr, size, 0)
+            assert err == 0, (
+                f"cudaHostRegister failed: {torch.cuda.cudart().cudaGetErrorString(err)}"
+            )
+            self._unregistered = False
+
+            if use_paging:
+                assert "shape" in kwargs, (
+                    "shape must be specified for paged memory allocator"
+                )
+                assert "dtype" in kwargs, (
+                    "dtype must be specified for paged memory allocator"
+                )
+                assert "fmt" in kwargs, "fmt must be specified for paged memory allocator"
+                self.pin_allocator = PagedTensorMemoryAllocator(
+                    tensor=self.buffer,
+                    shape=kwargs["shape"],
+                    dtype=kwargs["dtype"],
+                    fmt=kwargs["fmt"],
+                )
+            else:
+                self.pin_allocator = TensorMemoryAllocator(self.buffer)
 
         self.host_mem_lock = threading.Lock() if not use_paging else nullcontext()
 
@@ -1491,6 +1496,9 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             torch.cuda.synchronize()
             torch.cuda.cudart().cudaHostUnregister(self.buffer.data_ptr())
             self._unregistered = True
+        if self.buffer_ptr is not None:
+            spdk.free_io_buffer_view(self.buffer_ptr)
+            self.buffer_ptr = None
 
 
 class GPUMemoryAllocator(MemoryAllocatorInterface):
@@ -1751,3 +1759,337 @@ class NixlCPUMemoryAllocator(MemoryAllocatorInterface):
             self.cpu_allocator.batched_free(memory_objs, update_stats=update_stats)
         else:
             raise ValueError(f"Unsupported allocator type: {allocator_type}")
+
+class SpdkDmaAllocator(MemoryAllocatorInterface):
+    """
+    Implements a "explicit list" memory allocator.
+    """
+
+    ALIGN_BYTES = 512
+
+    def __init__(self, tensor: torch.Tensor, base_ptr: int, align_bytes: int = ALIGN_BYTES):
+        self.buffer = tensor.view(torch.uint8).flatten()
+        self.align_bytes = align_bytes
+        self.buffer_ptr = base_ptr
+
+        self.explicit_list = sortedcontainers.SortedList(key=lambda x: x.start)
+
+        self.explicit_list.add(FreeBlock(start=0, size=self.buffer.numel()))
+
+        # For debugging purposes
+        self.num_active_allocations = 0
+        self.total_allocated_size = 0
+
+        self.stats_monitor = LMCStatsMonitor.GetOrCreate()
+
+    @staticmethod
+    @_lmcache_nvtx_annotate
+    def _Compute_raw_size(shape: torch.Size, dtype: torch.dtype) -> int:
+        return shape.numel() * dtype.itemsize
+
+    @staticmethod
+    @_lmcache_nvtx_annotate
+    def _Compute_aligned_size(raw_size: int, align: int) -> int:
+        return (raw_size + align - 1) & ~(align - 1)
+
+    @_lmcache_nvtx_annotate
+    def _coalesce(
+        self,
+        curr_block: FreeBlock,
+        prev_block: Optional[FreeBlock],
+        succ_block: Optional[FreeBlock],
+    ):
+        """
+        Coalesces the current block with the previous and/or successor block.
+        This assumes the curr_block is NOT in self.explicit_list
+
+        Returns True if the current block was coalesced, otherwise False.
+        """
+        if prev_block is not None and prev_block.can_be_coalesced(curr_block):
+            merge_prev = True
+        else:
+            merge_prev = False
+
+        if succ_block is not None and curr_block.can_be_coalesced(succ_block):
+            merge_succ = True
+        else:
+            merge_succ = False
+
+        if merge_prev and merge_succ:
+            prev_block.size += curr_block.size + succ_block.size  # type: ignore
+            self.explicit_list.remove(succ_block)
+        elif merge_prev:
+            prev_block.size += curr_block.size  # type: ignore
+        elif merge_succ:
+            # NOTE: logically, this won't change the order of the succ_block,
+            #       so we don't need to do a "remove" and "reinsert" here
+            self.explicit_list.remove(succ_block)
+            succ_block.start -= curr_block.size  # type: ignore
+            succ_block.size += curr_block.size  # type: ignore
+            self.explicit_list.add(succ_block)
+
+        return merge_prev or merge_succ
+
+    @_lmcache_nvtx_annotate
+    def allocate(
+        self,
+        shape: Union[torch.Size, Tuple[int, ...]],
+        dtype: Optional[torch.dtype],
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        parent_allocator: Optional["MemoryAllocatorInterface"] = None,
+    ) -> Optional[TensorMemoryObj]:
+        if not isinstance(shape, torch.Size):
+            shape = torch.Size(shape)
+
+        assert dtype is not None, "dtype must be specified"
+        # Calculate the size of the tensor
+        raw_size = TensorMemoryAllocator._Compute_raw_size(shape, dtype)
+        if raw_size % self.align_bytes != 0:
+            aligned_size = TensorMemoryAllocator._Compute_aligned_size(
+                raw_size, self.align_bytes
+            )
+        else:
+            aligned_size = raw_size
+
+        # Find the first block that fits the shape
+        for block in self.explicit_list:
+            if block.size >= aligned_size:
+                break
+        else:
+            logger.warning(
+                f"Failed to allocate memory for "
+                f"tensor({shape}, {dtype}) because "
+                "no memory is available"
+            )
+            return None
+
+        # Do not add the block back if `block.size == aligned_size`
+        self.explicit_list.remove(block)
+        # Update the explicit list
+        if block.size > aligned_size:
+            self.explicit_list.add(
+                FreeBlock(
+                    start=block.start + aligned_size,
+                    size=block.size - aligned_size,
+                )
+            )
+
+        # TODO (Jiayi): need a flag to drop these debug ops
+        # Update debug status
+        self.total_allocated_size += aligned_size
+        self.num_active_allocations += 1
+        self.stats_monitor.update_local_cache_usage(self.total_allocated_size)
+                
+        # Allocate the block
+         
+        mem_obj = TensorMemoryObj(
+            raw_data=self.buffer[block.start : block.start + raw_size],
+            metadata=MemoryObjMetadata(
+                shape, dtype, self.buffer_ptr + block.start, aligned_size, 1, False, fmt
+            ),
+            parent_allocator=parent_allocator,
+        )
+        # logger.info(f"Allocated memory with size {mem_obj.meta.phy_size/(1024 * 1024)}MiB")
+        return mem_obj
+
+    @_lmcache_nvtx_annotate
+    def batched_allocate(
+        self,
+        shape: Union[torch.Size, Tuple[int, ...]],
+        dtype: Optional[torch.dtype],
+        batch_size: int,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        parent_allocator: Optional["MemoryAllocatorInterface"] = None,
+    ) -> Optional[List[TensorMemoryObj]]:
+        """
+        Batched allocate tensor memory objs with equal sizes.
+        """
+        if not isinstance(shape, torch.Size):
+            shape = torch.Size(shape)
+
+        assert dtype is not None, "dtype must be specified"
+
+        # Calculate the size of the tensor
+        unit_raw_size = TensorMemoryAllocator._Compute_raw_size(shape, dtype)
+
+        if unit_raw_size % self.align_bytes != 0:
+            unit_aligned_size = TensorMemoryAllocator._Compute_aligned_size(
+                unit_raw_size, self.align_bytes
+            )
+        else:
+            unit_aligned_size = unit_raw_size
+
+        total_aligned_size = unit_aligned_size * batch_size
+
+        # Find the first block that fits the shape
+        for block in self.explicit_list:
+            if block.size >= total_aligned_size:
+                break
+        else:
+            logger.debug(
+                f"Failed to batched allocate memory for "
+                f"{batch_size} tensor({shape}, {dtype}) because "
+                "no memory is available"
+            )
+            return None
+
+        # Do not add the block back if `block.size == aligned_size`
+        self.explicit_list.remove(block)
+        # Update the explicit list
+        if block.size > total_aligned_size:
+            self.explicit_list.add(
+                FreeBlock(
+                    start=block.start + total_aligned_size,
+                    size=block.size - total_aligned_size,
+                )
+            )
+
+        # TODO (Jiayi): need a flag to drop these debug ops
+        # Update debug status
+        self.total_allocated_size += total_aligned_size
+        self.num_active_allocations += batch_size
+        self.stats_monitor.update_local_cache_usage(self.total_allocated_size)
+
+        raw_datas = torch.chunk(
+            self.buffer[block.start : block.start + total_aligned_size],
+            batch_size,
+        )
+        tensor_mem_objs = []
+        temp_start = block.start
+        for raw_data in raw_datas:
+            tensor_mem_objs.append(
+                TensorMemoryObj(
+                    raw_data=raw_data,
+                    metadata=MemoryObjMetadata(
+                        shape, dtype, temp_start, unit_aligned_size, 1, False, fmt
+                    ),
+                    parent_allocator=parent_allocator,
+                )
+            )
+            temp_start += unit_aligned_size
+
+        return tensor_mem_objs
+
+    @_lmcache_nvtx_annotate
+    def free(self, memory_obj: MemoryObj):
+        # logger.info("freedom!")
+        if not memory_obj.is_valid():
+            return
+        
+        offset = memory_obj.meta.address - self.buffer_ptr
+        new_free_block = FreeBlock(
+            start=offset, size=memory_obj.meta.phy_size
+        )
+        index = self.explicit_list.bisect_right(new_free_block)
+        prev_block = self.explicit_list[index - 1] if index > 0 else None
+        succ_block = (
+            self.explicit_list[index] if index < len(self.explicit_list) else None
+        )
+
+        coalesced = self._coalesce(new_free_block, prev_block, succ_block)
+
+        if not coalesced:
+            self.explicit_list.add(new_free_block)
+        memory_obj.invalidate()
+
+        # TODO (Jiayi): need a flag to drop these debug ops
+        # Update debug status
+        self.total_allocated_size -= memory_obj.meta.phy_size
+        self.num_active_allocations = max(0, self.num_active_allocations - 1)
+        self.stats_monitor.update_local_cache_usage(self.total_allocated_size)
+
+    @_lmcache_nvtx_annotate
+    def batched_free(self, memory_objs: List[MemoryObj], update_stats: bool = True):
+        """
+        Batched free memory objs.
+        Unlike `batched_allocate`, this function does not
+        assume that the memory objs are equal-sized.
+        """
+
+        new_free_block = None
+        curr_start = memory_objs[0].meta.address - self.buffer_ptr
+        new_free_blocks = []
+        num_valid_blocks = 0
+        total_freed_size = 0
+        for memory_obj in memory_objs:
+            if not memory_obj.is_valid():
+                logger.warning("Trying to free an invalidated MemoryObj")
+                continue
+            num_valid_blocks += 1
+            memory_obj.invalidate()
+            total_freed_size += memory_obj.meta.phy_size
+            if new_free_block is None:
+                offset = memory_obj.meta.address - self.buffer_ptr
+                new_free_block = FreeBlock(
+                    start=offset, size=memory_obj.meta.phy_size
+                )
+                curr_start += memory_obj.meta.phy_size
+                continue
+
+            if curr_start == memory_obj.meta.address - self.buffer_ptr:
+                new_free_block.size += memory_obj.meta.phy_size
+                curr_start += memory_obj.meta.phy_size
+            else:
+                new_free_blocks.append(new_free_block)
+                offset = memory_obj.meta.address - self.buffer_ptr
+                new_free_block = FreeBlock(
+                    start=offset, size=memory_obj.meta.phy_size
+                )
+                curr_start = memory_obj.meta.address + memory_obj.meta.phy_size
+        new_free_blocks.append(new_free_block)
+
+        for new_free_block in new_free_blocks:
+            index = self.explicit_list.bisect_right(new_free_block)
+            prev_block = self.explicit_list[index - 1] if index > 0 else None
+            succ_block = (
+                self.explicit_list[index] if index < len(self.explicit_list) else None
+            )
+
+            coalesced = self._coalesce(new_free_block, prev_block, succ_block)
+
+            if not coalesced:
+                self.explicit_list.add(new_free_block)
+
+        if update_stats:
+            # TODO (Jiayi): need a flag to drop these debug ops
+            # Update debug status
+            self.total_allocated_size -= total_freed_size
+            self.num_active_allocations = max(
+                0, self.num_active_allocations - num_valid_blocks
+            )
+            self.stats_monitor.update_local_cache_usage(self.total_allocated_size)
+
+    def memcheck(self):
+        """For debug purposes.
+        Returns True is everything is fine, otherwise False.
+        """
+        clear = True
+        logger.info("Checking memory allocator consistency")
+        logger.info(f" - Total active allocations: {self.num_active_allocations}")
+        logger.info(
+            f" - Total allocated size: {self.total_allocated_size / 1048576} MB"
+        )
+
+        # Check the real total free size
+        total_free_size = sum([block.size for block in self.explicit_list])
+        logger.info(f" - Total free size: {total_free_size / 1048576} MB")
+
+        # Check if the numbers are consistent
+        if total_free_size + self.total_allocated_size != self.buffer.numel():
+            logger.error("Memory allocator size is inconsistent")
+            logger.error("This implies a bug in the memory allocator")
+            clear = False
+
+        # Check if the blocks are coalesced
+        for prev, succ in zip(
+            self.explicit_list[:-1], self.explicit_list[1:], strict=False
+        ):
+            if prev.can_be_coalesced(succ):
+                logger.error("Memory allocator has non-coalesced blocks")
+                logger.error("This implies a bug in the memory allocator")
+                clear = False
+        return clear
+
+    def __del__(self):
+        spdk.free_io_buffer(self.buffer_ptr)
+        # del self.buffer

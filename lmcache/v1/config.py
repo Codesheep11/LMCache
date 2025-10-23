@@ -8,7 +8,7 @@ import re
 
 # Third Party
 import yaml
-
+import spdk_controller as spdk
 # First Party
 from lmcache.logging import init_logger
 import lmcache.config as orig_config
@@ -119,6 +119,20 @@ class LMCacheEngineConfig:
     # Size of CuFile Buffer in MiB
     cufile_buffer_size: Optional[int] = None
 
+    # (Optional) SPDK params
+    # The name of the SPDK bdev to use
+    bdev_name: Optional[str] = None
+    # The path to the JSON config file for SPDK
+    json_config_file: Optional[str] = None
+    # The RPC address for SPDK
+    rpc_addr: Optional[str] = None
+    # The reactor mask for SPDK
+    reactor_mask: Optional[str] = None
+    # The main core for SPDK workers
+    main_core: Optional[int] = None
+    # The maximum size of the SPDK blobstore in GB
+    spdk_max_size: Optional[int] = None
+
     # The extra config
     extra_config: Optional[dict] = None
 
@@ -176,6 +190,12 @@ class LMCacheEngineConfig:
         weka_path: Optional[str] = None,
         gds_path: Optional[str] = None,
         cufile_buffer_size: Optional[int] = None,
+        bdev_name: Optional[str] = None,
+        json_config_file: Optional[str] = None,
+        reactor_mask: Optional[str] = None,
+        main_core: Optional[int] = None,
+        rpc_addr: Optional[str] = None,
+        spdk_max_size: Optional[int] = None,
         extra_config: Optional[dict] = None,
         save_unfull_chunk: bool = True,
         blocking_timeout_secs: int = 10,
@@ -222,6 +242,12 @@ class LMCacheEngineConfig:
             weka_path,
             gds_path,
             cufile_buffer_size,
+            bdev_name,
+            json_config_file,
+            reactor_mask,
+            main_core,
+            rpc_addr,
+            spdk_max_size,
             extra_config,
             save_unfull_chunk,
             blocking_timeout_secs,
@@ -370,9 +396,32 @@ class LMCacheEngineConfig:
         nixl_proxy_port = config.get("nixl_proxy_port", None)
 
         extra_config = config.get("extra_config", None)
+        
+        bdev_name = config.get("bdev_name", None)
+        json_config_file = config.get("json_config_file", None)
+        _mask = config.get("reactor_mask", None)
+        reactor_mask = hex(_mask) if _mask is not None else None
+        main_core = int(config.get("main_core", None))
+        rpc_addr = config.get("rpc_addr", None)
+        spdk_max_size = config.get("spdk_max_size", None)
+        
         if extra_config is not None:
             assert isinstance(extra_config, dict), "extra_config must be a dict"
-
+        
+        if bdev_name is not None:
+            spdk.init(bdev_name, 
+                     json_config_file,
+                     reactor_mask,
+                     main_core,
+                     rpc_addr)
+            logger.info(
+                f"SPDK Blobstore initialized with bdev: {bdev_name}, "
+                f"json_config_file: {json_config_file}, "
+                f"reactor_mask: {reactor_mask}, "
+                f"main_core: {main_core}, "
+                f"rpc_addr: {rpc_addr}, "
+                f"spdk_max_size: {spdk_max_size} GB"
+            )
         # Try getting "legacy" nixl config
         if nixl_receiver_host is None:
             nixl_receiver_host = config.get("nixl_peer_host", None)
@@ -453,6 +502,12 @@ class LMCacheEngineConfig:
                 weka_path,
                 gds_path,
                 cufile_buffer_size,
+                bdev_name,
+                json_config_file,
+                reactor_mask,
+                main_core,
+                rpc_addr,
+                spdk_max_size,
                 extra_config,
                 save_unfull_chunk,
                 blocking_timeout_secs,
@@ -756,6 +811,12 @@ class LMCacheEngineConfig:
             "extra_config": self.extra_config,
             "save_unfull_chunk": self.save_unfull_chunk,
             "blocking_timeout_secs": self.blocking_timeout_secs,
+            "bdev_name": self.bdev_name,
+            "json_config_file": self.json_config_file,
+            "reactor_mask": self.reactor_mask,
+            "main_core": self.main_core,
+            "rpc_addr": self.rpc_addr,
+            "spdk_max_size": self.spdk_max_size,
             "external_lookup_client": self.external_lookup_client,
         }
         logger.info(f"LMCache Configuration: {config_dict}")

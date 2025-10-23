@@ -858,6 +858,9 @@ class LMCacheEngine:
         if self.lmcache_worker is not None:
             self.lmcache_worker.close()
 
+        if self.config.bdev_name is not None:
+            self.memory_allocator.close()
+
         self.storage_manager.close()
 
         self.memory_allocator.close()
@@ -915,9 +918,17 @@ class LMCacheEngineBuilder:
             assert config.cufile_buffer_size is not None
             return CuFileMemoryAllocator(config.cufile_buffer_size * 1024**2)
 
+        if config.spdk_max_size and config.spdk_max_size > 0:
+            assert config.bdev_name is not None
+            assert config.reactor_mask is not None
+            assert config.rpc_addr is not None
+            assert config.main_core is not None
+            dma_size =  5 * 1024**3 # 5 GB
+            return MixedMemoryAllocator(dma_size, use_dma=True)
+        
         max_local_cpu_size = config.max_local_cpu_size
-        return MixedMemoryAllocator(int(max_local_cpu_size * 1024**3))
-
+        return MixedMemoryAllocator(int(max_local_cpu_size * 1024**3), use_dma=False)
+    
     @staticmethod
     def _Create_token_database(
         config: LMCacheEngineConfig,

@@ -19,6 +19,7 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
 from lmcache.v1.storage_backend.remote_backend import RemoteBackend
 from lmcache.v1.storage_backend.weka_gds_backend import WekaGdsBackend
+from lmcache.v1.storage_backend.spdk_backend import SpdkBlobBackend
 
 if TYPE_CHECKING:
     # First Party
@@ -86,6 +87,18 @@ def CreateStorageBackends(
 
         backend_name = str(local_disk_backend)
         storage_backends[backend_name] = local_disk_backend
+
+    if config.bdev_name is not None and config.spdk_max_size > 0:
+        spdk_backend = SpdkBlobBackend(
+            config, 
+            loop,
+            local_cpu_backend,
+            dst_device, 
+            lmcache_worker,
+            lookup_server,
+        )
+        backend_name = str(spdk_backend)
+        storage_backends[backend_name] = spdk_backend
 
     if config.weka_path is not None:
         weka_backend = WekaGdsBackend(config, loop, memory_allocator, dst_device)
