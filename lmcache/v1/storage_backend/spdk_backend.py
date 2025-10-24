@@ -1,8 +1,8 @@
+# Standard
 from collections import OrderedDict
 from concurrent.futures import Future
 from typing import Any, Dict, List, Optional, Tuple
 import threading
-from typing import Any, Dict, List, Optional, Tuple
 import asyncio
 import time
 
@@ -13,10 +13,11 @@ from lmcache.utils import CacheEngineKey, SpdkBlobMetadata
 from lmcache.v1.cache_controller.message import KVAdmitMsg, KVEvictMsg
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_server import LookupServerInterface
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.evictor import LRUEvictor, PutStatus
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.cache_controller.worker import LMCacheWorker
 
 # Local
 import spdk_controller as spdk
@@ -51,9 +52,9 @@ class SpdkBlobBackend(StorageBackendInterface):
         self.dict_lock = threading.RLock()
         self.usage_lock = threading.RLock()
         
-        self.write_window_size = getattr(config, 'spdk_write_window_size', 32)
-        self.idle_flush_time = getattr(config, 'spdk_idle_flush_time', 0.5)  # I/O空窗时间 (s)
-        self.max_flush_delay = getattr(config, 'spdk_max_flush_delay', 1.0)  # 最大延迟 (s)
+        self.write_window_size = getattr(config, 'spdk_write_window_size', 64)
+        self.idle_flush_time = getattr(config, 'spdk_idle_flush_time', 0.5)
+        self.max_flush_delay = getattr(config, 'spdk_max_flush_delay', 1.0) 
         self.read_bios = getattr(config, 'read_bios', True)
 
         self.put_tasks: dict[CacheEngineKey, MemoryObj] = {}
@@ -73,6 +74,11 @@ class SpdkBlobBackend(StorageBackendInterface):
             daemon=True
         )
         self.flush_thread.start()
+
+        self.keys_in_request: List[CacheEngineKey] = []
+        
+        self.prefetch_tasks: dict[CacheEngineKey, Future] = {}
+        self.prefetch_lock = threading.RLock()
 
     def _flush_loop(self):
         while self.running.is_set():
@@ -149,10 +155,13 @@ class SpdkBlobBackend(StorageBackendInterface):
             if key in self.put_tasks: return True
         with self.dict_lock:
             if key not in self.dict: return False
-            if pin: self.dict[key].pin()
+            if pin: 
+                self.dict[key].pin()
+                self.keys_in_request.append(key)
             return True
             
-    def exists_in_put_tasks(self, key: CacheEngineKey) -> bool: return False
+    def exists_in_put_tasks(self, key: CacheEngineKey) -> bool: 
+        return False
 
     def pin(self, key: CacheEngineKey) -> bool:
         with self.dict_lock:
@@ -200,6 +209,13 @@ class SpdkBlobBackend(StorageBackendInterface):
         
         if self.lmcache_worker is not None and not has_stored:
             self.lmcache_worker.put_msg(KVAdmitMsg(self.instance_id, key.worker_id, key.chunk_hash, "spdk"))
+
+    def touch_cache(self):
+        with self.dict_lock:
+            for key in reversed(self.keys_in_request):
+                if key in self.dict:
+                    self.evictor.update_on_hit(key, self.dict)
+            self.keys_in_request = []
 
     def batched_submit_put_task(self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj]) -> None:
         if not keys: return
@@ -265,14 +281,43 @@ class SpdkBlobBackend(StorageBackendInterface):
 
         if not keys_after_put_tasks_check:
             return [results.get(key) for key in keys]
-        remaining_keys = keys_after_put_tasks_check
+
+        keys_after_prefetch_check = []
+        prefetch_futures_to_wait: List[Tuple[CacheEngineKey, Future]] = []
+        with self.prefetch_lock:
+            for key in keys_after_put_tasks_check:
+                if key in self.prefetch_tasks:
+                    prefetch_futures_to_wait.append((key, self.prefetch_tasks[key]))
+                else:
+                    keys_after_prefetch_check.append(key)
+
+        if prefetch_futures_to_wait:
+            for key, future in prefetch_futures_to_wait:
+                try:
+                    memory_obj = future.result(timeout=30) 
+                    if memory_obj:
+                        if self.local_cpu_backend.contains(key, pin=True):
+                            results[key] = memory_obj
+                        else:
+                            logger.warning(f"Prefetched obj {key} was evicted from CPU. Re-reading.")
+                            keys_after_prefetch_check.append(key)
+                    else:
+                        logger.warning(f"Prefetch task for {key} returned None. Will attempt SPDK read.")
+                        keys_after_prefetch_check.append(key)
+                except Exception as e:
+                    logger.error(f"Waiting for prefetch task for {key} failed: {e}. Will attempt SPDK read.", exc_info=True)
+                    keys_after_prefetch_check.append(key)
+
+        
+        if not keys_after_prefetch_check:
+            return [results.get(key) for key in keys]
+        remaining_keys = keys_after_prefetch_check
 
         spdk_tasks_info = []
         if remaining_keys:
             with self.dict_lock:
                 for key in remaining_keys:
                     if key in self.dict:
-                        self.evictor.update_on_hit(key, self.dict)
                         metadata = self.dict[key]
                         spdk_tasks_info.append({
                             "key": key,
@@ -321,30 +366,69 @@ class SpdkBlobBackend(StorageBackendInterface):
     def get_non_blocking(self, key: CacheEngineKey) -> Optional["Future"]:
         return self.submit_prefetch_task(key)
     
+    def _remove_prefetch_task(self, key: CacheEngineKey, future: Future):
+        with self.prefetch_lock:
+            self.prefetch_tasks.pop(key, None)
+        
+        try:
+            future.result() 
+        except Exception as e:
+            logger.warning(f"Prefetch task for {key} failed: {e}. Unpinning entry.")
+            with self.dict_lock:
+                if key in self.dict:
+                    self.dict[key].unpin()
+
     def submit_prefetch_task(self, key: CacheEngineKey) -> Optional[Future]:
-        with self.dict_lock:
-            if key not in self.dict: return None
-            self.evictor.update_on_hit(key, self.dict)
-            metadata = self.dict[key]
-            blob_info = {
-                "blob_handle": metadata.blob_handle,
-                "dtype": metadata.dtype,
-                "shape": metadata.shape,
-                "fmt": metadata.fmt
-            }
-        assert blob_info["dtype"] is not None and blob_info["shape"] is not None
-        return asyncio.run_coroutine_threadsafe(
-            self.async_load_bytes_from_spdk(blob_info["blob_handle"], blob_info["dtype"], blob_info["shape"], blob_info["fmt"]),
-            self.loop
-        )
+        with self.prefetch_lock:
+            if key in self.prefetch_tasks:
+                logger.debug(f"Prefetch task for {key} is already in progress.")
+                return self.prefetch_tasks[key]
+
+            with self.dict_lock:
+                if key not in self.dict: return None
+                self.dict[key].pin()
+                metadata = self.dict[key]
+                blob_info = {
+                    "key": key,
+                    "blob_handle": metadata.blob_handle,
+                    "dtype": metadata.dtype,
+                    "shape": metadata.shape,
+                    "fmt": metadata.fmt
+                }
+            assert blob_info["dtype"] is not None and blob_info["shape"] is not None
+            
+            coro = self.async_load_bytes_from_spdk(
+                blob_info["key"],
+                blob_info["blob_handle"], 
+                blob_info["dtype"], 
+                blob_info["shape"], 
+                blob_info["fmt"]
+            )
+            future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+            future.add_done_callback(lambda f: self._remove_prefetch_task(key, f))
+            
+            self.prefetch_tasks[key] = future
+            return future
     
-    async def async_load_bytes_from_spdk(self, blob_handle: int, dtype, shape, fmt) -> Optional[MemoryObj]:
+    async def async_load_bytes_from_spdk(
+        self, key: CacheEngineKey, blob_handle: int, dtype, shape, fmt
+    ) -> Optional[MemoryObj]:
+        
         memory_obj = self.local_cpu_backend.allocate(shape, dtype, fmt)
         if memory_obj is None:
             logger.debug("Memory allocation failed during async spdk load.")
             return None
+        
         concurrent_future = spdk.read_async(blob_handle, memory_obj.meta.address, 0, memory_obj.get_physical_size())
         await asyncio.wrap_future(concurrent_future)
+        
+        with self.dict_lock:
+            if key in self.dict:
+                self.dict[key].unpin()
+
+        self.local_cpu_backend.submit_put_task(key, memory_obj)
+
         return memory_obj
 
     def submit_put_task(self, key: CacheEngineKey, memory_obj: MemoryObj) -> Optional[Future]:
