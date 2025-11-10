@@ -80,6 +80,10 @@ class SpdkBlobBackend(StorageBackendInterface):
         self.prefetch_tasks: dict[CacheEngineKey, Future] = {}
         self.prefetch_lock = threading.RLock()
 
+        self.cumulative_read_bytes = 0
+        self.cumulative_read_time = 0.0
+        self.stats_lock = threading.Lock()
+
     def _flush_loop(self):
         while self.running.is_set():
             tasks_to_process = []
@@ -328,7 +332,17 @@ class SpdkBlobBackend(StorageBackendInterface):
                         })
 
         if spdk_tasks_info:
+            start_time = time.time()
             spdk_results = self._perform_batched_spdk_read(spdk_tasks_info)
+            end_time = time.time()
+            read_time = end_time - start_time
+            total_read_bytes = spdk.get_blob_size_in_bytes() * len(spdk_tasks_info)
+            with self.stats_lock:
+                self.cumulative_read_bytes += total_read_bytes
+                self.cumulative_read_time += read_time
+                logger.info(f"current average read bandwidth: "
+                            f"{(self.cumulative_read_bytes / self.cumulative_read_time) / (1024 * 1024):.2f} MB/s")
+
             for task_info, result_obj in zip(spdk_tasks_info, spdk_results):
                 results[task_info["key"]] = result_obj
                 

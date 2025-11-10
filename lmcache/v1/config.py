@@ -401,7 +401,8 @@ class LMCacheEngineConfig:
         json_config_file = config.get("json_config_file", None)
         _mask = config.get("reactor_mask", None)
         reactor_mask = hex(_mask) if _mask is not None else None
-        main_core = int(config.get("main_core", None))
+        _main_core = config.get("main_core", None)
+        main_core = int(_main_core) if _main_core is not None else None
         rpc_addr = config.get("rpc_addr", None)
         spdk_max_size = config.get("spdk_max_size", None)
         

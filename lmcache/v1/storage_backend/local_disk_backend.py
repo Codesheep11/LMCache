@@ -197,6 +197,9 @@ class LocalDiskBackend(StorageBackendInterface):
         self.instance_id = config.lmcache_instance_id
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.usage = 0
+        self.cumulative_read_bytes = 0
+        self.cumulative_read_time = 0.0
+        self.stats_lock = threading.Lock()
 
     def __str__(self):
         return "LocalDiskBackend"
@@ -422,7 +425,22 @@ class LocalDiskBackend(StorageBackendInterface):
         assert dtype is not None
         assert shape is not None
 
+        start_time = time.time()
         memory_obj = self.load_bytes_from_disk(path, dtype=dtype, shape=shape, fmt=fmt)
+        end_time = time.time()
+
+        read_bytes = memory_obj.get_physical_size()
+        read_time = end_time - start_time
+        
+        self.stats_lock.acquire()
+        self.cumulative_read_bytes += read_bytes
+        self.cumulative_read_time += read_time
+        logger.info(
+            f"current average read bandwidth: "
+            f"{(self.cumulative_read_bytes / self.cumulative_read_time) / (1024 * 1024):.2f} MB/s"
+        )
+        self.stats_lock.release()
+
         self.disk_lock.release()
 
         return memory_obj
@@ -531,10 +549,10 @@ class LocalDiskBackend(StorageBackendInterface):
         buffer = memory_obj.byte_array
         size = len(buffer)
         if size % self.os_disk_bs != 0 or not self.use_odirect:
-            logger.warning(
-                "Cannot use O_DIRECT for this file, "
-                "size is not aligned to disk block size."
-            )
+            # logger.warning(
+            #     "Cannot use O_DIRECT for this file, "
+            #     "size is not aligned to disk block size."
+            # )
             with open(path, "rb") as f:
                 f.readinto(buffer)
         else:

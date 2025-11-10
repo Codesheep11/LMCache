@@ -248,17 +248,17 @@ class LMCacheEngine:
         if self.lookup_server is not None:
             self.lookup_server.batched_insert(keys)
 
-        logger.info(
-            "Stored %d out of total %d tokens. size: %.4f gb, cost %.4f ms, "
-            "throughput: %.4f GB/s; offload_time: %.4f ms, put_time: %.4f ms",
-            tot_token_num,
-            num_to_store_tokens,
-            tot_kv_size / 1024**3,
-            tot_time * 1000,
-            tot_kv_size / tot_time / 1024**3,
-            offload_time * 1000,
-            put_time * 1000,
-        )
+        # logger.info(
+        #     "Stored %d out of total %d tokens. size: %.4f gb, cost %.4f ms, "
+        #     "throughput: %.4f GB/s; offload_time: %.4f ms, put_time: %.4f ms",
+        #     tot_token_num,
+        #     num_to_store_tokens,
+        #     tot_kv_size / 1024**3,
+        #     tot_time * 1000,
+        #     tot_kv_size / tot_time / 1024**3,
+        #     offload_time * 1000,
+        #     put_time * 1000,
+        # )
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
 
@@ -497,11 +497,11 @@ class LMCacheEngine:
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
-        logger.info(
-            f"Retrieved {retrieved_tokens} "
-            f"out of {num_required_tokens} "
-            f"out of total {len(tokens)} tokens"
-        )
+        # logger.info(
+        #     f"Retrieved {retrieved_tokens} "
+        #     f"out of {num_required_tokens} "
+        #     f"out of total {len(tokens)} tokens"
+        # )
         return ret_mask
 
     @_lmcache_nvtx_annotate
