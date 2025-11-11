@@ -52,10 +52,10 @@ class SpdkBlobBackend(StorageBackendInterface):
         self.dict_lock = threading.RLock()
         self.usage_lock = threading.RLock()
         
-        self.write_window_size = getattr(config, 'spdk_write_window_size', 64)
-        self.idle_flush_time = getattr(config, 'spdk_idle_flush_time', 0.5)
+        self.write_window_size = getattr(config, 'spdk_write_window_size', 256)
+        self.idle_flush_time = getattr(config, 'spdk_idle_flush_time', 5)
         self.max_flush_delay = getattr(config, 'spdk_max_flush_delay', 1.0) 
-        self.read_bios = getattr(config, 'read_bios', True)
+        self.read_bios = getattr(config, 'read_bios', False)
 
         self.put_tasks: dict[CacheEngineKey, MemoryObj] = {}
         self.put_tasks_lock = threading.RLock()
@@ -100,7 +100,7 @@ class SpdkBlobBackend(StorageBackendInterface):
                     should_flush = True
                 elif (now - self.oldest_item_timestamp) > self.max_flush_delay:
                     should_flush = True
-                    logger.debug("Flushing SPDK write buffer: max delay expired.")
+                    logger.info("Flushing SPDK write buffer: max delay expired.")
 
                 if should_flush:
                     tasks_to_process = self.write_buffer
@@ -268,85 +268,92 @@ class SpdkBlobBackend(StorageBackendInterface):
             self._perform_batch_write(tasks_to_write_now)
  
     def batched_get_blocking(self, keys: List[CacheEngineKey]) -> List[Optional[MemoryObj]]:
-        if not keys: return []
-        results: Dict[CacheEngineKey, Optional[MemoryObj]] = {key: None for key in keys}
-        
-        remaining_keys = list(keys)
-        
-        keys_after_put_tasks_check = []
-        with self.put_tasks_lock:
-            for key in remaining_keys:
-                if key in self.put_tasks:
-                    mem_obj = self.put_tasks[key]
-                    mem_obj.ref_count_up()
-                    results[key] = mem_obj
-                else:
-                    keys_after_put_tasks_check.append(key)
-
-        if not keys_after_put_tasks_check:
-            return [results.get(key) for key in keys]
-
-        keys_after_prefetch_check = []
-        prefetch_futures_to_wait: List[Tuple[CacheEngineKey, Future]] = []
-        with self.prefetch_lock:
-            for key in keys_after_put_tasks_check:
-                if key in self.prefetch_tasks:
-                    prefetch_futures_to_wait.append((key, self.prefetch_tasks[key]))
-                else:
-                    keys_after_prefetch_check.append(key)
-
-        if prefetch_futures_to_wait:
-            for key, future in prefetch_futures_to_wait:
-                try:
-                    memory_obj = future.result(timeout=30) 
-                    if memory_obj:
-                        if self.local_cpu_backend.contains(key, pin=True):
-                            results[key] = memory_obj
-                        else:
-                            logger.warning(f"Prefetched obj {key} was evicted from CPU. Re-reading.")
-                            keys_after_prefetch_check.append(key)
-                    else:
-                        logger.warning(f"Prefetch task for {key} returned None. Will attempt SPDK read.")
-                        keys_after_prefetch_check.append(key)
-                except Exception as e:
-                    logger.error(f"Waiting for prefetch task for {key} failed: {e}. Will attempt SPDK read.", exc_info=True)
-                    keys_after_prefetch_check.append(key)
-
-        
-        if not keys_after_prefetch_check:
-            return [results.get(key) for key in keys]
-        remaining_keys = keys_after_prefetch_check
-
-        spdk_tasks_info = []
-        if remaining_keys:
-            with self.dict_lock:
+        if not self.read_bios:
+            mem_objs = []
+            for key in keys:
+                mem_objs.append(self.get_blocking(key))
+            return mem_objs
+        else:
+            if not keys: return []
+            results: Dict[CacheEngineKey, Optional[MemoryObj]] = {key: None for key in keys}
+            
+            remaining_keys = list(keys)
+            
+            keys_after_put_tasks_check = []
+            with self.put_tasks_lock:
                 for key in remaining_keys:
-                    if key in self.dict:
-                        metadata = self.dict[key]
-                        spdk_tasks_info.append({
-                            "key": key,
-                            "blob_handle": metadata.blob_handle,
-                            "dtype": metadata.dtype,
-                            "shape": metadata.shape,
-                            "fmt": metadata.fmt
-                        })
+                    if key in self.put_tasks:
+                        mem_obj = self.put_tasks[key]
+                        mem_obj.ref_count_up()
+                        results[key] = mem_obj
+                    else:
+                        keys_after_put_tasks_check.append(key)
 
-        if spdk_tasks_info:
-            start_time = time.time()
-            spdk_results = self._perform_batched_spdk_read(spdk_tasks_info)
-            end_time = time.time()
-            read_time = end_time - start_time
-            total_read_bytes = spdk.get_blob_size_in_bytes() * len(spdk_tasks_info)
-            with self.stats_lock:
-                self.cumulative_read_bytes += total_read_bytes
-                self.cumulative_read_time += read_time
-                logger.info(f"current average read bandwidth: "
-                            f"{(self.cumulative_read_bytes / self.cumulative_read_time) / (1024 * 1024):.2f} MB/s")
+            if not keys_after_put_tasks_check:
+                return [results.get(key) for key in keys]
 
-            for task_info, result_obj in zip(spdk_tasks_info, spdk_results):
-                results[task_info["key"]] = result_obj
-                
-        return [results.get(key) for key in keys]
+            keys_after_prefetch_check = []
+            prefetch_futures_to_wait: List[Tuple[CacheEngineKey, Future]] = []
+            with self.prefetch_lock:
+                for key in keys_after_put_tasks_check:
+                    if key in self.prefetch_tasks:
+                        prefetch_futures_to_wait.append((key, self.prefetch_tasks[key]))
+                    else:
+                        keys_after_prefetch_check.append(key)
+
+            if prefetch_futures_to_wait:
+                for key, future in prefetch_futures_to_wait:
+                    try:
+                        memory_obj = future.result(timeout=30) 
+                        if memory_obj:
+                            if self.local_cpu_backend.contains(key, pin=True):
+                                results[key] = memory_obj
+                            else:
+                                logger.warning(f"Prefetched obj {key} was evicted from CPU. Re-reading.")
+                                keys_after_prefetch_check.append(key)
+                        else:
+                            logger.warning(f"Prefetch task for {key} returned None. Will attempt SPDK read.")
+                            keys_after_prefetch_check.append(key)
+                    except Exception as e:
+                        logger.error(f"Waiting for prefetch task for {key} failed: {e}. Will attempt SPDK read.", exc_info=True)
+                        keys_after_prefetch_check.append(key)
+
+            
+            if not keys_after_prefetch_check:
+                return [results.get(key) for key in keys]
+            remaining_keys = keys_after_prefetch_check
+
+            spdk_tasks_info = []
+            if remaining_keys:
+                with self.dict_lock:
+                    for key in remaining_keys:
+                        if key in self.dict:
+                            self.evictor.update_on_hit(key, self.dict)
+                            metadata = self.dict[key]
+                            spdk_tasks_info.append({
+                                "key": key,
+                                "blob_handle": metadata.blob_handle,
+                                "dtype": metadata.dtype,
+                                "shape": metadata.shape,
+                                "fmt": metadata.fmt
+                            })
+
+            if spdk_tasks_info:
+                start_time = time.time()
+                spdk_results = self._perform_batched_spdk_read(spdk_tasks_info)
+                end_time = time.time()
+                read_time = end_time - start_time
+                total_read_bytes = spdk.get_blob_size_in_bytes() * len(spdk_tasks_info)
+                with self.stats_lock:
+                    self.cumulative_read_bytes += total_read_bytes
+                    self.cumulative_read_time += read_time
+                    logger.info(f"current average read bandwidth: "
+                                f"{(self.cumulative_read_bytes / self.cumulative_read_time) / (1024 * 1024):.2f} MB/s")
+
+                for task_info, result_obj in zip(spdk_tasks_info, spdk_results):
+                    results[task_info["key"]] = result_obj
+                    
+            return [results.get(key) for key in keys]
 
     def _perform_batched_spdk_read(self, spdk_tasks_info: List[Dict[str, Any]]) -> List[Optional[MemoryObj]]:
         if not spdk_tasks_info: return []
@@ -451,9 +458,41 @@ class SpdkBlobBackend(StorageBackendInterface):
         return None
     
     def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
-        logger.warning("SpdkBlobBackend.get_blocking is deprecated, use batched_get_blocking instead.")
-        results = self.batched_get_blocking([key])
-        return results[0] if results else None
+        # logger.warning("SpdkBlobBackend.get_blocking is deprecated, use batched_get_blocking instead.")
+        # results = self.batched_get_blocking([key])
+        # return results[0] if results else None
+        with self.dict_lock:
+            if key not in self.dict:
+                return None
+            
+            self.evictor.update_on_hit(key, self.dict)
+
+            metadata = self.dict[key]
+            blob_handle = metadata.blob_handle
+            dtype = metadata.dtype
+            shape = metadata.shape
+            fmt = metadata.fmt
+            memory_obj = self.local_cpu_backend.allocate(shape, dtype, fmt)
+            if memory_obj is None:
+                logger.debug("Memory allocation failed during spdk get_blocking.")
+                return None
+            start_time = time.time()
+            future = spdk.read_async(blob_handle, memory_obj.meta.address, 0, memory_obj.get_physical_size())
+            try:
+                future.result(timeout=30)
+                end_time = time.time()
+                read_time = end_time - start_time
+                total_read_bytes = memory_obj.get_physical_size()
+                with self.stats_lock:
+                    self.cumulative_read_bytes += total_read_bytes
+                    self.cumulative_read_time += read_time
+                    logger.info(f"current average read bandwidth: "
+                                f"{(self.cumulative_read_bytes / self.cumulative_read_time) / (1024 * 1024):.2f} MB/s")
+                return memory_obj
+            except Exception as e:
+                logger.error(f"SPDK read operation failed or timed out: {e}", exc_info=True)
+                memory_obj.ref_count_down()
+                return None
 
     def close(self) -> None:
         logger.info("Closing SPDK blob backend...")
