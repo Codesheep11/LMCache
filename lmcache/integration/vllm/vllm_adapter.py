@@ -4,7 +4,7 @@ from copy import deepcopy
 from enum import Enum
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 import dataclasses
-
+import spdk_controller as spdk
 # Third Party
 from torch.nn.utils.rnn import pad_sequence
 import torch
@@ -155,6 +155,16 @@ def init_lmcache_engine(
     kv_shape = (num_layer, 1 if use_mla else 2, chunk_size, num_kv_head, head_size)
     logger.info(f"use mla: {use_mla}, kv shape: {kv_shape}")
 
+    if config.bdev_name:
+        num_elements = num_layer * (1 if use_mla else 2) * chunk_size * num_kv_head * head_size
+        bytes_per_element = torch.empty((), dtype=kv_dtype).element_size()
+        blob_size_in_bytes = num_elements * bytes_per_element
+        logger.info(
+            f"Each KV cache blob size: {blob_size_in_bytes} bytes "
+            f"({blob_size_in_bytes / (1024**2):.2f} MB)"
+        )
+        spdk.set_blob_size_in_bytes(blob_size_in_bytes)
+    
     # Change current device.
     torch.cuda.device(parallel_config.rank)
     device = torch.device(f"cuda:{parallel_config.rank}")
