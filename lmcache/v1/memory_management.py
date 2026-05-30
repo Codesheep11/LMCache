@@ -1370,10 +1370,17 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         """
         :param int size: The size of the pinned memory in bytes.
         """
+        self._unregistered = True
+        self.buffer_ptr = None
         if use_dma:
+            io_unit_size = spdk.get_io_unit_size()
+            assert io_unit_size > 0, "SPDK must be initialized before creating DMA allocator"
             mem_view, ptr = spdk.alloc_io_buffer_view(size)
             self.buffer = torch.frombuffer(mem_view, dtype=torch.uint8).pin_memory().flatten()
-            self.pin_allocator = SpdkDmaAllocator(self.buffer, ptr)
+            self.buffer_ptr = ptr
+            self.pin_allocator = SpdkDmaAllocator(
+                self.buffer, ptr, align_bytes=io_unit_size
+            )
         else:
             self.buffer = torch.empty(size, dtype=torch.uint8)
             ptr = self.buffer.data_ptr()
@@ -1679,6 +1686,21 @@ class CuFileMemoryAllocator(GPUMemoryAllocator):
 
     def __del__(self):
         self.cuFileBufDeregister(ctypes.c_void_p(self.base_pointer))
+
+
+class SpdkDirectP2PMemoryAllocator(GPUMemoryAllocator):
+    def __init__(self, size: int, device=None):
+        if device is None:
+            device = f"cuda:{torch.cuda.current_device()}"
+        io_unit_size = spdk.get_io_unit_size()
+        assert io_unit_size > 0, (
+            "SPDK must be initialized before creating direct-p2p allocator"
+        )
+        super().__init__(size, device, align_bytes=io_unit_size)
+        self.base_pointer = self.tensor.data_ptr()
+
+    def close(self):
+        return
 
 
 class NixlCPUMemoryAllocator(MemoryAllocatorInterface):

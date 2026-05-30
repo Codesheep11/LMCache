@@ -4,6 +4,7 @@ from collections import defaultdict
 from typing import Dict, Generator, List, Optional, Union
 import asyncio
 import multiprocessing
+import os
 import time
 
 # Third Party
@@ -33,7 +34,9 @@ from lmcache.v1.memory_management import (
     MemoryFormat,
     MixedMemoryAllocator,
     NixlCPUMemoryAllocator,
+    SpdkDirectP2PMemoryAllocator,
 )
+from lmcache.v1.spdk_utils import init_spdk_if_needed
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.token_database import (
     ChunkedTokenDatabase,
@@ -79,6 +82,13 @@ class LMCacheEngine:
         self.memory_allocator = memory_allocator
         self.token_database = token_database
         self.gpu_connector = gpu_connector
+        self.trace_retrieve = os.environ.get("LMCACHE_TRACE_RETRIEVE", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self.trace_retrieve = False
 
         self.enable_p2p = config.enable_p2p
 
@@ -142,6 +152,32 @@ class LMCacheEngine:
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
 
         self.post_inited = False
+
+    def _log_retrieve_trace(self, **fields) -> None:
+        if not self.trace_retrieve:
+            return
+
+        parts = ["[LMCACHE_RETRIEVE_TRACE]"]
+        for key, value in fields.items():
+            if value is None:
+                continue
+            parts.append(f"{key}={value}")
+        print(" ".join(parts), flush=True)
+
+    @staticmethod
+    def _get_memory_obj_storage_size(memory_obj: Optional["MemoryObj"]) -> int:
+        if memory_obj is None:
+            return 0
+        return memory_obj.get_physical_size()
+
+    @staticmethod
+    def _get_memory_obj_device(memory_obj: Optional["MemoryObj"]) -> str:
+        if memory_obj is None or memory_obj.tensor is None:
+            return "none"
+        device = memory_obj.tensor.device
+        if device.index is None:
+            return device.type
+        return f"{device.type}:{device.index}"
 
     def post_init(self, **kwargs) -> None:
         if not self.post_inited:
@@ -406,6 +442,9 @@ class LMCacheEngine:
         else:
             num_required_tokens = len(tokens)
         monitor_req_id = self.stats_monitor.on_retrieve_request(num_required_tokens)
+        request_id = kwargs.get("request_id")
+        retrieve_start = time.perf_counter()
+        storage_get_secs = 0.0
 
         ret_mask = torch.zeros_like(tokens, dtype=torch.bool, device="cpu")
 
@@ -417,6 +456,9 @@ class LMCacheEngine:
         reordered_memory_objs = []
         reordered_starts = []
         reordered_ends = []
+        streamed_keys = []
+        streamed_memory_objs = []
+        streamed_gpu_work = False
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask
         ):
@@ -471,26 +513,106 @@ class LMCacheEngine:
 
         # TODO(Jiayi): We can parallelize the retrieval from
         # different storage backends.
+        locations = []
         for location, keys in key_mapping.items():
-            memory_objs = self.storage_manager.batched_get(
+            storage_get_start = time.perf_counter()
+            memory_objs = self.storage_manager.batched_get_to_gpu(
                 keys=keys,
+                starts=start_mapping[location],
+                ends=end_mapping[location],
+                gpu_connector=self.gpu_connector,
                 location=location,
+                **kwargs,
             )
+            storage_get_secs += time.perf_counter() - storage_get_start
+
+            if memory_objs is not None:
+                streamed_memory_objs.extend(memory_objs)
+                streamed_keys.extend(keys)
+                streamed_gpu_work = streamed_gpu_work or any(
+                    memory_obj is not None for memory_obj in memory_objs
+                )
+                locations.append(location)
+                continue
+
+            storage_get_start = time.perf_counter()
+            memory_objs = self.storage_manager.batched_get(keys=keys, location=location)
+            storage_get_secs += time.perf_counter() - storage_get_start
             reordered_memory_objs.extend(memory_objs)
             reordered_keys.extend(keys)
             reordered_starts.extend(start_mapping[location])
             reordered_ends.extend(end_mapping[location])
+            locations.append(location)
 
         # NOTE(Jiayi): memory_obj doesn't have to be a pinned
         # cpu tensor for the sake of performance.
         # For example, disk->gpu is faster than disk->cpu->gpu.
         # RDMA is another example.
-        self.gpu_connector.batched_to_gpu(
-            reordered_memory_objs, reordered_starts, reordered_ends, **kwargs
+        to_gpu_secs = 0.0
+        if reordered_memory_objs:
+            to_gpu_start = time.perf_counter()
+            self.gpu_connector.batched_to_gpu(
+                reordered_memory_objs, reordered_starts, reordered_ends, **kwargs
+            )
+            if self.trace_retrieve and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            to_gpu_secs = time.perf_counter() - to_gpu_start
+        elif streamed_gpu_work and self.trace_retrieve and torch.cuda.is_available():
+            to_gpu_start = time.perf_counter()
+            torch.cuda.synchronize()
+            to_gpu_secs = time.perf_counter() - to_gpu_start
+
+        total_retrieve_secs = time.perf_counter() - retrieve_start
+        retrieved_memory_objs = streamed_memory_objs + reordered_memory_objs
+        retrieved_keys = streamed_keys + reordered_keys
+        total_bytes = sum(
+            self._get_memory_obj_storage_size(memory_obj)
+            for memory_obj in retrieved_memory_objs
+            if memory_obj is not None
+        )
+        devices = sorted(
+            {
+                self._get_memory_obj_device(memory_obj)
+                for memory_obj in retrieved_memory_objs
+                if memory_obj is not None
+            }
+        )
+        self._log_retrieve_trace(
+            request_id=request_id,
+            chunks=len(retrieved_memory_objs),
+            total_bytes=total_bytes,
+            storage_ms=f"{storage_get_secs * 1000:.3f}",
+            to_gpu_ms=f"{to_gpu_secs * 1000:.3f}",
+            total_ms=f"{total_retrieve_secs * 1000:.3f}",
+            locations=",".join(locations) if locations else None,
+            devices=",".join(devices) if devices else None,
         )
 
+        if total_bytes > 0:
+            e2e_bw = total_bytes / total_retrieve_secs / (1024**3)
+            storage_bw = (
+                total_bytes / storage_get_secs / (1024**3)
+                if storage_get_secs > 0
+                else 0
+            )
+            h2d_bw = (
+                total_bytes / to_gpu_secs / (1024**3)
+                if to_gpu_secs > 0
+                else 0
+            )
+            logger.info(
+                f"[E2E Bandwidth] total: {e2e_bw:.2f} GB/s, "
+                f"storage({','.join(locations) if locations else '?'}): "
+                f"{storage_bw:.2f} GB/s ({storage_get_secs * 1000:.1f} ms), "
+                f"h2d: {h2d_bw:.2f} GB/s ({to_gpu_secs * 1000:.1f} ms), "
+                f"total: {total_retrieve_secs * 1000:.1f} ms, "
+                f"bytes: {total_bytes / (1024**2):.1f} MB"
+            )
+
         # TODO(Jiayi): Remove the following for loop with batched operations
-        for key, memory_obj in zip(reordered_keys, reordered_memory_objs, strict=False):
+        for key, memory_obj in zip(retrieved_keys, retrieved_memory_objs, strict=False):
+            if memory_obj is None:
+                continue
             if self.remove_after_retrieve:
                 self.storage_manager.remove(key)
             memory_obj.ref_count_down()
@@ -918,15 +1040,25 @@ class LMCacheEngineBuilder:
             assert config.cufile_buffer_size is not None
             return CuFileMemoryAllocator(config.cufile_buffer_size * 1024**2)
 
+        if config.spdk_enable_dp2p:
+            init_spdk_if_needed(config)
+            assert config.spdk_gpu_buffer_size_gb > 0
+            return SpdkDirectP2PMemoryAllocator(
+                int(config.spdk_gpu_buffer_size_gb * 1024**3)
+            )
+
         if config.spdk_max_size and config.spdk_max_size > 0:
+            init_spdk_if_needed(config)
             assert config.bdev_name is not None
             assert config.reactor_mask is not None
             assert config.rpc_addr is not None
             assert config.main_core is not None
-            dma_size =  5 * 1024**3 # 5 GB
+            dma_size =  4 * 5 * 1024**3 # 5 GB
             return MixedMemoryAllocator(dma_size, use_dma=True)
         
         max_local_cpu_size = config.max_local_cpu_size
+        if config.local_disk:
+            max_local_cpu_size = 6 * max_local_cpu_size
         return MixedMemoryAllocator(int(max_local_cpu_size * 1024**3), use_dma=False)
     
     @staticmethod

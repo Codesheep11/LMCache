@@ -13,6 +13,7 @@ from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_server import LookupServerInterface
 from lmcache.v1.memory_management import MemoryAllocatorInterface
+from lmcache.v1.spdk_utils import init_spdk_if_needed
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.gds_backend import GdsBackend
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
@@ -20,6 +21,7 @@ from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
 from lmcache.v1.storage_backend.remote_backend import RemoteBackend
 from lmcache.v1.storage_backend.weka_gds_backend import WekaGdsBackend
 from lmcache.v1.storage_backend.spdk_backend import SpdkBlobBackend
+from lmcache.v1.storage_backend.spdk_direct_p2p_backend import SpdkDirectP2PBackend
 
 if TYPE_CHECKING:
     # First Party
@@ -27,6 +29,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def _spdk_enable_direct_p2p(config: LMCacheEngineConfig) -> bool:
+    return config.spdk_enable_dp2p
 
 def CreateStorageBackends(
     config: LMCacheEngineConfig,
@@ -42,6 +47,7 @@ def CreateStorageBackends(
         dst_device = f"cuda:{torch.cuda.current_device()}"
 
     storage_backends: OrderedDict[str, StorageBackendInterface] = OrderedDict()
+    local_cpu_backend: Optional[LocalCPUBackend] = None
 
     if config.enable_nixl:
         if config.enable_xpyd:
@@ -63,7 +69,9 @@ def CreateStorageBackends(
     # TODO(Jiayi): The hierarchy is fixed for now
     # NOTE(Jiayi): The local_cpu backend is always created because
     # other backends might need it as a buffer.
-    if config.enable_nixl and not config.local_cpu:
+    if (config.enable_nixl and not config.local_cpu) or (
+        _spdk_enable_direct_p2p(config) and not config.local_cpu
+    ):
         pass
     else:
         local_cpu_backend = LocalCPUBackend(
@@ -76,6 +84,7 @@ def CreateStorageBackends(
         storage_backends[backend_name] = local_cpu_backend
 
     if config.local_disk and config.max_local_disk_size > 0:
+        assert local_cpu_backend is not None
         local_disk_backend = LocalDiskBackend(
             config,
             loop,
@@ -89,14 +98,26 @@ def CreateStorageBackends(
         storage_backends[backend_name] = local_disk_backend
 
     if config.bdev_name is not None and config.spdk_max_size > 0:
-        spdk_backend = SpdkBlobBackend(
-            config, 
-            loop,
-            local_cpu_backend,
-            dst_device, 
-            lmcache_worker,
-            lookup_server,
-        )
+        init_spdk_if_needed(config)
+        if _spdk_enable_direct_p2p(config):
+            spdk_backend = SpdkDirectP2PBackend(
+                config,
+                loop,
+                memory_allocator,
+                dst_device,
+                lmcache_worker,
+                lookup_server,
+            )
+        else:
+            assert local_cpu_backend is not None
+            spdk_backend = SpdkBlobBackend(
+                config,
+                loop,
+                local_cpu_backend,
+                dst_device,
+                lmcache_worker,
+                lookup_server,
+            )
         backend_name = str(spdk_backend)
         storage_backends[backend_name] = spdk_backend
 
@@ -110,6 +131,7 @@ def CreateStorageBackends(
         gds_backend = GdsBackend(config, loop, memory_allocator, dst_device)
         storage_backends[str(gds_backend)] = gds_backend
     if config.remote_url is not None:
+        assert local_cpu_backend is not None
         remote_backend = RemoteBackend(
             config, metadata, loop, local_cpu_backend, dst_device, lookup_server
         )

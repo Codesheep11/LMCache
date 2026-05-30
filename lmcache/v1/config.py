@@ -40,6 +40,17 @@ def to_int_list(
     return [int(p) for p in parts]
 
 
+def to_str_list(
+    value: Optional[Union[str, list[Any], tuple[Any, ...]]],
+) -> Optional[list[str]]:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return [str(x).strip() for x in value if str(x).strip()]
+    parts = [p.strip() for p in str(value).split(",") if p.strip()]
+    return parts or None
+
+
 @dataclass
 class LMCacheEngineConfig:
     chunk_size: int
@@ -132,6 +143,33 @@ class LMCacheEngineConfig:
     main_core: Optional[int] = None
     # The maximum size of the SPDK blobstore in GB
     spdk_max_size: Optional[int] = None
+    # Whether to enable SPDK direct-p2p mode
+    spdk_enable_dp2p: bool = False
+    # Allowed peer BDFs for direct-p2p
+    spdk_peer_bdfs: Optional[list[str]] = None
+    # Size of the registered GPU staging buffer in GiB
+    spdk_gpu_buffer_size_gb: float = 5.0
+    # Optional SPDK cluster size override in KiB
+    spdk_cluster_size_kb: Optional[int] = None
+    # Optional SPDK blob pool warm-start size
+    spdk_pool_initial_blob_count: Optional[int] = None
+    # Optional SPDK blob pool hard cap
+    spdk_pool_max_blob_count: Optional[int] = None
+    # Optional SPDK blob pool repopulation trigger threshold
+    spdk_pool_low_watermark: Optional[int] = None
+    # Optional SPDK blob pool repopulation batch size
+    spdk_pool_repopulate_batch_size: Optional[int] = None
+    # Timeout when waiting for a free blob handle from the pool
+    spdk_blob_acquire_timeout_secs: float = 5.0
+    # Timeout for SPDK read/write futures
+    spdk_io_timeout_secs: float = 30.0
+    # Whether to split large SPDK reads into staged SSD->CPU->GPU sub-reads
+    spdk_enable_chunked_gpu_overlap: bool = False
+    # Size of each staged SPDK sub-read in KiB
+    spdk_chunked_gpu_overlap_size_kb: int = 4096
+    # Prefer blob-granularity overlap when a batched read contains at least
+    # this many blobs; otherwise prefer chunk-granularity overlap.
+    spdk_blob_gpu_overlap_min_blob_count: int = 32
 
     # The extra config
     extra_config: Optional[dict] = None
@@ -196,6 +234,19 @@ class LMCacheEngineConfig:
         main_core: Optional[int] = None,
         rpc_addr: Optional[str] = None,
         spdk_max_size: Optional[int] = None,
+        spdk_enable_dp2p: bool = False,
+        spdk_peer_bdfs: Optional[list[str]] = None,
+        spdk_gpu_buffer_size_gb: float = 5.0,
+        spdk_cluster_size_kb: Optional[int] = None,
+        spdk_pool_initial_blob_count: Optional[int] = None,
+        spdk_pool_max_blob_count: Optional[int] = None,
+        spdk_pool_low_watermark: Optional[int] = None,
+        spdk_pool_repopulate_batch_size: Optional[int] = None,
+        spdk_blob_acquire_timeout_secs: float = 5.0,
+        spdk_io_timeout_secs: float = 30.0,
+        spdk_enable_chunked_gpu_overlap: bool = False,
+        spdk_chunked_gpu_overlap_size_kb: int = 4096,
+        spdk_blob_gpu_overlap_min_blob_count: int = 32,
         extra_config: Optional[dict] = None,
         save_unfull_chunk: bool = True,
         blocking_timeout_secs: int = 10,
@@ -203,55 +254,68 @@ class LMCacheEngineConfig:
     ) -> "LMCacheEngineConfig":
         # TODO (ApostaC): Add nixl config
         return LMCacheEngineConfig(
-            chunk_size,
-            local_cpu,
-            max_local_cpu_size,
-            local_disk,
-            max_local_disk_size,
-            remote_url,
-            remote_serde,
-            use_layerwise,
-            save_decode_cache,
-            enable_blending,
-            blend_recompute_ratio,
-            blend_min_tokens,
-            blend_special_str,
-            enable_p2p,
-            lookup_url,
-            distributed_url,
-            error_handling,
-            enable_controller,
-            lmcache_instance_id,
-            controller_url,
-            lmcache_worker_port,
-            pre_caching_hash_algorithm,
-            enable_nixl,
-            nixl_role,
-            nixl_receiver_host,
-            nixl_receiver_port,
-            nixl_buffer_size,
-            nixl_buffer_device,
-            nixl_enable_gc,
-            enable_xpyd,
-            nixl_peer_host,
-            nixl_peer_init_port,
-            nixl_peer_alloc_port,
-            nixl_proxy_host,
-            nixl_proxy_port,
-            audit_actual_remote_url,
-            weka_path,
-            gds_path,
-            cufile_buffer_size,
-            bdev_name,
-            json_config_file,
-            reactor_mask,
-            main_core,
-            rpc_addr,
-            spdk_max_size,
-            extra_config,
-            save_unfull_chunk,
-            blocking_timeout_secs,
-            external_lookup_client,
+            chunk_size=chunk_size,
+            local_cpu=local_cpu,
+            max_local_cpu_size=max_local_cpu_size,
+            local_disk=local_disk,
+            max_local_disk_size=max_local_disk_size,
+            remote_url=remote_url,
+            remote_serde=remote_serde,
+            use_layerwise=use_layerwise,
+            save_decode_cache=save_decode_cache,
+            enable_blending=enable_blending,
+            blend_recompute_ratio=blend_recompute_ratio,
+            blend_min_tokens=blend_min_tokens,
+            blend_special_str=blend_special_str,
+            enable_p2p=enable_p2p,
+            lookup_url=lookup_url,
+            distributed_url=distributed_url,
+            error_handling=error_handling,
+            enable_controller=enable_controller,
+            lmcache_instance_id=lmcache_instance_id,
+            controller_url=controller_url,
+            lmcache_worker_port=lmcache_worker_port,
+            pre_caching_hash_algorithm=pre_caching_hash_algorithm,
+            enable_nixl=enable_nixl,
+            nixl_role=nixl_role,
+            nixl_receiver_host=nixl_receiver_host,
+            nixl_receiver_port=nixl_receiver_port,
+            nixl_buffer_size=nixl_buffer_size,
+            nixl_buffer_device=nixl_buffer_device,
+            nixl_enable_gc=nixl_enable_gc,
+            enable_xpyd=enable_xpyd,
+            nixl_peer_host=nixl_peer_host,
+            nixl_peer_init_port=nixl_peer_init_port,
+            nixl_peer_alloc_port=nixl_peer_alloc_port,
+            nixl_proxy_host=nixl_proxy_host,
+            nixl_proxy_port=nixl_proxy_port,
+            audit_actual_remote_url=audit_actual_remote_url,
+            weka_path=weka_path,
+            gds_path=gds_path,
+            cufile_buffer_size=cufile_buffer_size,
+            bdev_name=bdev_name,
+            json_config_file=json_config_file,
+            reactor_mask=reactor_mask,
+            main_core=main_core,
+            rpc_addr=rpc_addr,
+            spdk_max_size=spdk_max_size,
+            spdk_enable_dp2p=spdk_enable_dp2p,
+            spdk_peer_bdfs=spdk_peer_bdfs,
+            spdk_gpu_buffer_size_gb=spdk_gpu_buffer_size_gb,
+            spdk_cluster_size_kb=spdk_cluster_size_kb,
+            spdk_pool_initial_blob_count=spdk_pool_initial_blob_count,
+            spdk_pool_max_blob_count=spdk_pool_max_blob_count,
+            spdk_pool_low_watermark=spdk_pool_low_watermark,
+            spdk_pool_repopulate_batch_size=spdk_pool_repopulate_batch_size,
+            spdk_blob_acquire_timeout_secs=spdk_blob_acquire_timeout_secs,
+            spdk_io_timeout_secs=spdk_io_timeout_secs,
+            spdk_enable_chunked_gpu_overlap=spdk_enable_chunked_gpu_overlap,
+            spdk_chunked_gpu_overlap_size_kb=spdk_chunked_gpu_overlap_size_kb,
+            spdk_blob_gpu_overlap_min_blob_count=spdk_blob_gpu_overlap_min_blob_count,
+            extra_config=extra_config,
+            save_unfull_chunk=save_unfull_chunk,
+            blocking_timeout_secs=blocking_timeout_secs,
+            external_lookup_client=external_lookup_client,
         ).validate()
 
     @staticmethod
@@ -405,24 +469,69 @@ class LMCacheEngineConfig:
         main_core = int(_main_core) if _main_core is not None else None
         rpc_addr = config.get("rpc_addr", None)
         spdk_max_size = config.get("spdk_max_size", None)
-        
+        spdk_enable_dp2p = bool(config.get("spdk_enable_dp2p", False))
+        spdk_peer_bdfs = to_str_list(
+            config.get("spdk_peer_bdfs", config.get("spdk_peer_bdf"))
+        )
+        _spdk_gpu_buffer_size_gb = config.get("spdk_gpu_buffer_size_gb", 5.0)
+        spdk_gpu_buffer_size_gb = float(_spdk_gpu_buffer_size_gb)
+        _spdk_cluster_size_kb = config.get("spdk_cluster_size_kb", None)
+        spdk_cluster_size_kb = (
+            int(_spdk_cluster_size_kb) if _spdk_cluster_size_kb is not None else None
+        )
+        _spdk_pool_initial_blob_count = config.get(
+            "spdk_pool_initial_blob_count", None
+        )
+        spdk_pool_initial_blob_count = (
+            int(_spdk_pool_initial_blob_count)
+            if _spdk_pool_initial_blob_count is not None
+            else None
+        )
+        _spdk_pool_max_blob_count = config.get("spdk_pool_max_blob_count", None)
+        spdk_pool_max_blob_count = (
+            int(_spdk_pool_max_blob_count)
+            if _spdk_pool_max_blob_count is not None
+            else None
+        )
+        _spdk_pool_low_watermark = config.get("spdk_pool_low_watermark", None)
+        spdk_pool_low_watermark = (
+            int(_spdk_pool_low_watermark)
+            if _spdk_pool_low_watermark is not None
+            else None
+        )
+        _spdk_pool_repopulate_batch_size = config.get(
+            "spdk_pool_repopulate_batch_size", None
+        )
+        spdk_pool_repopulate_batch_size = (
+            int(_spdk_pool_repopulate_batch_size)
+            if _spdk_pool_repopulate_batch_size is not None
+            else None
+        )
+        _spdk_blob_acquire_timeout_secs = config.get(
+            "spdk_blob_acquire_timeout_secs", 5.0
+        )
+        spdk_blob_acquire_timeout_secs = float(_spdk_blob_acquire_timeout_secs)
+        _spdk_io_timeout_secs = config.get("spdk_io_timeout_secs", 30.0)
+        spdk_io_timeout_secs = float(_spdk_io_timeout_secs)
+        spdk_enable_chunked_gpu_overlap = bool(
+            config.get("spdk_enable_chunked_gpu_overlap", False)
+        )
+        _spdk_chunked_gpu_overlap_size_kb = config.get(
+            "spdk_chunked_gpu_overlap_size_kb", 4096
+        )
+        spdk_chunked_gpu_overlap_size_kb = int(
+            _spdk_chunked_gpu_overlap_size_kb
+        )
+        _spdk_blob_gpu_overlap_min_blob_count = config.get(
+            "spdk_blob_gpu_overlap_min_blob_count", 32
+        )
+        spdk_blob_gpu_overlap_min_blob_count = int(
+            _spdk_blob_gpu_overlap_min_blob_count
+        )
+
         if extra_config is not None:
             assert isinstance(extra_config, dict), "extra_config must be a dict"
-        
-        if bdev_name is not None:
-            spdk.init(bdev_name, 
-                     json_config_file,
-                     reactor_mask,
-                     main_core,
-                     rpc_addr)
-            logger.info(
-                f"SPDK Blobstore initialized with bdev: {bdev_name}, "
-                f"json_config_file: {json_config_file}, "
-                f"reactor_mask: {reactor_mask}, "
-                f"main_core: {main_core}, "
-                f"rpc_addr: {rpc_addr}, "
-                f"spdk_max_size: {spdk_max_size} GB"
-            )
+
         # Try getting "legacy" nixl config
         if nixl_receiver_host is None:
             nixl_receiver_host = config.get("nixl_peer_host", None)
@@ -462,61 +571,103 @@ class LMCacheEngineConfig:
             case _:
                 raise ValueError(f"Invalid remote storage url: {remote_url}")
 
-        return (
+        parsed_config = (
             LMCacheEngineConfig(
-                chunk_size,
-                local_cpu,
-                max_local_cpu_size,
-                local_disk_path,
-                max_local_disk_size,
-                remote_url,
-                remote_serde,
-                use_layerwise,
-                save_decode_cache,
-                enable_blending,
-                blend_recompute_ratio,
-                blend_min_tokens,
-                blend_special_str,
-                enable_p2p,
-                lookup_url,
-                distributed_url,
-                error_handling,
-                enable_controller,
-                lmcache_instance_id,
-                controller_url,
-                lmcache_worker_port,
-                pre_caching_hash_algorithm,
-                enable_nixl,
-                nixl_role,
-                nixl_receiver_host,
-                nixl_receiver_port,
-                nixl_buffer_size,
-                nixl_buffer_device,
-                nixl_enable_gc,
-                enable_xpyd,
-                nixl_peer_host,
-                nixl_peer_init_port,
-                nixl_peer_alloc_port,
-                nixl_proxy_host,
-                nixl_proxy_port,
-                audit_actual_remote_url,
-                weka_path,
-                gds_path,
-                cufile_buffer_size,
-                bdev_name,
-                json_config_file,
-                reactor_mask,
-                main_core,
-                rpc_addr,
-                spdk_max_size,
-                extra_config,
-                save_unfull_chunk,
-                blocking_timeout_secs,
-                external_lookup_client,
+                chunk_size=chunk_size,
+                local_cpu=local_cpu,
+                max_local_cpu_size=max_local_cpu_size,
+                local_disk=local_disk_path,
+                max_local_disk_size=max_local_disk_size,
+                remote_url=remote_url,
+                remote_serde=remote_serde,
+                use_layerwise=use_layerwise,
+                save_decode_cache=save_decode_cache,
+                enable_blending=enable_blending,
+                blend_recompute_ratio=blend_recompute_ratio,
+                blend_min_tokens=blend_min_tokens,
+                blend_special_str=blend_special_str,
+                enable_p2p=enable_p2p,
+                lookup_url=lookup_url,
+                distributed_url=distributed_url,
+                error_handling=error_handling,
+                enable_controller=enable_controller,
+                lmcache_instance_id=lmcache_instance_id,
+                controller_url=controller_url,
+                lmcache_worker_port=lmcache_worker_port,
+                pre_caching_hash_algorithm=pre_caching_hash_algorithm,
+                enable_nixl=enable_nixl,
+                nixl_role=nixl_role,
+                nixl_receiver_host=nixl_receiver_host,
+                nixl_receiver_port=nixl_receiver_port,
+                nixl_buffer_size=nixl_buffer_size,
+                nixl_buffer_device=nixl_buffer_device,
+                nixl_enable_gc=nixl_enable_gc,
+                enable_xpyd=enable_xpyd,
+                nixl_peer_host=nixl_peer_host,
+                nixl_peer_init_port=nixl_peer_init_port,
+                nixl_peer_alloc_port=nixl_peer_alloc_port,
+                nixl_proxy_host=nixl_proxy_host,
+                nixl_proxy_port=nixl_proxy_port,
+                audit_actual_remote_url=audit_actual_remote_url,
+                weka_path=weka_path,
+                gds_path=gds_path,
+                cufile_buffer_size=cufile_buffer_size,
+                bdev_name=bdev_name,
+                json_config_file=json_config_file,
+                reactor_mask=reactor_mask,
+                main_core=main_core,
+                rpc_addr=rpc_addr,
+                spdk_max_size=spdk_max_size,
+                spdk_enable_dp2p=spdk_enable_dp2p,
+                spdk_peer_bdfs=spdk_peer_bdfs,
+                spdk_gpu_buffer_size_gb=spdk_gpu_buffer_size_gb,
+                spdk_cluster_size_kb=spdk_cluster_size_kb,
+                spdk_pool_initial_blob_count=spdk_pool_initial_blob_count,
+                spdk_pool_max_blob_count=spdk_pool_max_blob_count,
+                spdk_pool_low_watermark=spdk_pool_low_watermark,
+                spdk_pool_repopulate_batch_size=spdk_pool_repopulate_batch_size,
+                spdk_blob_acquire_timeout_secs=spdk_blob_acquire_timeout_secs,
+                spdk_io_timeout_secs=spdk_io_timeout_secs,
+                spdk_enable_chunked_gpu_overlap=spdk_enable_chunked_gpu_overlap,
+                spdk_chunked_gpu_overlap_size_kb=spdk_chunked_gpu_overlap_size_kb,
+                spdk_blob_gpu_overlap_min_blob_count=(
+                    spdk_blob_gpu_overlap_min_blob_count
+                ),
+                extra_config=extra_config,
+                save_unfull_chunk=save_unfull_chunk,
+                blocking_timeout_secs=blocking_timeout_secs,
+                external_lookup_client=external_lookup_client,
             )
             .validate()
             .log_config()
         )
+
+        if parsed_config.bdev_name is not None:
+            spdk.set_blob_pool_config(
+                initial_blob_count=parsed_config.spdk_pool_initial_blob_count,
+                max_blob_count=parsed_config.spdk_pool_max_blob_count,
+                low_watermark=parsed_config.spdk_pool_low_watermark,
+                repopulate_batch_size=parsed_config.spdk_pool_repopulate_batch_size,
+            )
+            spdk.init(
+                parsed_config.bdev_name,
+                parsed_config.json_config_file,
+                parsed_config.reactor_mask,
+                parsed_config.main_core,
+                parsed_config.rpc_addr,
+                peer_bdf=(
+                    parsed_config.spdk_peer_bdfs
+                    if parsed_config.spdk_enable_dp2p
+                    else None
+                ),
+                cluster_size_bytes=(
+                    None
+                    if parsed_config.spdk_cluster_size_kb is None
+                    else parsed_config.spdk_cluster_size_kb * 1024
+                ),
+            )
+
+        return parsed_config
 
     @staticmethod
     def from_env() -> "LMCacheEngineConfig":
@@ -545,6 +696,11 @@ class LMCacheEngineConfig:
         def to_int(value: Optional[str]) -> int:
             if value is None:
                 return 0
+            return int(value)
+
+        def to_optional_int(value: Optional[str]) -> Optional[int]:
+            if value is None or value == "":
+                return None
             return int(value)
 
         def to_float(value: Optional[str]) -> float:
@@ -718,6 +874,81 @@ class LMCacheEngineConfig:
                 config.cufile_buffer_size,
             )
         )
+        config.bdev_name = parse_env(get_env_name("bdev_name"), config.bdev_name)
+        config.json_config_file = parse_env(
+            get_env_name("json_config_file"), config.json_config_file
+        )
+        config.rpc_addr = parse_env(get_env_name("rpc_addr"), config.rpc_addr)
+        config.reactor_mask = parse_env(
+            get_env_name("reactor_mask"), config.reactor_mask
+        )
+        config.main_core = to_optional_int(
+            parse_env(get_env_name("main_core"), None)
+        )
+        config.spdk_max_size = to_optional_int(
+            parse_env(get_env_name("spdk_max_size"), None)
+        )
+        config.spdk_enable_dp2p = to_bool(
+            parse_env(get_env_name("spdk_enable_dp2p"), str(config.spdk_enable_dp2p))
+        )
+        config.spdk_peer_bdfs = to_str_list(
+            parse_env(get_env_name("spdk_peer_bdfs"), None)
+        )
+        if config.spdk_peer_bdfs is None:
+            config.spdk_peer_bdfs = to_str_list(
+                parse_env(get_env_name("spdk_peer_bdf"), None)
+            )
+        config.spdk_gpu_buffer_size_gb = to_float(
+            parse_env(
+                get_env_name("spdk_gpu_buffer_size_gb"),
+                str(config.spdk_gpu_buffer_size_gb),
+            )
+        )
+        config.spdk_cluster_size_kb = to_optional_int(
+            parse_env(get_env_name("spdk_cluster_size_kb"), None)
+        )
+        config.spdk_pool_initial_blob_count = to_optional_int(
+            parse_env(get_env_name("spdk_pool_initial_blob_count"), None)
+        )
+        config.spdk_pool_max_blob_count = to_optional_int(
+            parse_env(get_env_name("spdk_pool_max_blob_count"), None)
+        )
+        config.spdk_pool_low_watermark = to_optional_int(
+            parse_env(get_env_name("spdk_pool_low_watermark"), None)
+        )
+        config.spdk_pool_repopulate_batch_size = to_optional_int(
+            parse_env(get_env_name("spdk_pool_repopulate_batch_size"), None)
+        )
+        config.spdk_blob_acquire_timeout_secs = to_float(
+            parse_env(
+                get_env_name("spdk_blob_acquire_timeout_secs"),
+                config.spdk_blob_acquire_timeout_secs,
+            )
+        )
+        config.spdk_io_timeout_secs = to_float(
+            parse_env(
+                get_env_name("spdk_io_timeout_secs"),
+                config.spdk_io_timeout_secs,
+            )
+        )
+        config.spdk_enable_chunked_gpu_overlap = to_bool(
+            parse_env(
+                get_env_name("spdk_enable_chunked_gpu_overlap"),
+                str(config.spdk_enable_chunked_gpu_overlap),
+            )
+        )
+        config.spdk_chunked_gpu_overlap_size_kb = to_int(
+            parse_env(
+                get_env_name("spdk_chunked_gpu_overlap_size_kb"),
+                config.spdk_chunked_gpu_overlap_size_kb,
+            )
+        )
+        config.spdk_blob_gpu_overlap_min_blob_count = to_int(
+            parse_env(
+                get_env_name("spdk_blob_gpu_overlap_min_blob_count"),
+                config.spdk_blob_gpu_overlap_min_blob_count,
+            )
+        )
         config.extra_config = to_dict(parse_env(get_env_name("extra_config"), None))
         config.save_unfull_chunk = to_bool(
             parse_env(get_env_name("save_unfull_chunk"), config.save_unfull_chunk)
@@ -751,6 +982,35 @@ class LMCacheEngineConfig:
 
     def validate(self) -> "LMCacheEngineConfig":
         """Validate the config"""
+        if self.spdk_pool_initial_blob_count is not None:
+            assert self.spdk_pool_initial_blob_count > 0, (
+                "spdk_pool_initial_blob_count must be positive"
+            )
+        if self.spdk_pool_max_blob_count is not None:
+            assert self.spdk_pool_max_blob_count > 0, (
+                "spdk_pool_max_blob_count must be positive"
+            )
+        if self.spdk_pool_low_watermark is not None:
+            assert self.spdk_pool_low_watermark > 0, (
+                "spdk_pool_low_watermark must be positive"
+            )
+        if self.spdk_pool_repopulate_batch_size is not None:
+            assert self.spdk_pool_repopulate_batch_size > 0, (
+                "spdk_pool_repopulate_batch_size must be positive"
+            )
+        assert self.spdk_blob_acquire_timeout_secs > 0, (
+            "spdk_blob_acquire_timeout_secs must be positive"
+        )
+        assert self.spdk_io_timeout_secs > 0, (
+            "spdk_io_timeout_secs must be positive"
+        )
+        assert self.spdk_chunked_gpu_overlap_size_kb > 0, (
+            "spdk_chunked_gpu_overlap_size_kb must be positive"
+        )
+        assert self.spdk_blob_gpu_overlap_min_blob_count > 0, (
+            "spdk_blob_gpu_overlap_min_blob_count must be positive"
+        )
+
         if self.enable_p2p:
             assert self.lookup_url is not None
             assert self.distributed_url is not None
@@ -768,6 +1028,54 @@ class LMCacheEngineConfig:
                 "Nixl only supports save_decode_cache=False"
             )
             assert self.enable_p2p is False, "Nixl only supports enable_p2p=False"
+
+        if self.spdk_enable_dp2p:
+            assert self.bdev_name is not None, (
+                "spdk_enable_dp2p requires bdev_name to be configured"
+            )
+            assert self.json_config_file is not None, (
+                "spdk_enable_dp2p requires json_config_file to be configured"
+            )
+            assert self.reactor_mask is not None, (
+                "spdk_enable_dp2p requires reactor_mask to be configured"
+            )
+            assert self.main_core is not None, (
+                "spdk_enable_dp2p requires main_core to be configured"
+            )
+            assert self.rpc_addr is not None, (
+                "spdk_enable_dp2p requires rpc_addr to be configured"
+            )
+            assert self.spdk_max_size is not None and self.spdk_max_size > 0, (
+                "spdk_enable_dp2p requires spdk_max_size > 0"
+            )
+            assert self.spdk_peer_bdfs, (
+                "spdk_enable_dp2p requires spdk_peer_bdfs to be configured"
+            )
+            assert self.spdk_gpu_buffer_size_gb > 0, (
+                "spdk_gpu_buffer_size_gb must be positive"
+            )
+            if self.spdk_cluster_size_kb is not None:
+                assert self.spdk_cluster_size_kb > 0, (
+                    "spdk_cluster_size_kb must be positive"
+                )
+            assert self.enable_nixl is False, (
+                "spdk_enable_dp2p is incompatible with enable_nixl"
+            )
+            assert self.local_cpu is False, (
+                "spdk_enable_dp2p requires local_cpu=False"
+            )
+            assert self.local_disk is None, (
+                "spdk_enable_dp2p requires local_disk=None"
+            )
+            assert self.remote_url is None, (
+                "spdk_enable_dp2p requires remote_url=None"
+            )
+            assert self.weka_path is None, (
+                "spdk_enable_dp2p requires weka_path=None"
+            )
+            assert self.gds_path is None, (
+                "spdk_enable_dp2p requires gds_path=None"
+            )
 
         return self
 
@@ -818,6 +1126,23 @@ class LMCacheEngineConfig:
             "main_core": self.main_core,
             "rpc_addr": self.rpc_addr,
             "spdk_max_size": self.spdk_max_size,
+            "spdk_enable_dp2p": self.spdk_enable_dp2p,
+            "spdk_peer_bdfs": self.spdk_peer_bdfs,
+            "spdk_gpu_buffer_size_gb": self.spdk_gpu_buffer_size_gb,
+            "spdk_cluster_size_kb": self.spdk_cluster_size_kb,
+            "spdk_pool_initial_blob_count": self.spdk_pool_initial_blob_count,
+            "spdk_pool_max_blob_count": self.spdk_pool_max_blob_count,
+            "spdk_pool_low_watermark": self.spdk_pool_low_watermark,
+            "spdk_pool_repopulate_batch_size": self.spdk_pool_repopulate_batch_size,
+            "spdk_blob_acquire_timeout_secs": self.spdk_blob_acquire_timeout_secs,
+            "spdk_io_timeout_secs": self.spdk_io_timeout_secs,
+            "spdk_enable_chunked_gpu_overlap": self.spdk_enable_chunked_gpu_overlap,
+            "spdk_chunked_gpu_overlap_size_kb": (
+                self.spdk_chunked_gpu_overlap_size_kb
+            ),
+            "spdk_blob_gpu_overlap_min_blob_count": (
+                self.spdk_blob_gpu_overlap_min_blob_count
+            ),
             "external_lookup_client": self.external_lookup_client,
         }
         logger.info(f"LMCache Configuration: {config_dict}")

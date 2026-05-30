@@ -398,8 +398,40 @@ class LMCacheConnectorV1Impl:
             vllm_config.parallel_config
         )
         self.current_layer = 0
+        self.tp_rank = get_tensor_model_parallel_rank()
+
+        request_trace_env = os.environ.get("LMCACHE_TRACE_REQUESTS")
+        if request_trace_env is None:
+            self.enable_request_trace = (
+                getattr(vllm_config.scheduler_config, "max_num_seqs", None) == 1
+            )
+        else:
+            self.enable_request_trace = request_trace_env.lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
 
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
+
+    def _log_request_trace(
+        self, stage: str, request_id: str, **fields: object
+    ) -> None:
+        if not self.enable_request_trace:
+            return
+
+        parts = [
+            f"stage={stage}",
+            f"role={self.kv_role}",
+            f"tp_rank={self.tp_rank}",
+            f"request_id={request_id}",
+        ]
+        for key, value in fields.items():
+            if value is None:
+                continue
+            parts.append(f"{key}={value}")
+        print(f"[LMCACHE_REQ_TRACE] {' '.join(parts)}", flush=True)
 
     def _init_kv_caches_from_forward_context(self, forward_context: "ForwardContext"):
         for layer_name in forward_context.no_compile_layers:
@@ -473,6 +505,9 @@ class LMCacheConnectorV1Impl:
             token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            num_expected_tokens = (
+                lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
+            )
             if self.use_layerwise:
                 sync = True
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
@@ -495,20 +530,20 @@ class LMCacheConnectorV1Impl:
                     # NOTE: retrieve for two layers at the first layer
                     next(layerwise_retriever)
                     next(layerwise_retriever)
-                    self.layerwise_retrievers.append(layerwise_retriever)
+                    self.layerwise_retrievers.append(
+                        (request.req_id, num_expected_tokens, layerwise_retriever)
+                    )
             else:
                 ret_token_mask = self.lmcache_engine.retrieve(
                     tokens[:lmcache_cached_tokens],
                     token_mask[:lmcache_cached_tokens],
                     kvcaches=kvcaches,
                     slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                    request_id=request.req_id,
                 )
 
                 # Check the result
                 num_retrieved_tokens = ret_token_mask.sum().item()
-                num_expected_tokens = (
-                    lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
-                )
                 if num_retrieved_tokens < num_expected_tokens:
                     logger.error(
                         "The number of retrieved tokens is less than the "
@@ -519,6 +554,15 @@ class LMCacheConnectorV1Impl:
                         num_retrieved_tokens,
                         num_expected_tokens,
                     )
+                self._log_request_trace(
+                    "load",
+                    request.req_id,
+                    vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                    lmcache_hit_tokens=lmcache_cached_tokens,
+                    expected_load_tokens=num_expected_tokens,
+                    retrieved_tokens=num_retrieved_tokens,
+                    layerwise=0,
+                )
 
         self.lmcache_engine.lookup_unpin(metadata.lookup_requests_in_step)
 
@@ -536,13 +580,19 @@ class LMCacheConnectorV1Impl:
             logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
 
         # Wait for the layer to be loaded
-        for layerwise_retriever in self.layerwise_retrievers:
+        for req_id, num_expected_tokens, layerwise_retriever in self.layerwise_retrievers:
             ret_token_mask = next(layerwise_retriever)
 
             if self.current_layer == self.num_layers - 1:
                 assert ret_token_mask is not None
                 num_retrieved_tokens = ret_token_mask.sum().item()
-                logger.info(f"Retrieved {num_retrieved_tokens} tokens")
+                self._log_request_trace(
+                    "load",
+                    req_id,
+                    expected_load_tokens=num_expected_tokens,
+                    retrieved_tokens=num_retrieved_tokens,
+                    layerwise=1,
+                )
 
         return
 
@@ -616,14 +666,26 @@ class LMCacheConnectorV1Impl:
                 store_mask = torch.ones_like(token_ids, dtype=torch.bool)
                 store_mask[:skip_leading_tokens] = False
 
-                logger.info(
-                    "Storing KV cache for %d out of %d tokens "
-                    "(skip_leading_tokens=%d) for request %s",
-                    len(token_ids) - skip_leading_tokens,
-                    len(token_ids),
-                    skip_leading_tokens,
-                    request.req_id,
-                )
+                store_tokens = int(store_mask.sum().item())
+                if self.enable_request_trace:
+                    self._log_request_trace(
+                        "store",
+                        request.req_id,
+                        total_tokens=len(token_ids),
+                        skip_leading_tokens=skip_leading_tokens,
+                        store_tokens=store_tokens,
+                        is_last_prefill=int(request.is_last_prefill),
+                        layerwise=1,
+                    )
+                else:
+                    logger.info(
+                        "Storing KV cache for %d out of %d tokens "
+                        "(skip_leading_tokens=%d) for request %s",
+                        store_tokens,
+                        len(token_ids),
+                        skip_leading_tokens,
+                        request.req_id,
+                    )
                 if not is_first:
                     sync = True
                     is_first = True
@@ -706,15 +768,6 @@ class LMCacheConnectorV1Impl:
             store_mask = torch.ones_like(token_ids, dtype=torch.bool)
             store_mask[:skip_leading_tokens] = False
 
-            # logger.info(
-            #     "Storing KV cache for %d out of %d tokens "
-            #     "(skip_leading_tokens=%d) for request %s",
-            #     len(token_ids) - skip_leading_tokens,
-            #     len(token_ids),
-            #     skip_leading_tokens,
-            #     request.req_id,
-            # )
-
             is_last_prefill = request.is_last_prefill
             if is_last_prefill:
                 if request.disagg_spec:
@@ -727,6 +780,16 @@ class LMCacheConnectorV1Impl:
                 token_ids = token_ids[:aligned_token_len]
                 store_mask = store_mask[:aligned_token_len]
                 slot_mapping = slot_mapping[:aligned_token_len]
+
+            self._log_request_trace(
+                "store",
+                request.req_id,
+                total_tokens=len(token_ids),
+                skip_leading_tokens=skip_leading_tokens,
+                store_tokens=int(store_mask.sum().item()),
+                is_last_prefill=int(is_last_prefill),
+                layerwise=0,
+            )
 
             self.lmcache_engine.store(
                 token_ids,
@@ -814,6 +877,18 @@ class LMCacheConnectorV1Impl:
             can_load=False,
         )
 
+        self._log_request_trace(
+            "lookup",
+            request.request_id,
+            prompt_tokens=len(request.prompt_token_ids),
+            request_tokens=request.num_tokens,
+            vllm_cached_tokens=num_computed_tokens,
+            lmcache_hit_tokens=num_external_hit_tokens,
+            load_tokens=max(need_to_allocate, 0),
+            full_hit=int(num_external_hit_tokens >= request.num_tokens),
+            skip_last_n_tokens=self.skip_last_n_tokens,
+        )
+
         if need_to_allocate <= 0:
             return 0
 
@@ -861,11 +936,28 @@ class LMCacheConnectorV1Impl:
 
         if request.request_id not in self.load_specs:
             # No KV tokens from external KV cache, return
+            self._log_request_trace(
+                "alloc",
+                request.request_id,
+                external_tokens=num_external_tokens,
+                can_load=0,
+                reason="no_load_spec",
+            )
             return
 
         if num_external_tokens == 0:
             # No need to load anything
             self.load_specs[request.request_id].can_load = False
+            load_spec = self.load_specs[request.request_id]
+            self._log_request_trace(
+                "alloc",
+                request.request_id,
+                vllm_cached_tokens=load_spec.vllm_cached_tokens,
+                lmcache_hit_tokens=load_spec.lmcache_cached_tokens,
+                external_tokens=0,
+                can_load=0,
+                reason="zero_external_tokens",
+            )
             return
 
         # Only check for non-prompt-hit case
@@ -886,6 +978,15 @@ class LMCacheConnectorV1Impl:
             )
 
         self.load_specs[request.request_id].can_load = True
+        load_spec = self.load_specs[request.request_id]
+        self._log_request_trace(
+            "alloc",
+            request.request_id,
+            vllm_cached_tokens=load_spec.vllm_cached_tokens,
+            lmcache_hit_tokens=load_spec.lmcache_cached_tokens,
+            external_tokens=num_external_tokens,
+            can_load=1,
+        )
 
     @_lmcache_nvtx_annotate
     def build_connector_meta(

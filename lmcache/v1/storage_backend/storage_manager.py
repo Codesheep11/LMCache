@@ -69,11 +69,12 @@ class StorageManager:
         )
 
         self.enable_nixl = config.enable_nixl
+        self.local_cpu_backend = self.storage_backends.get("LocalCPUBackend")
 
         if self.enable_nixl:
             self.allocator_backend = self.storage_backends["NixlBackend"]
-            if config.local_cpu:
-                self.local_cpu_backend = self.storage_backends["LocalCPUBackend"]
+        elif config.spdk_enable_dp2p:
+            self.allocator_backend = self.storage_backends["SpdkDirectP2PBackend"]
         else:
             self.allocator_backend = self.storage_backends["LocalCPUBackend"]
 
@@ -219,10 +220,16 @@ class StorageManager:
             # are allocated by the allocator backend.
             memory_obj = backend.get_blocking(key)
             if memory_obj:
-                if backend_name not in ["LocalCPUBackend", "NixlBackend"]:
-                    local_cpu_backend = self.storage_backends["LocalCPUBackend"]
-                    assert isinstance(local_cpu_backend, LocalCPUBackend)
-                    local_cpu_backend.submit_put_task(key, memory_obj)
+                if (
+                    self.local_cpu_backend is not None
+                    and backend_name not in ["LocalCPUBackend", "NixlBackend"]
+                    and not getattr(backend, "skip_cpu_writeback", False)
+                    and not (
+                        memory_obj.tensor is not None and memory_obj.tensor.is_cuda
+                    )
+                ):
+                    assert isinstance(self.local_cpu_backend, LocalCPUBackend)
+                    self.local_cpu_backend.submit_put_task(key, memory_obj)
                 return memory_obj
 
         return None
@@ -262,6 +269,36 @@ class StorageManager:
             memory_objs = storage_backend.batched_get_blocking(keys)
             if memory_objs:
                 return memory_objs
+        return None
+
+    def batched_get_to_gpu(
+        self,
+        keys: List[CacheEngineKey],
+        starts: List[int],
+        ends: List[int],
+        gpu_connector,
+        location: Optional[str] = None,
+        **kwargs,
+    ) -> Optional[List[MemoryObj]]:
+        """
+        Blocking function to stream memory objects from the storage backend
+        directly into the final GPU KV cache.
+        """
+        for backend_name, storage_backend in self.storage_backends.items():
+            if location and backend_name != location:
+                continue
+            batched_get_to_gpu = getattr(
+                storage_backend, "batched_get_to_gpu_blocking", None
+            )
+            if batched_get_to_gpu is None:
+                return None
+            return batched_get_to_gpu(
+                keys,
+                starts,
+                ends,
+                gpu_connector,
+                **kwargs,
+            )
         return None
 
     def layerwise_batched_get(

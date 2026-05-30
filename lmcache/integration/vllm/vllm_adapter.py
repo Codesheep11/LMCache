@@ -50,6 +50,7 @@ from lmcache.v1.gpu_connector import (
     VLLMPagedMemGPUConnectorV2,
     VLLMPagedMemLayerwiseGPUConnector,
 )
+from lmcache.v1.spdk_utils import align_size_to_io_unit, init_spdk_if_needed
 
 # FIXME(Jiayi): temporarily comment this out
 # from lmcache_vllm.blend_adapter import remove_request_id_indices
@@ -156,9 +157,11 @@ def init_lmcache_engine(
     logger.info(f"use mla: {use_mla}, kv shape: {kv_shape}")
 
     if config.bdev_name:
+        init_spdk_if_needed(config)
         num_elements = num_layer * (1 if use_mla else 2) * chunk_size * num_kv_head * head_size
         bytes_per_element = torch.empty((), dtype=kv_dtype).element_size()
-        blob_size_in_bytes = num_elements * bytes_per_element
+        logical_blob_size_in_bytes = num_elements * bytes_per_element
+        blob_size_in_bytes = align_size_to_io_unit(logical_blob_size_in_bytes)
         logger.info(
             f"Each KV cache blob size: {blob_size_in_bytes} bytes "
             f"({blob_size_in_bytes / (1024**2):.2f} MB)"
