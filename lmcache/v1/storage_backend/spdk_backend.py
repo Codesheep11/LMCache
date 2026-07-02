@@ -29,6 +29,9 @@ import spdk_controller as spdk
 
 logger = init_logger(__name__)
 
+DEFAULT_BLOB_ACQUIRE_TIMEOUT_SECS = 5.0
+DEFAULT_IO_TIMEOUT_SECS = 30.0
+
 
 class SpdkBlobBackend(StorageBackendInterface):
     def __init__(
@@ -51,8 +54,8 @@ class SpdkBlobBackend(StorageBackendInterface):
         self.usage = 0
         self.bdev_name = config.bdev_name
         self.sock_path = config.rpc_addr
-        self.blob_acquire_timeout_secs = config.spdk_blob_acquire_timeout_secs
-        self.io_timeout_secs = config.spdk_io_timeout_secs
+        self.blob_acquire_timeout_secs = DEFAULT_BLOB_ACQUIRE_TIMEOUT_SECS
+        self.io_timeout_secs = DEFAULT_IO_TIMEOUT_SECS
         self.trace_io = os.environ.get("LMCACHE_TRACE_IO", "").lower() in (
             "1",
             "true",
@@ -66,14 +69,10 @@ class SpdkBlobBackend(StorageBackendInterface):
         )
         self.io_unit_size = spdk.get_io_unit_size()
         requested_overlap_chunk_kb = getattr(
-            config, "spdk_chunked_gpu_overlap_size_kb", 4096
-        )
-        self.blob_gpu_overlap_min_blob_count = max(
-            int(getattr(config, "spdk_blob_gpu_overlap_min_blob_count", 32)),
-            1,
+            config, "xds_chunked_size_kb", 4096
         )
         self.chunked_gpu_overlap_requested = getattr(
-            config, "spdk_enable_chunked_gpu_overlap", False
+            config, "xds_enable_chunked_overlap", False
         )
         self.enable_chunked_gpu_overlap = (
             self.chunked_gpu_overlap_requested
@@ -86,12 +85,12 @@ class SpdkBlobBackend(StorageBackendInterface):
         )
         if self.chunked_gpu_overlap_requested and self.cuda_device is None:
             logger.warning(
-                "spdk_enable_chunked_gpu_overlap is enabled, but CUDA is unavailable. "
+                "xds_enable_chunked_overlap is enabled, but CUDA is unavailable. "
                 "Falling back to the original SPDK read path."
             )
         
-        spdk_max_size = config.spdk_max_size
-        self.evictor = LRUEvictor(max_cache_size=spdk_max_size)
+        xds_max_size = config.xds_max_size
+        self.evictor = LRUEvictor(max_cache_size=xds_max_size)
 
         self.dict_lock = threading.RLock()
         self.usage_lock = threading.RLock()

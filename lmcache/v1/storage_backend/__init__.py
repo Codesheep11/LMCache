@@ -21,7 +21,7 @@ from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
 from lmcache.v1.storage_backend.remote_backend import RemoteBackend
 from lmcache.v1.storage_backend.weka_gds_backend import WekaGdsBackend
 from lmcache.v1.storage_backend.spdk_backend import SpdkBlobBackend
-from lmcache.v1.storage_backend.spdk_direct_p2p_backend import SpdkDirectP2PBackend
+from lmcache.v1.storage_backend.xds_backend import XDSBackend
 
 if TYPE_CHECKING:
     # First Party
@@ -31,7 +31,7 @@ logger = init_logger(__name__)
 
 
 def _spdk_enable_direct_p2p(config: LMCacheEngineConfig) -> bool:
-    return config.spdk_enable_dp2p
+    return config.xds_enable_direct
 
 def CreateStorageBackends(
     config: LMCacheEngineConfig,
@@ -97,10 +97,14 @@ def CreateStorageBackends(
         backend_name = str(local_disk_backend)
         storage_backends[backend_name] = local_disk_backend
 
-    if config.bdev_name is not None and config.spdk_max_size > 0:
+    if (
+        config.bdev_name is not None
+        and config.xds_max_size is not None
+        and config.xds_max_size > 0
+    ):
         init_spdk_if_needed(config)
         if _spdk_enable_direct_p2p(config):
-            spdk_backend = SpdkDirectP2PBackend(
+            spdk_backend = XDSBackend(
                 config,
                 loop,
                 memory_allocator,

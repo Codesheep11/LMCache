@@ -31,14 +31,16 @@ if TYPE_CHECKING:
     from lmcache.v1.cache_controller.worker import LMCacheWorker
 
 # Local
-import spdk_controller as spdk
+import spdk_controller as xds
 
 logger = init_logger(__name__)
 
+BLOB_ACQUIRE_TIMEOUT_SECS = 5.0
+IO_TIMEOUT_SECS = 30.0
 
-class SpdkDirectP2PBackend(StorageBackendInterface):
+
+class XDSBackend(StorageBackendInterface):
     # StorageManager uses these capability flags instead of class-name branches.
-    is_allocator_backend = True
     skip_cpu_writeback = True
 
     def __init__(
@@ -53,21 +55,22 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
         assert dst_device.startswith("cuda")
         super().__init__(dst_device)
 
-        if not spdk.dp2p_is_enabled():
+        if not xds.dp2p_is_enabled():
             raise RuntimeError(
-                "SPDK direct-p2p is not enabled. Check peer BDF config and SPDK init."
+                "xDS direct-p2p is not enabled." \
+                "Check peer BDF config and xDS init."
             )
 
         assert isinstance(memory_allocator, GPUMemoryAllocator), (
-            "SpdkDirectP2PBackend requires a GPUMemoryAllocator-compatible allocator."
+            "XDSBackend requires a GPUMemoryAllocator-compatible allocator."
         )
 
         self.memory_allocator = memory_allocator
         assert hasattr(self.memory_allocator, "base_pointer"), (
-            "SpdkDirectP2PBackend requires allocator.base_pointer."
+            "XDSBackend requires allocator.base_pointer."
         )
 
-        self.gpu_reg_handle = spdk.register_gpu_buffer(
+        self.gpu_reg_handle = xds.register_gpu_buffer(
             self.memory_allocator.base_pointer,
             self.memory_allocator.tensor.numel()
             * self.memory_allocator.tensor.element_size(),
@@ -77,17 +80,10 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
         self.lmcache_worker = lmcache_worker
         self.instance_id = config.lmcache_instance_id
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
-        self.blob_acquire_timeout_secs = config.spdk_blob_acquire_timeout_secs
-        self.io_timeout_secs = config.spdk_io_timeout_secs
-        self.trace_io = os.environ.get("LMCACHE_TRACE_IO", "").lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
+        self.trace_io = True
 
         self.dict: OrderedDict[CacheEngineKey, SpdkBlobMetadata] = OrderedDict()
-        self.evictor = LRUEvictor(max_cache_size=config.spdk_max_size)
+        self.evictor = LRUEvictor(max_cache_size=config.xds_max_size)
         self.usage = 0
 
         self.dict_lock = threading.RLock()
@@ -95,7 +91,7 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
         self.put_tasks_lock = threading.RLock()
         self.prefetch_lock = threading.RLock()
 
-        spdk.init_blob_pool()
+        xds.init_blob_pool()
 
         self.put_tasks: dict[CacheEngineKey, MemoryObj] = {}
         self.prefetch_tasks: dict[CacheEngineKey, Future] = {}
@@ -108,30 +104,15 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
     def __str__(self):
         return self.__class__.__name__
 
-    def _allocate_memory_obj(self, shape, dtype, fmt) -> Optional[MemoryObj]:
-        return self.memory_allocator.allocate(shape, dtype, fmt)
-
-    def _batched_allocate_memory_objs(
-        self, shape, dtype, batch_size: int, fmt
-    ) -> Optional[List[MemoryObj]]:
-        return self.memory_allocator.batched_allocate(shape, dtype, batch_size, fmt)
-
-    def _get_io_ptr(self, memory_obj: MemoryObj) -> int:
-        assert memory_obj.tensor is not None
-        return int(memory_obj.tensor.data_ptr())
-
     def _get_storage_size(self, memory_obj: MemoryObj) -> int:
         storage_size = memory_obj.get_physical_size()
         aligned_size = align_size_to_io_unit(storage_size)
         if storage_size != aligned_size:
             raise ValueError(
-                "SPDK direct-p2p backend requires memory objects to be io_unit aligned: "
+                "xDS backend requires memory objects to be io_unit aligned: "
                 f"physical_size={storage_size}, aligned_size={aligned_size}"
             )
         return storage_size
-
-    def _wait_for_io(self, future: Future):
-        return future.result(timeout=self.io_timeout_secs)
 
     def _update_usage(self, delta: int) -> None:
         with self.usage_lock:
@@ -170,7 +151,7 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
     ) -> Optional[MemoryObj]:
-        return self._allocate_memory_obj(shape, dtype, fmt)
+        return self.memory_allocator.allocate(shape, dtype, fmt)
 
     def batched_allocate(
         self,
@@ -180,7 +161,7 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
     ) -> Optional[List[MemoryObj]]:
-        return self._batched_allocate_memory_objs(shape, dtype, batch_size, fmt)
+        return self.memory_allocator.batched_allocate(shape, dtype, batch_size, fmt)
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self.put_tasks_lock:
@@ -228,7 +209,7 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
         if update_evictor_usage:
             self._update_evictor_usage(-metadata.size)
 
-        spdk.release_blob(metadata.blob_handle)
+        xds.release_blob(metadata.blob_handle)
 
         if self.lmcache_worker is not None:
             self.lmcache_worker.put_msg(
@@ -247,7 +228,7 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
         with self.dict_lock:
             if key in self.dict:
                 old_metadata = self.dict.pop(key)
-                spdk.release_blob(old_metadata.blob_handle)
+                xds.release_blob(old_metadata.blob_handle)
                 delete_size = old_metadata.size
                 has_stored = True
             self.dict[key] = SpdkBlobMetadata(
@@ -283,7 +264,7 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
 
         try:
             blob_handles = [
-                spdk.get_blob(timeout=self.blob_acquire_timeout_secs)
+                xds.get_blob(timeout=BLOB_ACQUIRE_TIMEOUT_SECS)
                 for _ in keys
             ]
             total_size = 0
@@ -293,7 +274,7 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
                 total_size += storage_size
                 io_sizes.append(storage_size)
                 requests.append(
-                    (blob_handle, self._get_io_ptr(memory_obj), 0, storage_size)
+                    (blob_handle, int(memory_obj.tensor.data_ptr()), 0, storage_size)
                 )
 
             self._update_usage(total_size)
@@ -301,11 +282,9 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
 
             io_start = time.perf_counter()
             try:
-                self._wait_for_io(
-                    spdk.write_batch_async(
-                        requests,
-                    )
-                )
+                xds.write_batch_async(
+                    requests,
+                ).result(timeout=IO_TIMEOUT_SECS)
             except Exception:
                 self._log_io_trace(
                     "write_batch", io_sizes, time.perf_counter() - io_start, False
@@ -328,7 +307,7 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
                 self._update_usage(-usage_added)
                 self._update_evictor_usage(-usage_added)
             for handle in blob_handles:
-                spdk.release_blob(handle)
+                xds.release_blob(handle)
             for memory_obj in memory_objs:
                 memory_obj.ref_count_down()
         finally:
@@ -397,10 +376,10 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
         with self.stats_lock:
             self.cumulative_read_bytes += read_bytes
             self.cumulative_read_time += read_time
-            logger.info(
-                "current average read bandwidth: %.2f MB/s",
-                (self.cumulative_read_bytes / self.cumulative_read_time) / (1024 * 1024),
-            )
+            # logger.info(
+            #     "current average read bandwidth: %.2f MB/s",
+            #     (self.cumulative_read_bytes / self.cumulative_read_time) / (1024 * 1024),
+            # )
 
     def _perform_batched_spdk_read(
         self, spdk_tasks_info: List[Dict[str, Any]]
@@ -415,8 +394,11 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
         io_sizes: List[int] = []
 
         for idx, task_info in enumerate(spdk_tasks_info):
-            memory_obj = self._allocate_memory_obj(
-                task_info["shape"], task_info["dtype"], task_info["fmt"]
+            memory_obj = self.allocate(
+                task_info["shape"],
+                task_info["dtype"],
+                task_info["fmt"],
+                eviction=False,
             )
             if memory_obj is None:
                 logger.warning("GPU allocation failed during batched direct-p2p read.")
@@ -433,7 +415,7 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
             batch_requests.append(
                 (
                     task_info["blob_handle"],
-                    self._get_io_ptr(memory_obj),
+                    int(memory_obj.tensor.data_ptr()),
                     0,
                     storage_size,
                 )
@@ -445,12 +427,12 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
         if not batch_requests:
             return allocated_memory_objs, 0
 
-        future = spdk.read_batch_async(
+        future = xds.read_batch_async(
             batch_requests,
         )
         try:
             io_start = time.perf_counter()
-            self._wait_for_io(future)
+            future.result(timeout=IO_TIMEOUT_SECS)
             self._log_io_trace(
                 "read_batch", io_sizes, time.perf_counter() - io_start, True
             )
@@ -500,7 +482,7 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
 
         for key, future in prefetch_futures:
             try:
-                results[key] = future.result(timeout=self.io_timeout_secs)
+                results[key] = future.result(timeout=IO_TIMEOUT_SECS)
             except Exception as e:
                 logger.error(
                     "Waiting for direct-p2p prefetch task for %s failed: %s",
@@ -544,7 +526,7 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
     async def async_load_bytes_from_spdk(
         self, key: CacheEngineKey, blob_handle: int, storage_size: int, dtype, shape, fmt
     ) -> Optional[MemoryObj]:
-        memory_obj = self._allocate_memory_obj(shape, dtype, fmt)
+        memory_obj = self.allocate(shape, dtype, fmt, eviction=False)
         if memory_obj is None:
             logger.debug("GPU allocation failed during async direct-p2p load.")
             return None
@@ -560,11 +542,14 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
         try:
             await asyncio.wait_for(
                 asyncio.wrap_future(
-                    spdk.read_async(
-                        blob_handle, self._get_io_ptr(memory_obj), 0, storage_size
+                    xds.read_async(
+                        blob_handle,
+                        int(memory_obj.tensor.data_ptr()),
+                        0,
+                        storage_size,
                     )
                 ),
-                timeout=self.io_timeout_secs,
+                timeout=IO_TIMEOUT_SECS,
             )
         except Exception:
             self._log_io_trace(
@@ -639,8 +624,8 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
             self.evictor.update_on_hit(key, self.dict)
             metadata = self.dict[key]
 
-        memory_obj = self._allocate_memory_obj(
-            metadata.shape, metadata.dtype, metadata.fmt
+        memory_obj = self.allocate(
+            metadata.shape, metadata.dtype, metadata.fmt, eviction=False
         )
         if memory_obj is None:
             logger.debug("GPU allocation failed during direct-p2p get_blocking.")
@@ -654,15 +639,15 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
             )
 
         start_time = time.time()
-        future = spdk.read_async(
+        future = xds.read_async(
             metadata.blob_handle,
-            self._get_io_ptr(memory_obj),
+            int(memory_obj.tensor.data_ptr()),
             0,
             metadata.size,
         )
         try:
             io_start = time.perf_counter()
-            self._wait_for_io(future)
+            future.result(timeout=IO_TIMEOUT_SECS)
             self._log_io_trace(
                 "read_blocking",
                 [metadata.size],
@@ -679,7 +664,7 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
                 False,
             )
             logger.error(
-                "SPDK direct-p2p read failed or timed out: %s", e, exc_info=True
+                "xDS read failed or timed out: %s", e, exc_info=True
             )
             memory_obj.ref_count_down()
             return None
@@ -695,11 +680,11 @@ class SpdkDirectP2PBackend(StorageBackendInterface):
 
         if self.gpu_reg_handle is not None:
             try:
-                spdk.unregister_gpu_buffer(self.gpu_reg_handle)
+                xds.unregister_gpu_buffer(self.gpu_reg_handle)
             except Exception:
-                logger.warning("Failed to unregister SPDK direct-p2p GPU buffer.")
+                logger.warning("Failed to unregister xDS GPU buffer.")
             finally:
                 self.gpu_reg_handle = None
 
-        spdk.unload()
-        logger.info("SPDK direct-p2p backend closed.")
+        xds.unload()
+        logger.info("xDS backend closed.")

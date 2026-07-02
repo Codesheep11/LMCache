@@ -130,10 +130,10 @@ class LMCacheEngineConfig:
     # Size of CuFile Buffer in MiB
     cufile_buffer_size: Optional[int] = None
 
-    # (Optional) SPDK params
-    # The name of the SPDK bdev to use
+    # (Optional) xDS params
+    # The name of the bdev to use
     bdev_name: Optional[str] = None
-    # The path to the JSON config file for SPDK
+    # The path to the JSON config file
     json_config_file: Optional[str] = None
     # The RPC address for SPDK
     rpc_addr: Optional[str] = None
@@ -142,34 +142,20 @@ class LMCacheEngineConfig:
     # The main core for SPDK workers
     main_core: Optional[int] = None
     # The maximum size of the SPDK blobstore in GB
-    spdk_max_size: Optional[int] = None
-    # Whether to enable SPDK direct-p2p mode
-    spdk_enable_dp2p: bool = False
+    xds_max_size: Optional[int] = None
+    # Whether to enable xds direct mode
+    xds_enable_direct: bool = False
     # Allowed peer BDFs for direct-p2p
-    spdk_peer_bdfs: Optional[list[str]] = None
+    xds_peer_bdfs: Optional[list[str]] = None
     # Size of the registered GPU staging buffer in GiB
-    spdk_gpu_buffer_size_gb: float = 5.0
-    # Optional SPDK cluster size override in KiB
-    spdk_cluster_size_kb: Optional[int] = None
-    # Optional SPDK blob pool warm-start size
-    spdk_pool_initial_blob_count: Optional[int] = None
-    # Optional SPDK blob pool hard cap
-    spdk_pool_max_blob_count: Optional[int] = None
-    # Optional SPDK blob pool repopulation trigger threshold
-    spdk_pool_low_watermark: Optional[int] = None
-    # Optional SPDK blob pool repopulation batch size
-    spdk_pool_repopulate_batch_size: Optional[int] = None
-    # Timeout when waiting for a free blob handle from the pool
-    spdk_blob_acquire_timeout_secs: float = 5.0
-    # Timeout for SPDK read/write futures
-    spdk_io_timeout_secs: float = 30.0
-    # Whether to split large SPDK reads into staged SSD->CPU->GPU sub-reads
-    spdk_enable_chunked_gpu_overlap: bool = False
-    # Size of each staged SPDK sub-read in KiB
-    spdk_chunked_gpu_overlap_size_kb: int = 4096
-    # Prefer blob-granularity overlap when a batched read contains at least
-    # this many blobs; otherwise prefer chunk-granularity overlap.
-    spdk_blob_gpu_overlap_min_blob_count: int = 32
+    xds_gpu_buffer_size_gb: float = 5.0
+    # Optional XDS cluster size override in KiB
+    xds_cluster_size_kb: int = 1024
+
+    # Whether to split large reads into staged SSD->CPU->GPU sub-reads
+    xds_enable_chunked_overlap: bool = False
+    # Size of each staged XDS sub-read in KiB
+    xds_chunked_size_kb: int = 4096
 
     # The extra config
     extra_config: Optional[dict] = None
@@ -233,20 +219,13 @@ class LMCacheEngineConfig:
         reactor_mask: Optional[str] = None,
         main_core: Optional[int] = None,
         rpc_addr: Optional[str] = None,
-        spdk_max_size: Optional[int] = None,
-        spdk_enable_dp2p: bool = False,
-        spdk_peer_bdfs: Optional[list[str]] = None,
-        spdk_gpu_buffer_size_gb: float = 5.0,
-        spdk_cluster_size_kb: Optional[int] = None,
-        spdk_pool_initial_blob_count: Optional[int] = None,
-        spdk_pool_max_blob_count: Optional[int] = None,
-        spdk_pool_low_watermark: Optional[int] = None,
-        spdk_pool_repopulate_batch_size: Optional[int] = None,
-        spdk_blob_acquire_timeout_secs: float = 5.0,
-        spdk_io_timeout_secs: float = 30.0,
-        spdk_enable_chunked_gpu_overlap: bool = False,
-        spdk_chunked_gpu_overlap_size_kb: int = 4096,
-        spdk_blob_gpu_overlap_min_blob_count: int = 32,
+        xds_max_size: Optional[int] = None,
+        xds_enable_direct: bool = False,
+        xds_peer_bdfs: Optional[list[str]] = None,
+        xds_gpu_buffer_size_gb: float = 5.0,
+        xds_cluster_size_kb: Optional[int] = None,
+        xds_enable_chunked_overlap: bool = False,
+        xds_chunked_size_kb: int = 4096,
         extra_config: Optional[dict] = None,
         save_unfull_chunk: bool = True,
         blocking_timeout_secs: int = 10,
@@ -298,20 +277,13 @@ class LMCacheEngineConfig:
             reactor_mask=reactor_mask,
             main_core=main_core,
             rpc_addr=rpc_addr,
-            spdk_max_size=spdk_max_size,
-            spdk_enable_dp2p=spdk_enable_dp2p,
-            spdk_peer_bdfs=spdk_peer_bdfs,
-            spdk_gpu_buffer_size_gb=spdk_gpu_buffer_size_gb,
-            spdk_cluster_size_kb=spdk_cluster_size_kb,
-            spdk_pool_initial_blob_count=spdk_pool_initial_blob_count,
-            spdk_pool_max_blob_count=spdk_pool_max_blob_count,
-            spdk_pool_low_watermark=spdk_pool_low_watermark,
-            spdk_pool_repopulate_batch_size=spdk_pool_repopulate_batch_size,
-            spdk_blob_acquire_timeout_secs=spdk_blob_acquire_timeout_secs,
-            spdk_io_timeout_secs=spdk_io_timeout_secs,
-            spdk_enable_chunked_gpu_overlap=spdk_enable_chunked_gpu_overlap,
-            spdk_chunked_gpu_overlap_size_kb=spdk_chunked_gpu_overlap_size_kb,
-            spdk_blob_gpu_overlap_min_blob_count=spdk_blob_gpu_overlap_min_blob_count,
+            xds_max_size=xds_max_size,
+            xds_enable_direct=xds_enable_direct,
+            xds_peer_bdfs=xds_peer_bdfs,
+            xds_gpu_buffer_size_gb=xds_gpu_buffer_size_gb,
+            xds_cluster_size_kb=xds_cluster_size_kb,
+            xds_enable_chunked_overlap=xds_enable_chunked_overlap,
+            xds_chunked_size_kb=xds_chunked_size_kb,
             extra_config=extra_config,
             save_unfull_chunk=save_unfull_chunk,
             blocking_timeout_secs=blocking_timeout_secs,
@@ -468,65 +440,25 @@ class LMCacheEngineConfig:
         _main_core = config.get("main_core", None)
         main_core = int(_main_core) if _main_core is not None else None
         rpc_addr = config.get("rpc_addr", None)
-        spdk_max_size = config.get("spdk_max_size", None)
-        spdk_enable_dp2p = bool(config.get("spdk_enable_dp2p", False))
-        spdk_peer_bdfs = to_str_list(
-            config.get("spdk_peer_bdfs", config.get("spdk_peer_bdf"))
+        xds_max_size = config.get("xds_max_size", None)
+        xds_enable_direct = bool(config.get("xds_enable_direct", False))
+        xds_peer_bdfs = to_str_list(
+            config.get("xds_peer_bdfs", config.get("spdk_peer_bdf"))
         )
-        _spdk_gpu_buffer_size_gb = config.get("spdk_gpu_buffer_size_gb", 5.0)
-        spdk_gpu_buffer_size_gb = float(_spdk_gpu_buffer_size_gb)
-        _spdk_cluster_size_kb = config.get("spdk_cluster_size_kb", None)
-        spdk_cluster_size_kb = (
-            int(_spdk_cluster_size_kb) if _spdk_cluster_size_kb is not None else None
+        _xds_gpu_buffer_size_gb = config.get("xds_gpu_buffer_size_gb", 5.0)
+        xds_gpu_buffer_size_gb = float(_xds_gpu_buffer_size_gb)
+        _xds_cluster_size_kb = config.get("xds_cluster_size_kb", None)
+        xds_cluster_size_kb = (
+            int(_xds_cluster_size_kb) if _xds_cluster_size_kb is not None else None
         )
-        _spdk_pool_initial_blob_count = config.get(
-            "spdk_pool_initial_blob_count", None
+        xds_enable_chunked_overlap = bool(
+            config.get("xds_enable_chunked_overlap", False)
         )
-        spdk_pool_initial_blob_count = (
-            int(_spdk_pool_initial_blob_count)
-            if _spdk_pool_initial_blob_count is not None
-            else None
+        _xds_chunked_size_kb = config.get(
+            "xds_chunked_size_kb", 4096
         )
-        _spdk_pool_max_blob_count = config.get("spdk_pool_max_blob_count", None)
-        spdk_pool_max_blob_count = (
-            int(_spdk_pool_max_blob_count)
-            if _spdk_pool_max_blob_count is not None
-            else None
-        )
-        _spdk_pool_low_watermark = config.get("spdk_pool_low_watermark", None)
-        spdk_pool_low_watermark = (
-            int(_spdk_pool_low_watermark)
-            if _spdk_pool_low_watermark is not None
-            else None
-        )
-        _spdk_pool_repopulate_batch_size = config.get(
-            "spdk_pool_repopulate_batch_size", None
-        )
-        spdk_pool_repopulate_batch_size = (
-            int(_spdk_pool_repopulate_batch_size)
-            if _spdk_pool_repopulate_batch_size is not None
-            else None
-        )
-        _spdk_blob_acquire_timeout_secs = config.get(
-            "spdk_blob_acquire_timeout_secs", 5.0
-        )
-        spdk_blob_acquire_timeout_secs = float(_spdk_blob_acquire_timeout_secs)
-        _spdk_io_timeout_secs = config.get("spdk_io_timeout_secs", 30.0)
-        spdk_io_timeout_secs = float(_spdk_io_timeout_secs)
-        spdk_enable_chunked_gpu_overlap = bool(
-            config.get("spdk_enable_chunked_gpu_overlap", False)
-        )
-        _spdk_chunked_gpu_overlap_size_kb = config.get(
-            "spdk_chunked_gpu_overlap_size_kb", 4096
-        )
-        spdk_chunked_gpu_overlap_size_kb = int(
-            _spdk_chunked_gpu_overlap_size_kb
-        )
-        _spdk_blob_gpu_overlap_min_blob_count = config.get(
-            "spdk_blob_gpu_overlap_min_blob_count", 32
-        )
-        spdk_blob_gpu_overlap_min_blob_count = int(
-            _spdk_blob_gpu_overlap_min_blob_count
+        xds_chunked_size_kb = int(
+            _xds_chunked_size_kb
         )
 
         if extra_config is not None:
@@ -617,22 +549,13 @@ class LMCacheEngineConfig:
                 reactor_mask=reactor_mask,
                 main_core=main_core,
                 rpc_addr=rpc_addr,
-                spdk_max_size=spdk_max_size,
-                spdk_enable_dp2p=spdk_enable_dp2p,
-                spdk_peer_bdfs=spdk_peer_bdfs,
-                spdk_gpu_buffer_size_gb=spdk_gpu_buffer_size_gb,
-                spdk_cluster_size_kb=spdk_cluster_size_kb,
-                spdk_pool_initial_blob_count=spdk_pool_initial_blob_count,
-                spdk_pool_max_blob_count=spdk_pool_max_blob_count,
-                spdk_pool_low_watermark=spdk_pool_low_watermark,
-                spdk_pool_repopulate_batch_size=spdk_pool_repopulate_batch_size,
-                spdk_blob_acquire_timeout_secs=spdk_blob_acquire_timeout_secs,
-                spdk_io_timeout_secs=spdk_io_timeout_secs,
-                spdk_enable_chunked_gpu_overlap=spdk_enable_chunked_gpu_overlap,
-                spdk_chunked_gpu_overlap_size_kb=spdk_chunked_gpu_overlap_size_kb,
-                spdk_blob_gpu_overlap_min_blob_count=(
-                    spdk_blob_gpu_overlap_min_blob_count
-                ),
+                xds_max_size=xds_max_size,
+                xds_enable_direct=xds_enable_direct,
+                xds_peer_bdfs=xds_peer_bdfs,
+                xds_gpu_buffer_size_gb=xds_gpu_buffer_size_gb,
+                xds_cluster_size_kb=xds_cluster_size_kb,
+                xds_enable_chunked_overlap=xds_enable_chunked_overlap,
+                xds_chunked_size_kb=xds_chunked_size_kb,
                 extra_config=extra_config,
                 save_unfull_chunk=save_unfull_chunk,
                 blocking_timeout_secs=blocking_timeout_secs,
@@ -643,12 +566,6 @@ class LMCacheEngineConfig:
         )
 
         if parsed_config.bdev_name is not None:
-            spdk.set_blob_pool_config(
-                initial_blob_count=parsed_config.spdk_pool_initial_blob_count,
-                max_blob_count=parsed_config.spdk_pool_max_blob_count,
-                low_watermark=parsed_config.spdk_pool_low_watermark,
-                repopulate_batch_size=parsed_config.spdk_pool_repopulate_batch_size,
-            )
             spdk.init(
                 parsed_config.bdev_name,
                 parsed_config.json_config_file,
@@ -656,14 +573,14 @@ class LMCacheEngineConfig:
                 parsed_config.main_core,
                 parsed_config.rpc_addr,
                 peer_bdf=(
-                    parsed_config.spdk_peer_bdfs
-                    if parsed_config.spdk_enable_dp2p
+                    parsed_config.xds_peer_bdfs
+                    if parsed_config.xds_enable_direct
                     else None
                 ),
                 cluster_size_bytes=(
                     None
-                    if parsed_config.spdk_cluster_size_kb is None
-                    else parsed_config.spdk_cluster_size_kb * 1024
+                    if parsed_config.xds_cluster_size_kb is None
+                    else parsed_config.xds_cluster_size_kb * 1024
                 ),
             )
 
@@ -885,68 +802,38 @@ class LMCacheEngineConfig:
         config.main_core = to_optional_int(
             parse_env(get_env_name("main_core"), None)
         )
-        config.spdk_max_size = to_optional_int(
-            parse_env(get_env_name("spdk_max_size"), None)
+        config.xds_max_size = to_optional_int(
+            parse_env(get_env_name("xds_max_size"), None)
         )
-        config.spdk_enable_dp2p = to_bool(
-            parse_env(get_env_name("spdk_enable_dp2p"), str(config.spdk_enable_dp2p))
+        config.xds_enable_direct = to_bool(
+            parse_env(get_env_name("xds_enable_direct"), str(config.xds_enable_direct))
         )
-        config.spdk_peer_bdfs = to_str_list(
-            parse_env(get_env_name("spdk_peer_bdfs"), None)
+        config.xds_peer_bdfs = to_str_list(
+            parse_env(get_env_name("xds_peer_bdfs"), None)
         )
-        if config.spdk_peer_bdfs is None:
-            config.spdk_peer_bdfs = to_str_list(
+        if config.xds_peer_bdfs is None:
+            config.xds_peer_bdfs = to_str_list(
                 parse_env(get_env_name("spdk_peer_bdf"), None)
             )
-        config.spdk_gpu_buffer_size_gb = to_float(
+        config.xds_gpu_buffer_size_gb = to_float(
             parse_env(
-                get_env_name("spdk_gpu_buffer_size_gb"),
-                str(config.spdk_gpu_buffer_size_gb),
+                get_env_name("xds_gpu_buffer_size_gb"),
+                str(config.xds_gpu_buffer_size_gb),
             )
         )
-        config.spdk_cluster_size_kb = to_optional_int(
-            parse_env(get_env_name("spdk_cluster_size_kb"), None)
+        config.xds_cluster_size_kb = to_optional_int(
+            parse_env(get_env_name("xds_cluster_size_kb"), None)
         )
-        config.spdk_pool_initial_blob_count = to_optional_int(
-            parse_env(get_env_name("spdk_pool_initial_blob_count"), None)
-        )
-        config.spdk_pool_max_blob_count = to_optional_int(
-            parse_env(get_env_name("spdk_pool_max_blob_count"), None)
-        )
-        config.spdk_pool_low_watermark = to_optional_int(
-            parse_env(get_env_name("spdk_pool_low_watermark"), None)
-        )
-        config.spdk_pool_repopulate_batch_size = to_optional_int(
-            parse_env(get_env_name("spdk_pool_repopulate_batch_size"), None)
-        )
-        config.spdk_blob_acquire_timeout_secs = to_float(
+        config.xds_enable_chunked_overlap = to_bool(
             parse_env(
-                get_env_name("spdk_blob_acquire_timeout_secs"),
-                config.spdk_blob_acquire_timeout_secs,
+                get_env_name("xds_enable_chunked_overlap"),
+                str(config.xds_enable_chunked_overlap),
             )
         )
-        config.spdk_io_timeout_secs = to_float(
+        config.xds_chunked_size_kb = to_int(
             parse_env(
-                get_env_name("spdk_io_timeout_secs"),
-                config.spdk_io_timeout_secs,
-            )
-        )
-        config.spdk_enable_chunked_gpu_overlap = to_bool(
-            parse_env(
-                get_env_name("spdk_enable_chunked_gpu_overlap"),
-                str(config.spdk_enable_chunked_gpu_overlap),
-            )
-        )
-        config.spdk_chunked_gpu_overlap_size_kb = to_int(
-            parse_env(
-                get_env_name("spdk_chunked_gpu_overlap_size_kb"),
-                config.spdk_chunked_gpu_overlap_size_kb,
-            )
-        )
-        config.spdk_blob_gpu_overlap_min_blob_count = to_int(
-            parse_env(
-                get_env_name("spdk_blob_gpu_overlap_min_blob_count"),
-                config.spdk_blob_gpu_overlap_min_blob_count,
+                get_env_name("xds_chunked_size_kb"),
+                config.xds_chunked_size_kb,
             )
         )
         config.extra_config = to_dict(parse_env(get_env_name("extra_config"), None))
@@ -982,34 +869,6 @@ class LMCacheEngineConfig:
 
     def validate(self) -> "LMCacheEngineConfig":
         """Validate the config"""
-        if self.spdk_pool_initial_blob_count is not None:
-            assert self.spdk_pool_initial_blob_count > 0, (
-                "spdk_pool_initial_blob_count must be positive"
-            )
-        if self.spdk_pool_max_blob_count is not None:
-            assert self.spdk_pool_max_blob_count > 0, (
-                "spdk_pool_max_blob_count must be positive"
-            )
-        if self.spdk_pool_low_watermark is not None:
-            assert self.spdk_pool_low_watermark > 0, (
-                "spdk_pool_low_watermark must be positive"
-            )
-        if self.spdk_pool_repopulate_batch_size is not None:
-            assert self.spdk_pool_repopulate_batch_size > 0, (
-                "spdk_pool_repopulate_batch_size must be positive"
-            )
-        assert self.spdk_blob_acquire_timeout_secs > 0, (
-            "spdk_blob_acquire_timeout_secs must be positive"
-        )
-        assert self.spdk_io_timeout_secs > 0, (
-            "spdk_io_timeout_secs must be positive"
-        )
-        assert self.spdk_chunked_gpu_overlap_size_kb > 0, (
-            "spdk_chunked_gpu_overlap_size_kb must be positive"
-        )
-        assert self.spdk_blob_gpu_overlap_min_blob_count > 0, (
-            "spdk_blob_gpu_overlap_min_blob_count must be positive"
-        )
 
         if self.enable_p2p:
             assert self.lookup_url is not None
@@ -1029,52 +888,47 @@ class LMCacheEngineConfig:
             )
             assert self.enable_p2p is False, "Nixl only supports enable_p2p=False"
 
-        if self.spdk_enable_dp2p:
+        if self.xds_enable_direct or self.xds_enable_chunked_overlap:
             assert self.bdev_name is not None, (
-                "spdk_enable_dp2p requires bdev_name to be configured"
+                "xds_enable_direct requires bdev_name to be configured"
             )
             assert self.json_config_file is not None, (
-                "spdk_enable_dp2p requires json_config_file to be configured"
+                "xds_enable_direct requires json_config_file to be configured"
             )
             assert self.reactor_mask is not None, (
-                "spdk_enable_dp2p requires reactor_mask to be configured"
+                "xds_enable_direct requires reactor_mask to be configured"
             )
             assert self.main_core is not None, (
-                "spdk_enable_dp2p requires main_core to be configured"
+                "xds_enable_direct requires main_core to be configured"
             )
             assert self.rpc_addr is not None, (
-                "spdk_enable_dp2p requires rpc_addr to be configured"
+                "xds_enable_direct requires rpc_addr to be configured"
             )
-            assert self.spdk_max_size is not None and self.spdk_max_size > 0, (
-                "spdk_enable_dp2p requires spdk_max_size > 0"
+            assert self.xds_max_size is not None and self.xds_max_size > 0, (
+                "xds_enable_direct requires xds_max_size > 0"
             )
-            assert self.spdk_peer_bdfs, (
-                "spdk_enable_dp2p requires spdk_peer_bdfs to be configured"
-            )
-            assert self.spdk_gpu_buffer_size_gb > 0, (
-                "spdk_gpu_buffer_size_gb must be positive"
-            )
-            if self.spdk_cluster_size_kb is not None:
-                assert self.spdk_cluster_size_kb > 0, (
-                    "spdk_cluster_size_kb must be positive"
+            if self.xds_cluster_size_kb is not None:
+                assert self.xds_cluster_size_kb > 0, (
+                    "xds_cluster_size_kb must be positive"
                 )
-            assert self.enable_nixl is False, (
-                "spdk_enable_dp2p is incompatible with enable_nixl"
+
+        if self.xds_enable_direct:
+            assert self.xds_peer_bdfs, (
+                "xds_enable_direct requires xds_peer_bdfs to be configured"
             )
-            assert self.local_cpu is False, (
-                "spdk_enable_dp2p requires local_cpu=False"
+            assert self.xds_gpu_buffer_size_gb > 0, (
+                "xds_gpu_buffer_size_gb must be positive"
+            )  
+            assert self.xds_enable_chunked_overlap is False, (
+                "xds_enable_direct is incompatible with xds_enable_chunked_overlap"
             )
-            assert self.local_disk is None, (
-                "spdk_enable_dp2p requires local_disk=None"
+
+        if self.xds_enable_chunked_overlap:
+            assert self.xds_chunked_size_kb > 0, (
+                "xds_chunked_size_kb must be positive when xds_enable_chunked_overlap is True"
             )
-            assert self.remote_url is None, (
-                "spdk_enable_dp2p requires remote_url=None"
-            )
-            assert self.weka_path is None, (
-                "spdk_enable_dp2p requires weka_path=None"
-            )
-            assert self.gds_path is None, (
-                "spdk_enable_dp2p requires gds_path=None"
+            assert self.xds_enable_direct is False, (
+                "xds_enable_chunked_overlap is incompatible with xds_enable_direct"
             )
 
         return self
@@ -1125,23 +979,14 @@ class LMCacheEngineConfig:
             "reactor_mask": self.reactor_mask,
             "main_core": self.main_core,
             "rpc_addr": self.rpc_addr,
-            "spdk_max_size": self.spdk_max_size,
-            "spdk_enable_dp2p": self.spdk_enable_dp2p,
-            "spdk_peer_bdfs": self.spdk_peer_bdfs,
-            "spdk_gpu_buffer_size_gb": self.spdk_gpu_buffer_size_gb,
-            "spdk_cluster_size_kb": self.spdk_cluster_size_kb,
-            "spdk_pool_initial_blob_count": self.spdk_pool_initial_blob_count,
-            "spdk_pool_max_blob_count": self.spdk_pool_max_blob_count,
-            "spdk_pool_low_watermark": self.spdk_pool_low_watermark,
-            "spdk_pool_repopulate_batch_size": self.spdk_pool_repopulate_batch_size,
-            "spdk_blob_acquire_timeout_secs": self.spdk_blob_acquire_timeout_secs,
-            "spdk_io_timeout_secs": self.spdk_io_timeout_secs,
-            "spdk_enable_chunked_gpu_overlap": self.spdk_enable_chunked_gpu_overlap,
-            "spdk_chunked_gpu_overlap_size_kb": (
-                self.spdk_chunked_gpu_overlap_size_kb
-            ),
-            "spdk_blob_gpu_overlap_min_blob_count": (
-                self.spdk_blob_gpu_overlap_min_blob_count
+            "xds_max_size": self.xds_max_size,
+            "xds_enable_direct": self.xds_enable_direct,
+            "xds_peer_bdfs": self.xds_peer_bdfs,
+            "xds_gpu_buffer_size_gb": self.xds_gpu_buffer_size_gb,
+            "xds_cluster_size_kb": self.xds_cluster_size_kb,
+            "xds_enable_chunked_overlap": self.xds_enable_chunked_overlap,
+            "xds_chunked_size_kb": (
+                self.xds_chunked_size_kb
             ),
             "external_lookup_client": self.external_lookup_client,
         }

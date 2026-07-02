@@ -1040,14 +1040,14 @@ class LMCacheEngineBuilder:
             assert config.cufile_buffer_size is not None
             return CuFileMemoryAllocator(config.cufile_buffer_size * 1024**2)
 
-        if config.spdk_enable_dp2p:
+        if config.xds_enable_direct:
             init_spdk_if_needed(config)
-            assert config.spdk_gpu_buffer_size_gb > 0
+            assert config.xds_gpu_buffer_size_gb > 0
             return SpdkDirectP2PMemoryAllocator(
-                int(config.spdk_gpu_buffer_size_gb * 1024**3)
+                int(config.xds_gpu_buffer_size_gb * 1024**3)
             )
 
-        if config.spdk_max_size and config.spdk_max_size > 0:
+        if config.xds_max_size and config.xds_max_size > 0:
             init_spdk_if_needed(config)
             assert config.bdev_name is not None
             assert config.reactor_mask is not None

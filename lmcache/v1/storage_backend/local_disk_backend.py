@@ -439,12 +439,12 @@ class LocalDiskBackend(StorageBackendInterface):
         avg_bw = (
             self.cumulative_read_bytes / self.cumulative_read_time / (1024 * 1024)
         )
-        logger.info(
-            f"[Disk Read Bandwidth] current: {cur_bw:.2f} MB/s, "
-            f"average: {avg_bw:.2f} MB/s, "
-            f"bytes: {read_bytes / (1024 * 1024):.2f} MB, "
-            f"time: {read_time * 1000:.2f} ms"
-        )
+        # logger.info(
+        #     f"[Disk Read Bandwidth] current: {cur_bw:.2f} MB/s, "
+        #     f"average: {avg_bw:.2f} MB/s, "
+        #     f"bytes: {read_bytes / (1024 * 1024):.2f} MB, "
+        #     f"time: {read_time * 1000:.2f} ms"
+        # )
         self.stats_lock.release()
 
         self.disk_lock.release()

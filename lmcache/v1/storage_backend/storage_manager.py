@@ -73,8 +73,8 @@ class StorageManager:
 
         if self.enable_nixl:
             self.allocator_backend = self.storage_backends["NixlBackend"]
-        elif config.spdk_enable_dp2p:
-            self.allocator_backend = self.storage_backends["SpdkDirectP2PBackend"]
+        elif config.xds_enable_direct:
+            self.allocator_backend = self.storage_backends["XDSBackend"]
         else:
             self.allocator_backend = self.storage_backends["LocalCPUBackend"]
 
