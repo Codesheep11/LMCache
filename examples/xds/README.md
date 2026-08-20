@@ -61,10 +61,12 @@ python -m sglang.launch_server \
   --model-path /mnt/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled \
   --tp 4 \
   --page-size 32 \
-  --disable-radix-cache \
   --enable-lmcache
 ```
 
 验证外部缓存时，连续发送两次相同且超过一个 LMCache chunk 的 prompt。关闭
-vLLM prefix caching 或 SGLang radix cache，避免把显存内前缀命中误判成 xDS
-命中；同时检查 LMCache 与 xDS 服务日志中的 store/retrieve 完成记录。
+vLLM prefix caching；SGLang 则在第一次请求完成后调用一次 `/flush_cache` 清空
+RadixCache，再发送第二次请求。`/flush_cache` 不会删除 LMCache/xDS 中已持久化的
+KV，因此第二次请求应从 xDS 恢复。不要给 SGLang 加 `--disable-radix-cache`，
+因为 LMCache connector 本身挂载在 `LMCRadixCache` 上。最后同时检查 LMCache
+与 xDS 服务日志中的 store/retrieve 完成记录。
