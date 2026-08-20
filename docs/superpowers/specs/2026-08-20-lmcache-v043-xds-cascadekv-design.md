@@ -1,106 +1,100 @@
-# LMCache v0.4.3 xDS and CascadeKV Backend Design
+# LMCache v0.4.3 xDS 与 CascadeKV 后端设计
 
-**Status:** Approved in conversation on 2026-08-20
+**状态：** 已于 2026-08-20 在对话中确认
 
-## Goal
+## 目标
 
-Forward-port the local xDS work onto upstream LMCache v0.4.3 while keeping the
-repository, Python distribution, and import package named `lmcache`. The result
-provides two mutually exclusive storage backends that connect to the same
-rank-local xDS service:
+将本地 xDS 修改向前移植到上游 LMCache v0.4.3，同时保持仓库名、Python
+发行包名和导入包名均为 `lmcache`。最终提供两个互斥的存储后端，二者都连接
+到当前 worker/rank 对应的 xDS 服务客户端：
 
-- `XDSBackend`: SSD to GPU through a service-registered GPU buffer.
-- `CascadeKVBackend`: SSD to service-owned CPU staging memory, then CPU to GPU
-  through LMCache's serving-engine GPU connector.
+- `XDSBackend`：通过服务注册的 GPU buffer，实现 SSD 到 GPU 的直接传输。
+- `CascadeKVBackend`：先从 SSD 读入由服务管理的 CPU staging 内存，再通过
+  LMCache 的推理引擎 GPU connector 从 CPU 传输到 GPU。
 
-Both paths must work with source-installed vLLM 0.18.0. SGLang remains a
-source-installed consumer and is validated after the LMCache backend port is
-working.
+两个路径都必须兼容源码安装的 vLLM 0.18.0。SGLang 同样从源码安装，并在
+LMCache 后端迁移完成后进行集成验证。
 
-## Version and Compatibility Constraints
+## 版本与兼容性约束
 
-- LMCache baseline: upstream tag `v0.4.3`.
-- LMCache working branch: `v0.4.3-xds`.
-- vLLM target: upstream tag `v0.18.0`.
-- PyTorch target: `2.10.0`, matching both source projects' build metadata.
-- The existing `/home/yangxc/workspace/LMCache` checkout remains unchanged and
-  serves only as the source of the local implementation and tests.
-- The xDS Python SDK is source-installed from
-  `/home/yangxc/workspace/xDS/sdk` and supplies `XDSClient`.
-- Backend selection and resource ownership are per LMCache worker/rank.
+- LMCache 基线：上游标签 `v0.4.3`。
+- LMCache 工作分支：`v0.4.3-xds`。
+- vLLM 目标版本：上游标签 `v0.18.0`。
+- PyTorch 目标版本：`2.10.0`，与两个源码项目的构建元数据保持一致。
+- 现有 `/home/yangxc/workspace/LMCache` 工作区保持不变，只作为本地实现和
+  测试的迁移来源。
+- xDS Python SDK 从 `/home/yangxc/workspace/xDS/sdk` 源码安装，并提供
+  `XDSClient`。
+- 后端选择和资源所有权均以 LMCache worker/rank 为单位。
 
-## Selected Architecture
+## 选定架构
 
-### Shared service client
+### 共享服务客户端
 
-LMCache creates one connected `XDSClient` for each worker rank whenever either
-backend is enabled. The connection uses `xds_service_name`, the LMCache worker
-rank, world size, and a backend-specific `require_direct` value. The client
-owns service connection state and blob handles; the selected backend owns all
-buffer registrations or allocations made through that client.
+当任一后端开启时，LMCache 为每个 worker rank 创建一个已连接的
+`XDSClient`。连接参数包括 `xds_service_name`、LMCache worker rank、world
+size，以及由后端决定的 `require_direct`。客户端拥有服务连接状态；被选中的
+后端负责管理通过该客户端申请的 blob handle、buffer 注册和 buffer 分配。
 
-The shared connection helper lives in a new, focused
-`lmcache/v1/xds_utils.py`. Common blob metadata also lives there so the port
-does not add xDS-only types to LMCache's general-purpose `lmcache/utils.py`.
+共享连接辅助逻辑放在新的独立文件 `lmcache/v1/xds_utils.py` 中。通用 xDS
+blob 元数据也放在该文件中，避免将 xDS 专用类型加入 LMCache 的通用
+`lmcache/utils.py`。
 
-### Direct xDS backend
+### 直接 xDS 后端
 
-`XDSBackend` requires a CUDA destination and `xds_require_direct: true`. It
-registers the LMCache GPU allocation once with
-`XDSClient.register_gpu_buffer()`. Each I/O descriptor addresses a range by
-`buffer_ref`, buffer offset, blob offset, and size. Reads therefore follow:
+`XDSBackend` 要求目标设备为 CUDA，并要求 `xds_require_direct: true`。它使用
+`XDSClient.register_gpu_buffer()` 将 LMCache 的 GPU 内存注册一次。每条 I/O
+描述符通过 `buffer_ref`、buffer offset、blob offset 和 size 指定传输范围。
+读取路径为：
 
 ```text
-SSD -> xDS service -> registered LMCache GPU buffer
+SSD -> xDS 服务 -> 已注册的 LMCache GPU buffer
 ```
 
-Writes follow the reverse path. Windowed I/O, queue-depth limits, staged write
-leases, completion validation, timeout handling, and deterministic buffer
-unregistration are forward-ported from the local implementation. A failed or
-short I/O never publishes blob metadata as durable.
+写入路径与之相反。从本地实现向前移植窗口化 I/O、队列深度限制、分阶段写入
+lease、完成结果校验、超时处理，以及确定性的 GPU buffer 注销逻辑。失败或
+短 I/O 不得将相应 blob 元数据发布为已持久化状态。
 
-### CascadeKV backend
+### CascadeKV 后端
 
-`CascadeKVBackend` uses the same service protocol without requiring the direct
-GPU capability. It allocates service-owned CPU DMA buffers with
-`XDSClient.alloc_buffer()`. The returned `memoryview` and `buffer_ref` remain
-paired for their full lifetime. Reads follow:
+`CascadeKVBackend` 使用相同的 xDS 服务协议，但不要求 GPU direct 能力。它
+通过 `XDSClient.alloc_buffer()` 申请由 xDS 服务管理的 CPU DMA buffer。返回
+的 `memoryview` 和 `buffer_ref` 在整个生命周期中必须保持一一对应。读取路径
+为：
 
 ```text
-SSD -> xDS service -> service-owned CPU staging buffer -> GPU
+SSD -> xDS 服务 -> 服务管理的 CPU staging buffer -> GPU
 ```
 
-Writes follow:
+写入路径为：
 
 ```text
-GPU -> service-owned CPU staging buffer -> xDS service -> SSD
+GPU -> 服务管理的 CPU staging buffer -> xDS 服务 -> SSD
 ```
 
-The CPU view is exposed to LMCache as a memory object without an intermediate
-CPU-to-CPU copy. LMCache's existing GPU connector performs CPU/GPU transfers.
-The backend maintains a bounded staging-buffer pool sized in whole aligned blob
-slots. Slots cannot be reused until both xDS I/O and the corresponding GPU
-copy have completed. On shutdown, the backend drains I/O, releases blob
-handles that were not committed, frees every CPU buffer with
-`XDSClient.free_buffer()`, and only then permits the client to close.
+CPU memoryview 直接适配成 LMCache memory object，不引入额外的 CPU 到 CPU
+拷贝。CPU/GPU 传输使用 LMCache 现有的 GPU connector。后端维护一个有界的
+staging buffer 池，容量按完整且对齐的 blob slot 计算。在 xDS I/O 和对应的
+GPU copy 都完成前，slot 不得被复用。
 
-### Backend factory and storage manager
+关闭后端时，必须先完成或取消所有 I/O，释放未提交的 blob handle，通过
+`XDSClient.free_buffer()` 释放全部 CPU buffer，最后才允许关闭客户端。
 
-`CreateStorageBackends` constructs exactly one of `XDSBackend` and
-`CascadeKVBackend`. The direct backend is the allocator backend because its
-objects reside in the registered GPU allocation. CascadeKV uses LMCache's
-normal local CPU allocation and storage flow, with CascadeKV acting as the
-persistent storage backend. Generic LMCache backends retain their v0.4.3
-behavior.
+### 后端工厂与 StorageManager
 
-## Configuration Contract
+`CreateStorageBackends` 只构造 `XDSBackend` 和 `CascadeKVBackend` 中被选中的
+一个。直接 xDS 后端作为 allocator backend，因为其对象位于已注册的 GPU
+内存中。CascadeKV 使用 LMCache 的常规本地 CPU 分配与存储流程，并作为持久化
+存储后端。其他 LMCache 通用后端保持 v0.4.3 原有行为。
 
-The public YAML keys are:
+## 配置接口
+
+公开 YAML 配置键如下：
 
 ```yaml
 xds_service_name: xds0
 
-# Direct SSD -> GPU path
+# SSD -> GPU 直接路径
 xds_backend: false
 xds_require_direct: false
 xds_windowed_io: true
@@ -111,121 +105,107 @@ xds_read_slot_count: 2
 xds_write_slot_count: 8
 xds_async_write: false
 
-# Staged SSD -> CPU -> GPU path
+# SSD -> CPU -> GPU 分级路径
 cascadekv_backend: false
 cascadekv_slot_count: 8
 ```
 
-Validation rules are:
+配置校验规则如下：
 
-1. `xds_backend` and `cascadekv_backend` cannot both be true.
-2. Enabling either backend requires a non-empty `xds_service_name`.
-3. `xds_backend` requires `xds_require_direct: true`.
-4. `cascadekv_backend` connects with `require_direct: false`; setting
-   `xds_require_direct: true` with CascadeKV is rejected to keep the selected
-   path unambiguous.
-5. Window sizes, queue depth, and slot counts must be positive.
-6. Direct-backend queue depth cannot exceed its read or write slot count.
-7. `cascadekv_slot_count` determines the bounded CPU staging capacity and must
-   be positive.
+1. `xds_backend` 和 `cascadekv_backend` 不能同时为 true。
+2. 开启任一后端时，必须提供非空的 `xds_service_name`。
+3. `xds_backend` 要求 `xds_require_direct: true`。
+4. `cascadekv_backend` 使用 `require_direct: false` 连接；CascadeKV 配置中设置
+   `xds_require_direct: true` 将直接报错，避免数据路径含义不明确。
+5. window size、queue depth 和 slot count 必须为正数。
+6. 直接后端的 queue depth 不能超过 read slot count 或 write slot count。
+7. `cascadekv_slot_count` 决定有界 CPU staging 容量，且必须为正数。
 
-Legacy in-process keys such as `bdev_name`, `rpc_addr`, and `xds_max_size` are
-not used by either new backend. Storage device ownership and capacity belong to
-the external xDS service.
+旧进程内实现使用的 `bdev_name`、`rpc_addr` 和 `xds_max_size` 等配置不再由
+两个新后端使用。存储设备和容量由外部 xDS 服务负责管理。
 
-## Code Boundaries
+## 代码边界
 
-The implementation is limited to the following responsibilities:
+实现范围限定为以下职责：
 
-- `lmcache/v1/storage_backend/xds_backend.py`: direct GPU backend and its
-  direct-I/O scheduling.
-- `lmcache/v1/storage_backend/cascadekv_backend.py`: CPU-staged backend,
-  staging-slot pool, and CPU memory-object adaptation.
-- `lmcache/v1/xds_utils.py`: client creation, alignment helpers, and common xDS
-  blob metadata.
-- `lmcache/v1/storage_backend/xds_read_ring.py`: bounded direct-read slot
-  scheduling used only by `XDSBackend`.
-- `lmcache/v1/storage_backend/xds_write_scheduler.py`: direct asynchronous
-  write leases used only by `XDSBackend`.
-- `lmcache/v1/storage_backend/transfer_result.py`: explicit per-chunk transfer
-  outcomes when the v0.4.3 generic interface cannot express partial success.
-- `lmcache/v1/config.py`: the configuration keys and validation contract above.
-- `lmcache/v1/storage_backend/__init__.py`: lazy imports and mutually exclusive
-  backend construction.
-- `lmcache/v1/storage_backend/storage_manager.py`: minimal allocator-backend
-  selection and transfer-result consumption.
-- `lmcache/v1/cache_engine.py`: only the xDS client/allocator lifecycle hooks
-  required for the direct backend.
+- `lmcache/v1/storage_backend/xds_backend.py`：GPU direct 后端及其直接 I/O
+  调度。
+- `lmcache/v1/storage_backend/cascadekv_backend.py`：CPU staging 后端、staging
+  slot 池和 CPU memory object 适配。
+- `lmcache/v1/xds_utils.py`：创建客户端、对齐辅助函数和通用 xDS blob 元数据。
+- `lmcache/v1/storage_backend/xds_read_ring.py`：仅供 `XDSBackend` 使用的有界
+  direct-read slot 调度。
+- `lmcache/v1/storage_backend/xds_write_scheduler.py`：仅供 `XDSBackend` 使用
+  的 direct async-write lease。
+- `lmcache/v1/storage_backend/transfer_result.py`：当 v0.4.3 通用接口无法表示
+  部分成功时，提供明确的逐 chunk 传输结果。
+- `lmcache/v1/config.py`：实现上述配置项与校验规则。
+- `lmcache/v1/storage_backend/__init__.py`：惰性导入并互斥构造两个后端。
+- `lmcache/v1/storage_backend/storage_manager.py`：最小化修改 allocator backend
+  选择与传输结果消费逻辑。
+- `lmcache/v1/cache_engine.py`：仅加入直接后端必需的 xDS client 和 allocator
+  生命周期钩子。
 
-The upstream v0.4.3 vLLM connector is retained by default. Connector changes
-are allowed only when a failing integration test proves that an xDS buffer
-lifecycle or shutdown hook cannot be expressed through the upstream connector.
-No project-wide refactor or package rename is in scope.
+默认保留上游 v0.4.3 的 vLLM connector。只有当失败的集成测试证明 xDS buffer
+生命周期或关闭逻辑无法通过上游 connector 表达时，才允许修改 connector。
+本次工作不进行全项目重构，也不修改包名。
 
-## Error Handling and Resource Ownership
+## 错误处理与资源所有权
 
-- Service connection failure aborts backend construction with the service name
-  and worker rank in the error.
-- Alignment, offset, and registered-range checks occur before I/O submission.
-- Timeouts and short completions are failures; failed chunks remain cache
-  misses and their newly acquired blob handles are released.
-- CascadeKV staging slots use an explicit state transition:
-  `free -> xds_io -> gpu_copy -> free`. Exceptions transition through cleanup
-  before returning the slot.
-- Direct write leases use `reserved -> submitted -> committed` or
-  `reserved/submitted -> rolled_back`.
-- `close()` is idempotent for both backends. New operations are rejected after
-  shutdown begins.
-- The backend closes its buffers and workers before the rank-local client is
-  closed. `XDSClient.close()` must observe no outstanding CPU buffer refs.
+- 服务连接失败时中止后端构造，错误信息包含 service name 和 worker rank。
+- 在提交 I/O 前完成对齐、offset 和注册范围检查。
+- 超时和短完成均视为失败；失败 chunk 保持 cache miss，新申请的 blob handle
+  必须被释放。
+- CascadeKV staging slot 使用明确的状态转换：
+  `free -> xds_io -> gpu_copy -> free`。发生异常时，必须先经过清理流程再归还
+  slot。
+- 直接写入 lease 使用 `reserved -> submitted -> committed`，失败路径为
+  `reserved/submitted -> rolled_back`。
+- 两个后端的 `close()` 都必须幂等。开始关闭后拒绝新的操作。
+- 后端必须先关闭自己的 buffer 和 worker，再关闭 rank-local client。
+  `XDSClient.close()` 执行时不得存在未释放的 CPU buffer ref。
 
-## Test Strategy
+## 测试策略
 
-Testing proceeds test-first and does not require live SSD hardware for unit
-coverage.
+开发采用测试先行方式，单元测试不依赖真实 SSD 硬件。
 
-1. Configuration tests prove mutual exclusion, required service name, direct
-   capability rules, positive sizing, YAML parsing, and environment overrides.
-2. Backend-factory tests prove the selected backend is constructed lazily and
-   the unused backend's optional dependencies are not imported.
-3. Mock-client unit tests for `XDSBackend` cover GPU registration, descriptor
-   bounds, successful read/write, short completion rollback, timeout cleanup,
-   async write draining, and idempotent close.
-4. Mock-client unit tests for `CascadeKVBackend` cover `alloc_buffer`, zero
-   intermediate CPU copies, SSD-to-CPU-to-GPU ordering, GPU-to-CPU-to-SSD
-   ordering, slot backpressure, timeout cleanup, `free_buffer`, and close
-   ordering.
-5. Existing LMCache v0.4.3 storage and configuration tests remain green.
-6. Source-install smoke tests import `lmcache`, `xds`, vLLM, and SGLang from
-   their expected checkout paths and report the pinned versions.
-7. The hardware validation starts the xDS service and sends the same long
-   prompt twice through vLLM 0.18.0 for each backend. The second request must
-   report an external-cache hit and logs must identify the selected path.
-8. SGLang validation repeats one prompt pair after its source integration is
-   adapted, without changing the LMCache backend contract.
+1. 配置测试覆盖后端互斥、service name 必填、direct capability 规则、正数范围、
+   YAML 解析和环境变量覆盖。
+2. 后端工厂测试证明只惰性构造被选中的后端，并且不会导入未使用后端的可选
+   依赖。
+3. `XDSBackend` mock-client 单元测试覆盖 GPU 注册、描述符边界、成功读写、短
+   完成回滚、超时清理、异步写入排空和幂等关闭。
+4. `CascadeKVBackend` mock-client 单元测试覆盖 `alloc_buffer`、无中间 CPU
+   拷贝、SSD 到 CPU 到 GPU 的调用顺序、GPU 到 CPU 到 SSD 的调用顺序、slot
+   背压、超时清理、`free_buffer` 和关闭顺序。
+5. 现有 LMCache v0.4.3 存储与配置测试保持通过。
+6. 源码安装 smoke test 从预期源码路径导入 `lmcache`、`xds`、vLLM 和 SGLang，
+   并输出固定版本。
+7. 硬件验证启动 xDS 服务，分别使用两个后端通过 vLLM 0.18.0 连续发送两次
+   相同的长 prompt。第二次请求必须报告外部缓存命中，日志必须明确标识所选
+   数据路径。
+8. 适配 SGLang 源码集成后重复一次 prompt 对，不修改 LMCache 后端接口。
 
-## Acceptance Criteria
+## 验收标准
 
-- The repository and import package remain named `lmcache`.
-- `xds_backend: true` selects and exercises SSD-to-GPU direct I/O.
-- `cascadekv_backend: true` selects and exercises SSD-to-CPU-to-GPU I/O through
-  the external xDS service.
-- Invalid dual-backend configurations fail before allocating resources.
-- Unit tests demonstrate deterministic cleanup for success, timeout, short I/O,
-  and shutdown.
-- LMCache, vLLM, and SGLang are editable source installations in a new Conda
-  environment; the existing validated `xds` environment remains recoverable.
-- One repeated-prompt validation for vLLM and one for SGLang show an xDS-backed
-  cache hit rather than only a local GPU prefix-cache hit.
+- 仓库名和导入包名保持 `lmcache`。
+- `xds_backend: true` 选择并实际执行 SSD 到 GPU 的直接 I/O。
+- `cascadekv_backend: true` 选择并实际执行通过外部 xDS 服务的 SSD 到 CPU 到
+  GPU 路径。
+- 同时开启两个后端的无效配置在资源分配前失败。
+- 单元测试证明成功、超时、短 I/O 和关闭场景都能确定性清理资源。
+- LMCache、vLLM 和 SGLang 在新的 Conda 环境中均为 editable 源码安装；现有
+  已验证的 `xds` 环境保持可恢复。
+- vLLM 和 SGLang 各完成一次重复 prompt 验证，确认命中 xDS 后端，而不是仅
+  命中本地 GPU prefix cache。
 
-## Rejected Approaches
+## 未采用的方案
 
-- Merging v0.4.3 directly into the old dirty branch: it combines 836 upstream
-  commits with old interfaces and obscures whether failures come from the port
-  or from merge resolution.
-- Retaining the in-process `xds.init_blob_pool()` CascadeKV path: it violates
-  the requirement that both backends use the external xDS service.
-- Copying service CPU data into a second LMCache CPU buffer: it adds an
-  avoidable CPU-to-CPU copy and doubles staging-memory pressure.
-- Renaming the Python distribution or imports to `cascadekv`: it breaks serving
-  engine integrations without helping backend selection.
+- 将 v0.4.3 直接合并进旧的脏分支：这会把 836 个上游提交与旧接口混合，难以
+  判断问题来自接口迁移还是冲突处理。
+- 保留进程内 `xds.init_blob_pool()` 的 CascadeKV 路径：这不符合两个后端都
+  使用外部 xDS 服务的要求。
+- 将服务 CPU buffer 再复制到第二个 LMCache CPU buffer：这会产生不必要的
+  CPU 到 CPU 拷贝，并使 staging 内存压力翻倍。
+- 将 Python 发行包或 import 改名为 `cascadekv`：这会破坏推理引擎集成，并且
+  对后端选择没有帮助。
