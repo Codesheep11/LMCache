@@ -18,6 +18,7 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
 from lmcache.v1.storage_backend.p2p_backend import P2PBackend
 from lmcache.v1.storage_backend.remote_backend import RemoteBackend
+from lmcache.v1.xds_utils import connect_xds_client
 
 if TYPE_CHECKING:
     # First Party
@@ -167,6 +168,41 @@ def CreateStorageBackends(
             storage_backends[backend_name] = local_cpu_backend
         else:
             logger.info("No cpu memory is allocated as max_local_cpu_size <= 0")
+
+    selected_xds_backend = (
+        "XDSBackend" if config.xds_backend else "CascadeKVBackend"
+    )
+    if (
+        metadata.role != "scheduler"
+        and (config.xds_backend or config.cascadekv_backend)
+        and selected_xds_backend not in _skip
+    ):
+        xds_client = connect_xds_client(config, metadata)
+        try:
+            if config.xds_backend:
+                from lmcache.v1.storage_backend.xds_backend import XDSBackend
+
+                xds_backend = XDSBackend(
+                    config,
+                    metadata,
+                    xds_client,
+                    dst_device,
+                )
+            else:
+                from lmcache.v1.storage_backend.cascadekv_backend import (
+                    CascadeKVBackend,
+                )
+
+                xds_backend = CascadeKVBackend(
+                    config,
+                    metadata,
+                    xds_client,
+                    dst_device="cpu",
+                )
+            storage_backends[str(xds_backend)] = xds_backend
+        except Exception:
+            xds_client.close()
+            raise
 
     if config.enable_p2p and "P2PBackend" not in _skip:
         assert local_cpu_backend is not None

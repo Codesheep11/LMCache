@@ -314,6 +314,8 @@ class StorageManager:
     ) -> AllocatorBackendInterface:
         if self.enable_pd:
             allocator_backend = self.storage_backends["PDBackend"]
+        elif config.xds_backend:
+            allocator_backend = self.storage_backends["XDSBackend"]
         elif "MaruBackend" in self.storage_backends:
             if "LocalCPUBackend" in self.storage_backends:
                 allocator_backend = self.storage_backends["LocalCPUBackend"]
@@ -449,6 +451,7 @@ class StorageManager:
             if memory_obj:
                 if (
                     backend_name not in ["LocalCPUBackend", "PDBackend", "MaruBackend"]
+                    and not getattr(backend, "skip_local_cpu_writeback", False)
                     and "LocalCPUBackend" in self.storage_backends
                 ):
                     local_cpu_backend = self.storage_backends["LocalCPUBackend"]
@@ -493,6 +496,11 @@ class StorageManager:
                 # auto-write remote data to local CPU cache
                 if (
                     backend_name not in ["LocalCPUBackend", "PDBackend", "MaruBackend"]
+                    and not getattr(
+                        storage_backend,
+                        "skip_local_cpu_writeback",
+                        False,
+                    )
                     and "LocalCPUBackend" in self.storage_backends
                     and None not in memory_objs
                 ):
