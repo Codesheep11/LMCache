@@ -177,6 +177,14 @@ class CascadeKVBackend(AllocatorBackendInterface):
                 "unexpected xDS completion request id: "
                 f"expected={request_id}, got={completion.request_id}"
             )
+        self._validate_io_result(completion, expected_bytes, operation)
+
+    @staticmethod
+    def _validate_io_result(
+        completion: Any,
+        expected_bytes: int,
+        operation: str,
+    ) -> None:
         if int(completion.status) != 0:
             raise RuntimeError(
                 f"xDS {operation} failed with status={completion.status}, "
