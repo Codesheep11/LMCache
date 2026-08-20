@@ -1,0 +1,18 @@
+# xDS direct path: SSD -> registered GPU buffer
+chunk_size: 256
+local_cpu: false
+max_local_cpu_size: 0
+use_layerwise: true
+save_unfull_chunk: true
+
+xds_service_name: xds0
+xds_backend: true
+cascadekv_backend: false
+xds_require_direct: true
+xds_windowed_io: true
+xds_read_window_size: 64
+xds_write_window_size: 64
+xds_io_queue_depth: 1
+xds_read_slot_count: 2
+xds_write_slot_count: 8
+xds_async_write: false

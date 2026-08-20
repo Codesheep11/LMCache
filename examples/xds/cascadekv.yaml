@@ -1,0 +1,13 @@
+# CascadeKV path: SSD -> service-managed CPU staging buffer -> GPU
+chunk_size: 256
+local_cpu: false
+# Required allocator capacity for the bounded CPU staging pool.
+max_local_cpu_size: 5
+use_layerwise: true
+save_unfull_chunk: true
+
+xds_service_name: xds0
+xds_backend: false
+cascadekv_backend: true
+xds_require_direct: false
+cascadekv_slot_count: 8
