@@ -27,6 +27,12 @@ export LMCACHE_CONFIG_FILE=/home/yangxc/workspace/LMCache-v043-xds/examples/xds/
 模式。CascadeKV 的 `max_local_cpu_size` 必须大于 0，因为它为 CPU staging
 分配器提供容量；`local_cpu: false` 表示不把它作为独立热缓存层使用。
 
+示例把 `chunk_size` 设为 32。xDS direct fast-map 要求一个 blob 对应一个 SPDK
+cluster；本机服务的 blob/cluster 都是 6 MiB，而 Qwen3-0.6B 的 32-token
+全层 KV chunk 约为 3.5 MiB。更换模型、TP 或 KV dtype 后，必须保证一个
+LMCache chunk 不大于 `xds_blob_size_bytes`；否则应减小 `chunk_size`，不要直接
+修改已经格式化的 blobstore cluster 大小。
+
 ## 启动外部 xDS 服务
 
 以下命令使用本机已有的 TP4/NUMA1 服务配置：
@@ -45,10 +51,10 @@ queue 数、GPU BDF、blob 大小与推理的 TP 数必须匹配。退出推理�
 ## vLLM 0.18.0
 
 ```bash
-CUDA_VISIBLE_DEVICES=4,5,6,7 \
-vllm serve /mnt/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled \
-  --tensor-parallel-size 4 \
-  --disable-prefix-caching \
+PYTHONHASHSEED=0 CUDA_VISIBLE_DEVICES=4 \
+vllm serve /mnt/adminserver-nfsrdma/Model/Qwen3-0.6B \
+  --max-model-len 4096 \
+  --no-enable-prefix-caching \
   --kv-transfer-config \
   '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
 ```
@@ -56,10 +62,10 @@ vllm serve /mnt/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled \
 ## SGLang 0.5.9
 
 ```bash
-CUDA_VISIBLE_DEVICES=4,5,6,7 \
+PYTHONHASHSEED=0 CUDA_VISIBLE_DEVICES=4 \
 python -m sglang.launch_server \
-  --model-path /mnt/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled \
-  --tp 4 \
+  --model-path /mnt/adminserver-nfsrdma/Model/Qwen3-0.6B \
+  --tp 1 \
   --page-size 32 \
   --enable-lmcache
 ```

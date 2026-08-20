@@ -1,5 +1,7 @@
 # xDS direct path: SSD -> registered GPU buffer
-chunk_size: 256
+# Qwen3-0.6B has a 3.5 MiB all-layer KV chunk at 32 tokens, which fits the
+# current xDS service's one-cluster 6 MiB blob.
+chunk_size: 32
 local_cpu: false
 max_local_cpu_size: 0
 use_layerwise: true
