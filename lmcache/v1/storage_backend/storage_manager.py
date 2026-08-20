@@ -316,6 +316,8 @@ class StorageManager:
             allocator_backend = self.storage_backends["PDBackend"]
         elif config.xds_backend:
             allocator_backend = self.storage_backends["XDSBackend"]
+        elif config.cascadekv_backend:
+            allocator_backend = self.storage_backends["CascadeKVBackend"]
         elif "MaruBackend" in self.storage_backends:
             if "LocalCPUBackend" in self.storage_backends:
                 allocator_backend = self.storage_backends["LocalCPUBackend"]

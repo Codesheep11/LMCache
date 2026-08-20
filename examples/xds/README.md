@@ -24,29 +24,37 @@ export LMCACHE_CONFIG_FILE=/home/yangxc/workspace/LMCache-v043-xds/examples/xds/
 ```
 
 `use_layerwise: true` 同时满足 SGLang connector 的要求；vLLM 0.18.0 也支持该
-模式。CascadeKV 的 `max_local_cpu_size` 必须大于 0，因为它为 CPU staging
-分配器提供容量；`local_cpu: false` 表示不把它作为独立热缓存层使用。
+模式。CascadeKV 的 staging 容量由 `cascadekv_slot_count × xDS blob_size`
+决定；保持 `local_cpu: false` 和 `max_local_cpu_size: 0`，可以避免额外创建
+LocalCPUBackend，确保命中必须经过 xDS。
 
 示例把 `chunk_size` 设为 32。xDS direct fast-map 要求一个 blob 对应一个 SPDK
-cluster；本机服务的 blob/cluster 都是 6 MiB，而 Qwen3-0.6B 的 32-token
-全层 KV chunk 约为 3.5 MiB。更换模型、TP 或 KV dtype 后，必须保证一个
-LMCache chunk 不大于 `xds_blob_size_bytes`；否则应减小 `chunk_size`，不要直接
-修改已经格式化的 blobstore cluster 大小。
+cluster；本机服务的 blob/cluster 都是 6 MiB。在 `use_layerwise: true` 下，
+每个 xDS blob 保存一个 layer 的一个 LMCache chunk。更换模型、TP、KV dtype
+或关闭 layerwise 后，必须保证每次提交的对象不大于
+`xds_blob_size_bytes`；否则应减小 `chunk_size`，不要直接修改已经格式化的
+blobstore cluster 大小。
+
+direct 后端还把 xDS 服务配置的 `xds_gpu_buffer_size_bytes` 作为注册 GPU
+allocator。它必须足以容纳一次 store 阶段同时收集的 KV；容量不足时 LMCache
+会记录 `no enough memory`，并只保存能容纳的前缀。例如本机 64 MiB 配置配合
+Qwen3-0.6B 可完整验证约 500 token 的短请求；若要缓存 4K prompt，应在启动
+xDS 服务前把该注册池调大到覆盖对应 KV 总字节数。
 
 ## 启动外部 xDS 服务
 
 以下命令使用本机已有的 TP4/NUMA1 服务配置：
 
 ```bash
-sudo -E env XDS_SERVICE_ALLOWED_UID=0 \
+sudo -E env XDS_SERVICE_ALLOWED_UID="$(id -u)" \
   /home/yangxc/workspace/xDS/src/service/xds_service \
   --config /home/yangxc/workspace/xDS/configs/setup_qwen3_30b_tp4_numa1.json \
   --service-name xds0
 ```
 
 服务成功后应出现 `/tmp/xds_xds0.sock` 和 `/tmp/xds_xds0.shm`。服务配置中的
-queue 数、GPU BDF、blob 大小与推理的 TP 数必须匹配。退出推理进程后再用
-`Ctrl-C` 正常关闭服务。
+queue 数至少要覆盖推理 rank 数；GPU/SSD PCIe 拓扑、blob 大小也必须与实际
+部署匹配。退出推理进程后再用 `Ctrl-C` 正常关闭服务。
 
 ## vLLM 0.18.0
 

@@ -125,6 +125,33 @@ def test_storage_manager_selects_direct_xds_allocator(metadata, monkeypatch):
     backends["XDSBackend"].close()
 
 
+def test_storage_manager_selects_cascadekv_allocator(metadata, monkeypatch):
+    config = LMCacheEngineConfig.from_defaults()
+    config.local_cpu = False
+    config.max_local_cpu_size = 0
+    config.xds_service_name = "xds0"
+    config.cascadekv_backend = True
+    config.cascadekv_slot_count = 2
+    client = FakeXDSClient()
+    monkeypatch.setattr(
+        "lmcache.v1.storage_backend.connect_xds_client",
+        lambda *_args, **_kwargs: client,
+        raising=False,
+    )
+    backends = CreateStorageBackends(
+        config,
+        metadata,
+        asyncio.new_event_loop(),
+        dst_device="cpu",
+    )
+    manager = object.__new__(StorageManager)
+    manager.enable_pd = False
+    manager.storage_backends = backends
+
+    assert manager._get_allocator_backend(config) is backends["CascadeKVBackend"]
+    backends["CascadeKVBackend"].close()
+
+
 def test_xds_read_skips_local_cpu_writeback(monkeypatch):
     memory_obj = object()
 

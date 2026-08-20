@@ -9,6 +9,7 @@ import torch
 # First Party
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat
+from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.xds_utils import (
     XDSBlobMetadata,
     align_to_io_unit,
@@ -113,3 +114,36 @@ def test_connect_xds_client_rejects_undersized_blob(lmcache_engine_metadata):
 
     with pytest.raises(ValueError, match="smaller than one LMCache chunk"):
         connect_xds_client(config, lmcache_engine_metadata, connect_fn=connect)
+
+
+def test_layerwise_xds_validates_one_layer_per_blob():
+    metadata = LMCacheMetadata(
+        model_name="test-model",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.bfloat16,
+        kv_shape=(28, 2, 32, 8, 128),
+        chunk_size=32,
+    )
+    config = LMCacheEngineConfig.from_defaults()
+    config.xds_service_name = "xds0"
+    config.xds_backend = True
+    config.xds_require_direct = True
+    config.use_layerwise = True
+
+    def connect(*_args):
+        return SimpleNamespace(
+            metadata=SimpleNamespace(
+                queue_id=0,
+                worker_id=0,
+                io_unit_size=4096,
+                blob_size_bytes=1024 * 1024,
+                capacity_bytes=64 * 1024 * 1024,
+                gpu_buffer_size_bytes=64 * 1024 * 1024,
+            )
+        )
+
+    client = connect_xds_client(config, metadata, connect_fn=connect)
+    assert client.metadata.blob_size_bytes == 1024 * 1024

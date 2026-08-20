@@ -1,9 +1,10 @@
 # CascadeKV path: SSD -> service-managed CPU staging buffer -> GPU
-# Keep one all-layer KV chunk within the xDS service's 6 MiB blob.
+# Keep one layerwise KV chunk within the xDS service's 6 MiB blob.
 chunk_size: 32
 local_cpu: false
-# Required allocator capacity for the bounded CPU staging pool.
-max_local_cpu_size: 5
+# Do not create a separate LocalCPUBackend: CascadeKV owns its bounded CPU
+# staging allocator, so a cache hit must travel through xDS.
+max_local_cpu_size: 0
 use_layerwise: true
 save_unfull_chunk: true
 

@@ -50,8 +50,11 @@ def align_to_io_unit(size: int, io_unit_size: int) -> int:
     return ((size + io_unit_size - 1) // io_unit_size) * io_unit_size
 
 
-def get_chunk_size_bytes(metadata: LMCacheMetadata) -> int:
-    """Return the logical byte size of one configured LMCache chunk."""
+def get_chunk_size_bytes(
+    metadata: LMCacheMetadata,
+    use_layerwise: bool = False,
+) -> int:
+    """Return the largest logical object submitted for one cache chunk."""
     shapes = metadata.get_shapes(metadata.chunk_size)
     dtypes = metadata.get_dtypes()
     if len(shapes) != len(dtypes):
@@ -59,16 +62,34 @@ def get_chunk_size_bytes(metadata: LMCacheMetadata) -> int:
             "LMCache metadata returned different shape and dtype counts: "
             f"{len(shapes)} != {len(dtypes)}"
         )
-    return sum(
+    sizes = [
         shape.numel() * torch.empty((), dtype=dtype).element_size()
         for shape, dtype in zip(shapes, dtypes, strict=True)
-    )
+    ]
+    if not use_layerwise:
+        return sum(sizes)
+
+    layer_groups = metadata.kv_layer_groups_manager.kv_layer_groups
+    if layer_groups:
+        return max(
+            size // group.num_layers
+            for size, group in zip(sizes, layer_groups, strict=True)
+        )
+
+    num_layers = metadata.kv_shape[0]
+    if num_layers <= 0 or sizes[0] % num_layers:
+        raise ValueError(
+            "LMCache layerwise metadata must have a positive, evenly sized "
+            f"layer dimension, got num_layers={num_layers}, size={sizes[0]}"
+        )
+    return sizes[0] // num_layers
 
 
 def _validate_service_metadata(
     client: Any,
     metadata: LMCacheMetadata,
     require_direct: bool,
+    use_layerwise: bool = False,
 ) -> None:
     service_metadata = getattr(client, "metadata", None)
     if service_metadata is None:
@@ -98,7 +119,7 @@ def _validate_service_metadata(
             f"queue_id={queue_id}, worker_id={worker_id}"
         )
 
-    logical_chunk_size = get_chunk_size_bytes(metadata)
+    logical_chunk_size = get_chunk_size_bytes(metadata, use_layerwise=use_layerwise)
     required_blob_size = align_to_io_unit(logical_chunk_size, io_unit_size)
     if blob_size < required_blob_size:
         raise ValueError(
@@ -147,7 +168,12 @@ def connect_xds_client(
         ) from exc
 
     try:
-        _validate_service_metadata(client, metadata, require_direct)
+        _validate_service_metadata(
+            client,
+            metadata,
+            require_direct,
+            use_layerwise=config.use_layerwise,
+        )
     except Exception:
         close = getattr(client, "close", None)
         if callable(close):

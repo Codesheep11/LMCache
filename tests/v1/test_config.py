@@ -750,14 +750,6 @@ def test_update_config_from_env_calls_validate():
             },
             "cascadekv_slot_count",
         ),
-        (
-            {
-                "xds_service_name": "xds0",
-                "cascadekv_backend": True,
-                "max_local_cpu_size": 0,
-            },
-            "max_local_cpu_size",
-        ),
     ],
 )
 def test_xds_backend_config_rejects_invalid_combinations(overrides, message):
@@ -780,6 +772,8 @@ def test_xds_backend_config_accepts_each_service_path(monkeypatch):
     cascade.xds_service_name = "xds0"
     cascade.cascadekv_backend = True
     cascade.cascadekv_slot_count = 4
+    cascade.local_cpu = False
+    cascade.max_local_cpu_size = 0
     cascade.validate()
 
     monkeypatch.setenv("LMCACHE_CASCADEKV_BACKEND", "true")

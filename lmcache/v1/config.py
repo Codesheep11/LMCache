@@ -661,11 +661,6 @@ def _validate_config(self):
             "cascadekv_slot_count must be positive, "
             f"got {self.cascadekv_slot_count}"
         )
-    if self.cascadekv_backend and self.max_local_cpu_size <= 0:
-        raise ValueError(
-            "cascadekv_backend requires max_local_cpu_size to be positive"
-        )
-
     return self
 
 

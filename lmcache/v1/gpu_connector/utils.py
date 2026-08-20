@@ -88,13 +88,18 @@ def permute_to_contiguous(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def permute_kv_caches_to_contiguous(
-    kv_caches: List[torch.Tensor],
-) -> List[torch.Tensor]:
+    kv_caches: List[torch.Tensor] | List[List[torch.Tensor]],
+) -> List[torch.Tensor] | List[List[torch.Tensor]]:
     """Apply :func:`permute_to_contiguous` to each tensor in *kv_caches*.
 
     The returned list shares the same underlying storage as the input.
     """
-    return [permute_to_contiguous(t) for t in kv_caches]
+    return [
+        permute_kv_caches_to_contiguous(t)
+        if isinstance(t, (list, tuple))
+        else permute_to_contiguous(t)
+        for t in kv_caches
+    ]
 
 
 def assert_contiguous(tensor: torch.Tensor) -> None:
