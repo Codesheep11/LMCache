@@ -81,6 +81,39 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": str,
     },
     "remote_serde": {"type": Optional[str], "default": "naive", "env_converter": str},
+    # External xDS service storage backends
+    "xds_service_name": {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+    },
+    "xds_backend": {"type": bool, "default": False, "env_converter": _to_bool},
+    "cascadekv_backend": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "xds_require_direct": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "xds_windowed_io": {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+    },
+    "xds_read_window_size": {"type": int, "default": 64, "env_converter": int},
+    "xds_write_window_size": {"type": int, "default": 64, "env_converter": int},
+    "xds_io_queue_depth": {"type": int, "default": 1, "env_converter": int},
+    "xds_read_slot_count": {"type": int, "default": 2, "env_converter": int},
+    "xds_write_slot_count": {"type": int, "default": 8, "env_converter": int},
+    "xds_async_write": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "cascadekv_slot_count": {"type": int, "default": 8, "env_converter": int},
     # Feature toggles
     "use_layerwise": {
         "type": bool,
@@ -595,6 +628,39 @@ def _validate_config(self):
         assert self.extra_config.get("nixl_pool_size") is not None
         assert self.nixl_buffer_size is not None
         assert self.nixl_buffer_device is not None
+
+    if self.xds_backend and self.cascadekv_backend:
+        raise ValueError("xds_backend and cascadekv_backend cannot both be enabled")
+
+    xds_enabled = self.xds_backend or self.cascadekv_backend
+    if xds_enabled and not self.xds_service_name:
+        raise ValueError(
+            "xds_service_name must be set when an xDS storage backend is enabled"
+        )
+
+    if self.xds_backend and not self.xds_require_direct:
+        raise ValueError("xds_backend requires xds_require_direct=true")
+    if self.cascadekv_backend and self.xds_require_direct:
+        raise ValueError("cascadekv_backend requires xds_require_direct=false")
+
+    if self.xds_backend:
+        positive_direct_fields = (
+            "xds_read_window_size",
+            "xds_write_window_size",
+            "xds_io_queue_depth",
+            "xds_read_slot_count",
+            "xds_write_slot_count",
+        )
+        for field_name in positive_direct_fields:
+            value = getattr(self, field_name)
+            if value <= 0:
+                raise ValueError(f"{field_name} must be positive, got {value}")
+
+    if self.cascadekv_backend and self.cascadekv_slot_count <= 0:
+        raise ValueError(
+            "cascadekv_slot_count must be positive, "
+            f"got {self.cascadekv_slot_count}"
+        )
 
     return self
 

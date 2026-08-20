@@ -715,3 +715,67 @@ def test_update_config_from_env_calls_validate():
         del os.environ["LMCACHE_PD_BUFFER_SIZE"]
         del os.environ["LMCACHE_PD_BUFFER_DEVICE"]
         del os.environ["LMCACHE_SAVE_UNFULL_CHUNK"]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {
+                "xds_service_name": "xds0",
+                "xds_backend": True,
+                "cascadekv_backend": True,
+                "xds_require_direct": True,
+            },
+            "cannot both be enabled",
+        ),
+        ({"xds_backend": True}, "xds_service_name"),
+        (
+            {"xds_service_name": "xds0", "xds_backend": True},
+            "xds_require_direct=true",
+        ),
+        (
+            {
+                "xds_service_name": "xds0",
+                "cascadekv_backend": True,
+                "xds_require_direct": True,
+            },
+            "xds_require_direct=false",
+        ),
+        (
+            {
+                "xds_service_name": "xds0",
+                "cascadekv_backend": True,
+                "cascadekv_slot_count": 0,
+            },
+            "cascadekv_slot_count",
+        ),
+    ],
+)
+def test_xds_backend_config_rejects_invalid_combinations(overrides, message):
+    config = LMCacheEngineConfig.from_defaults()
+    for name, value in overrides.items():
+        setattr(config, name, value)
+
+    with pytest.raises(ValueError, match=message):
+        config.validate()
+
+
+def test_xds_backend_config_accepts_each_service_path(monkeypatch):
+    direct = LMCacheEngineConfig.from_defaults()
+    direct.xds_service_name = "xds0"
+    direct.xds_backend = True
+    direct.xds_require_direct = True
+    direct.validate()
+
+    cascade = LMCacheEngineConfig.from_defaults()
+    cascade.xds_service_name = "xds0"
+    cascade.cascadekv_backend = True
+    cascade.cascadekv_slot_count = 4
+    cascade.validate()
+
+    monkeypatch.setenv("LMCACHE_CASCADEKV_BACKEND", "true")
+    monkeypatch.setenv("LMCACHE_XDS_SERVICE_NAME", "xds-env")
+    from_env = LMCacheEngineConfig.from_env()
+    assert from_env.cascadekv_backend is True
+    assert from_env.xds_service_name == "xds-env"
