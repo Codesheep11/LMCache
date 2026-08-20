@@ -750,6 +750,14 @@ def test_update_config_from_env_calls_validate():
             },
             "cascadekv_slot_count",
         ),
+        (
+            {
+                "xds_service_name": "xds0",
+                "cascadekv_backend": True,
+                "max_local_cpu_size": 0,
+            },
+            "max_local_cpu_size",
+        ),
     ],
 )
 def test_xds_backend_config_rejects_invalid_combinations(overrides, message):

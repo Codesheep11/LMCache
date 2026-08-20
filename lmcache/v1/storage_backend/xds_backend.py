@@ -146,8 +146,8 @@ class XDSBackend(CascadeKVBackend):
     ) -> None:
         key = lease.keys[0]
         memory_obj = lease.objects[0]
-        future = getattr(lease, "future")
-        callback = getattr(lease, "on_complete_callback")
+        future = lease.future
+        callback = lease.on_complete_callback
         try:
             if error is not None:
                 future.set_exception(error)

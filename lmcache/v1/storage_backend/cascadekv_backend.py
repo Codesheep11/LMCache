@@ -161,7 +161,8 @@ class CascadeKVBackend(AllocatorBackendInterface):
             )
         if size > self.blob_size:
             raise ValueError(
-                f"CascadeKV memory object size {size} exceeds blob size {self.blob_size}"
+                "CascadeKV memory object size "
+                f"{size} exceeds blob size {self.blob_size}"
             )
         return offset, size
 
