@@ -100,7 +100,8 @@ staging slots 接近 prompt 的 chunk 数量。本轮恢复移植前的有界流
 
 服务分配的 hugepage buffer 必须在生成 `torch.frombuffer()` 视图后通过
 `cudaHostRegister(..., cudaHostRegisterDefault)` 注册为 CUDA pinned host
-memory。移植前的 DMA 路径先调用 `xds.alloc_io_buffer_view()`，再执行
+memory。移植前 CascadeKV 后端的 DMA staging 路径先调用
+`xds.alloc_io_buffer_view()`，再执行
 `torch.frombuffer(...).pin_memory()` 并交给 `XDSDmaAllocator`。新版不能直接照搬
 这一表达：PyTorch 在源 tensor 尚未 pinned 时会复制数据，使 tensor 地址与 xDS
 buffer pointer 分离。service API 要求 `memoryview` 与 `buffer_ref` 保持一一对应，
