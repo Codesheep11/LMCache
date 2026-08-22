@@ -121,7 +121,7 @@ capture_manifest() {
     printf 'ssd_bdfs=%s\n' "${BDFS[*]}"
     printf 'gpu_visible=4,5,6,7\n'
     "$PYTHON" -c \
-      'import lmcache, torch, vllm; print(f"lmcache={lmcache.__version__}"); print(f"vllm={vllm.__version__}"); print(f"torch={torch.__version__}")'
+      'from importlib import metadata; import torch, vllm; print("lmcache=" + metadata.version("lmcache")); print(f"vllm={vllm.__version__}"); print(f"torch={torch.__version__}")'
     bash "$SWITCH" status
     nvidia-smi --query-gpu=index,name,memory.total,memory.used \
       --format=csv,noheader

@@ -34,4 +34,10 @@ service_tail=${xds_tail#*"$service_marker"}
 [[ "$output" == *'0000:ec:00.0'* ]]
 [[ "$output" == *'0000:ed:00.0'* ]]
 
+if rg -q 'lmcache\.__version__' "$RUNNER"; then
+  echo 'manifest must not require lmcache.__version__' >&2
+  exit 1
+fi
+rg -q 'metadata\.version\("lmcache"\)' "$RUNNER"
+
 printf 'LMCACHE_V043_SAME_SSD_ORCHESTRATOR_TESTS_OK\n'
