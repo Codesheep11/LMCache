@@ -698,9 +698,29 @@ def _validate_config(self):
             value = getattr(self, field_name)
             if value <= 0:
                 raise ValueError(f"{field_name} must be positive, got {value}")
+        user_set_keys = getattr(self, "_user_set_keys", set())
+        legacy_explicit = "cascadekv_slot_count" in user_set_keys
+        split_explicit = bool(
+            {"cascadekv_read_slot_count", "cascadekv_write_slot_count"}
+            & user_set_keys
+        )
+        if legacy_explicit and not split_explicit:
+            effective_read_slots = self.cascadekv_slot_count
+            effective_write_slots = self.cascadekv_slot_count
+        elif (
+            not user_set_keys
+            and self.cascadekv_slot_count != 8
+            and self.cascadekv_read_slot_count == 8
+            and self.cascadekv_write_slot_count == 64
+        ):
+            effective_read_slots = self.cascadekv_slot_count
+            effective_write_slots = self.cascadekv_slot_count
+        else:
+            effective_read_slots = self.cascadekv_read_slot_count
+            effective_write_slots = self.cascadekv_write_slot_count
         if self.cascadekv_io_queue_depth > min(
-            self.cascadekv_read_slot_count,
-            self.cascadekv_write_slot_count,
+            effective_read_slots,
+            effective_write_slots,
         ):
             raise ValueError(
                 "cascadekv_io_queue_depth cannot exceed the read or write slot count"

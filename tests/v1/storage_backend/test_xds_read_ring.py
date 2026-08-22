@@ -92,7 +92,7 @@ def test_read_ring_reports_unknown_completion_after_draining_inflight():
     assert "unknown completion request 999" in str(failures[0].error)
 
 
-def test_read_ring_wait_failure_releases_all_pending_items_and_stops():
+def test_read_ring_wait_failure_marks_submitted_items_unsafe_for_reuse():
     client = FailingWaitClient()
     pump = XDSReadRingPump(2, client.submit, client.wait_any_result, 1.0)
     worker = _run_pump(pump, ["first", "second", "not-submitted"])
@@ -107,3 +107,9 @@ def test_read_ring_wait_failure_releases_all_pending_items_and_stops():
         "not-submitted",
     }
     assert all(isinstance(result.error, TimeoutError) for result in results)
+    safety = {result.item: result.safe_to_reuse for result in results}
+    assert safety == {
+        "first": False,
+        "second": False,
+        "not-submitted": True,
+    }

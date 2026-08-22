@@ -995,10 +995,10 @@ class XDSBackend(CascadeKVBackend):
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> Optional[list[Future]]:
         if self._write_scheduler is None:
-            return super().batched_submit_put_task(
+            del transfer_spec
+            return self._batched_submit_put_task_serial(
                 keys,
                 objs,
-                transfer_spec,
                 on_complete_callback,
             )
         if len(keys) != len(objs):

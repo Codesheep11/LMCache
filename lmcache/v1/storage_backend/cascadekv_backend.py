@@ -4,7 +4,9 @@
 # Standard
 from collections import OrderedDict
 from concurrent.futures import Future
-from typing import Any, Callable, Optional, Sequence, Union
+from contextlib import contextmanager
+from functools import wraps
+from typing import Any, Callable, Iterator, Optional, Sequence, Union
 import asyncio
 import threading
 import time
@@ -47,13 +49,41 @@ CASCADEKV_READ_SLOT_COUNT_DEFAULT = 8
 CASCADEKV_WRITE_SLOT_COUNT_DEFAULT = 64
 
 
+def _guard_operation(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Reject new public operations after CascadeKV shutdown begins."""
+
+    @wraps(method)
+    def guarded(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with self._active_operation():
+            return method(self, *args, **kwargs)
+
+    return guarded
+
+
+def _guard_async_operation(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Async counterpart of :func:`_guard_operation`."""
+
+    @wraps(method)
+    async def guarded(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with self._active_operation():
+            return await method(self, *args, **kwargs)
+
+    return guarded
+
+
 def _resolve_slot_counts(config: LMCacheEngineConfig) -> tuple[int, int]:
     """Resolve new read/write banks with compatibility for old slot configs."""
     read_slots = int(config.cascadekv_read_slot_count)
     write_slots = int(config.cascadekv_write_slot_count)
     legacy_slots = int(config.cascadekv_slot_count)
-    if (
-        legacy_slots != LEGACY_CASCADEKV_SLOT_COUNT_DEFAULT
+    user_set_keys = getattr(config, "_user_set_keys", set())
+    legacy_explicit = "cascadekv_slot_count" in user_set_keys
+    split_explicit = bool(
+        {"cascadekv_read_slot_count", "cascadekv_write_slot_count"} & user_set_keys
+    )
+    if (legacy_explicit and not split_explicit) or (
+        not user_set_keys
+        and legacy_slots != LEGACY_CASCADEKV_SLOT_COUNT_DEFAULT
         and read_slots == CASCADEKV_READ_SLOT_COUNT_DEFAULT
         and write_slots == CASCADEKV_WRITE_SLOT_COUNT_DEFAULT
     ):
@@ -78,10 +108,25 @@ class CascadeKVBackend(AllocatorBackendInterface):
         self.metadata = metadata
         self.client = xds_client
         self._closed = False
+        self._closing = False
+        self._teardown_started = False
+        self._active_operations = 0
+        self._lifecycle_condition = threading.Condition()
+        self._operation_local = threading.local()
+        self._buffer_freed = False
+        self._client_closed = False
+        self._host_registered = False
+        self._read_allocator_closed = False
+        self._write_allocator_closed = False
+        self._poisoned_error: Optional[BaseException] = None
+        self._quarantined_objects: list[MemoryObj] = []
+        self._quarantined_xds_requests: dict[int, MemoryObj] = {}
+        self._write_scheduler: Optional[XDSAsyncWriteScheduler] = None
         self._entries: OrderedDict[CacheEngineKey, XDSBlobMetadata] = OrderedDict()
         self._entries_lock = threading.RLock()
         self._put_tasks: set[CacheEngineKey] = set()
         self._pending_objects: dict[CacheEngineKey, MemoryObj] = {}
+        self._pending_transfer_events: dict[CacheEngineKey, Any] = {}
         self._put_tasks_lock = threading.RLock()
         self._async_admission_lock = threading.Lock()
         self._io_lock = threading.Lock()
@@ -97,58 +142,121 @@ class CascadeKVBackend(AllocatorBackendInterface):
         self.read_staging_size = self.read_slot_count * self.blob_size
         self.write_staging_size = self.write_slot_count * self.blob_size
         self.staging_size = self.read_staging_size + self.write_staging_size
-        self.staging_view, self.staging_buffer_ref = xds_client.alloc_buffer(
-            self.staging_size
-        )
-        self.staging_tensor = torch.frombuffer(
-            self.staging_view,
-            dtype=torch.uint8,
-        )
-        if self.staging_tensor.numel() != self.staging_size:
-            xds_client.free_buffer(self.staging_buffer_ref)
-            raise RuntimeError(
-                "xDS service returned an unexpected CPU staging buffer size: "
-                f"{self.staging_tensor.numel()} != {self.staging_size}"
+        self.staging_buffer_ref: Optional[int] = None
+        try:
+            self.staging_view, self.staging_buffer_ref = xds_client.alloc_buffer(
+                self.staging_size
             )
-        self.staging_base_ptr = self.staging_tensor.data_ptr()
-        self._cudart = torch.cuda.cudart()
-        register_status = int(
-            self._cudart.cudaHostRegister(
-                self.staging_base_ptr,
-                self.staging_size,
-                0,
+            self.staging_tensor = torch.frombuffer(
+                self.staging_view,
+                dtype=torch.uint8,
             )
-        )
-        if register_status != 0:
-            xds_client.free_buffer(self.staging_buffer_ref)
-            error_string = self._cudart.cudaGetErrorString(register_status)
-            raise RuntimeError(
-                "CascadeKV cudaHostRegister failed: "
-                f"status={register_status}, error={error_string}"
+            if self.staging_tensor.numel() != self.staging_size:
+                raise RuntimeError(
+                    "xDS service returned an unexpected CPU staging buffer size: "
+                    f"{self.staging_tensor.numel()} != {self.staging_size}"
+                )
+            self.staging_base_ptr = self.staging_tensor.data_ptr()
+            self._cudart = torch.cuda.cudart()
+            register_status = int(
+                self._cudart.cudaHostRegister(
+                    self.staging_base_ptr,
+                    self.staging_size,
+                    0,
+                )
             )
-        self._host_registered = True
+            if register_status != 0:
+                error_string = self._cudart.cudaGetErrorString(register_status)
+                raise RuntimeError(
+                    "CascadeKV cudaHostRegister failed: "
+                    f"status={register_status}, error={error_string}"
+                )
+            self._host_registered = True
 
-        self.read_staging_tensor = self.staging_tensor[: self.read_staging_size]
-        self.write_staging_tensor = self.staging_tensor[self.read_staging_size :]
-        self.read_staging_base_ptr = self.read_staging_tensor.data_ptr()
-        self.write_staging_base_ptr = self.write_staging_tensor.data_ptr()
-        self.read_memory_allocator = TensorMemoryAllocator(
-            self.read_staging_tensor,
-            align_bytes=self.io_unit_size,
-        )
-        self.write_memory_allocator = TensorMemoryAllocator(
-            self.write_staging_tensor,
-            align_bytes=self.io_unit_size,
-        )
-        self.memory_allocator = self.initialize_allocator(config, metadata)
-        self._write_scheduler: Optional[XDSAsyncWriteScheduler] = None
-        if config.cascadekv_async_write:
-            self._write_scheduler = XDSAsyncWriteScheduler(
-                write_budget_bytes=self.write_staging_size,
-                submit_write=self._submit_async_lease,
-                commit=self._commit_async_lease,
-                rollback=self._rollback_async_lease,
+            self.read_staging_tensor = self.staging_tensor[: self.read_staging_size]
+            self.write_staging_tensor = self.staging_tensor[self.read_staging_size :]
+            self.read_staging_base_ptr = self.read_staging_tensor.data_ptr()
+            self.write_staging_base_ptr = self.write_staging_tensor.data_ptr()
+            self.read_memory_allocator = TensorMemoryAllocator(
+                self.read_staging_tensor,
+                align_bytes=self.io_unit_size,
             )
+            self.write_memory_allocator = TensorMemoryAllocator(
+                self.write_staging_tensor,
+                align_bytes=self.io_unit_size,
+            )
+            self.memory_allocator = self.initialize_allocator(config, metadata)
+            if config.cascadekv_async_write:
+                self._write_scheduler = XDSAsyncWriteScheduler(
+                    write_budget_bytes=self.write_staging_size,
+                    submit_write=self._submit_async_lease,
+                    commit=self._commit_async_lease,
+                    rollback=self._rollback_async_lease,
+                )
+        except BaseException:
+            self._cleanup_failed_initialization()
+            raise
+
+    def _cleanup_failed_initialization(self) -> None:
+        """Best-effort unwind of service and CUDA resources during construction."""
+        try:
+            if self._write_scheduler is not None:
+                self._write_scheduler.close(timeout=DEFAULT_IO_TIMEOUT_SECS)
+        except BaseException:
+            logger.exception("failed to close CascadeKV scheduler after init failure")
+        try:
+            if self._host_registered:
+                self._cudart.cudaHostUnregister(self.staging_base_ptr)
+                self._host_registered = False
+        except BaseException:
+            logger.exception(
+                "failed to unregister CascadeKV staging after init failure"
+            )
+        try:
+            if self.staging_buffer_ref is not None and not self._buffer_freed:
+                self.client.free_buffer(self.staging_buffer_ref)
+                self._buffer_freed = True
+        except BaseException:
+            logger.exception("failed to free CascadeKV staging after init failure")
+        try:
+            client_close = getattr(self.client, "close", None)
+            if callable(client_close) and not self._client_closed:
+                client_close()
+                self._client_closed = True
+        except BaseException:
+            logger.exception("failed to close xDS client after CascadeKV init failure")
+
+    @contextmanager
+    def _active_operation(self, allow_poison: bool = False) -> Iterator[None]:
+        """Hold the backend lifecycle open for one re-entrant public operation."""
+        condition = getattr(self, "_lifecycle_condition", None)
+        if condition is None:
+            yield
+            return
+        depth = int(getattr(self._operation_local, "depth", 0))
+        if depth:
+            self._operation_local.depth = depth + 1
+            try:
+                yield
+            finally:
+                self._operation_local.depth = depth
+            return
+        with condition:
+            if self._closing or self._closed or self._teardown_started:
+                raise RuntimeError("CascadeKVBackend is closing or closed")
+            if self._poisoned_error is not None and not allow_poison:
+                raise RuntimeError(
+                    "CascadeKVBackend is poisoned by an incomplete transfer"
+                ) from self._poisoned_error
+            self._active_operations += 1
+            self._operation_local.depth = 1
+        try:
+            yield
+        finally:
+            with condition:
+                self._operation_local.depth = 0
+                self._active_operations -= 1
+                condition.notify_all()
 
     def __str__(self) -> str:
         return self.__class__.__name__
@@ -167,6 +275,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
     def get_memory_allocator(self) -> MemoryAllocatorInterface:
         return self.memory_allocator
 
+    @_guard_operation
     def allocate(
         self,
         shapes: Union[torch.Size, list[torch.Size]],
@@ -178,6 +287,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
         del eviction, busy_loop
         return self.memory_allocator.allocate(shapes, dtypes, fmt)
 
+    @_guard_operation
     def batched_allocate(
         self,
         shapes: Union[torch.Size, list[torch.Size]],
@@ -198,6 +308,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
     def calculate_chunk_budget(self) -> int:
         return self.write_slot_count
 
+    @_guard_operation
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self._put_tasks_lock:
             if key in self._put_tasks:
@@ -233,6 +344,80 @@ class CascadeKVBackend(AllocatorBackendInterface):
                 f"{size} exceeds blob size {self.blob_size}"
             )
         return offset, size
+
+    @staticmethod
+    def _ensure_cuda_transfer_complete(
+        gpu_connector: Any,
+        direction: str,
+        event: Any = None,
+    ) -> None:
+        """Prove stream completion before a staging slot can be recycled."""
+        errors: list[BaseException] = []
+        if event is not None:
+            try:
+                event.synchronize()
+                return
+            except BaseException as error:
+                errors.append(error)
+        if gpu_connector is not None:
+            try:
+                recovery_event = gpu_connector.record_transfer_event(direction)
+                recovery_event.synchronize()
+                return
+            except BaseException as error:
+                errors.append(error)
+        try:
+            torch.cuda.synchronize()
+            return
+        except BaseException as error:
+            errors.append(error)
+        raise RuntimeError(
+            "could not establish CUDA transfer completion for CascadeKV slot reuse"
+        ) from errors[0]
+
+    def _quarantine_cuda_objects(
+        self,
+        memory_objs: Sequence[MemoryObj],
+        error: BaseException,
+    ) -> None:
+        """Retain unsafe staging slots and reject future backend operations."""
+        self._quarantined_objects.extend(memory_objs)
+        self._poisoned_error = error
+
+    def _quarantine_xds_object(
+        self,
+        request_id: int,
+        memory_obj: MemoryObj,
+        error: BaseException,
+    ) -> None:
+        """Retain a staging slot until its exact late xDS completion is drained."""
+        self._quarantined_objects.append(memory_obj)
+        self._quarantined_xds_requests[request_id] = memory_obj
+        self._poisoned_error = error
+
+    def drain_quarantined_xds_transfers(
+        self,
+        timeout: float = DEFAULT_IO_TIMEOUT_SECS,
+    ) -> None:
+        """Drain exact late xDS completions and make quarantined slots reusable."""
+        with self._active_operation(allow_poison=True):
+            pending = dict(self._quarantined_xds_requests)
+            while pending:
+                completion = self.client.wait_any_result(timeout=timeout)
+                request_id = int(completion.request_id)
+                memory_obj = pending.pop(request_id, None)
+                if memory_obj is None:
+                    raise RuntimeError(
+                        "xDS returned an unknown completion while draining "
+                        f"quarantined CascadeKV request {request_id}"
+                    )
+                memory_obj.ref_count_down()
+                self._quarantined_xds_requests.pop(request_id, None)
+                self._quarantined_objects = [
+                    item for item in self._quarantined_objects if item is not memory_obj
+                ]
+            if not self._quarantined_objects:
+                self._poisoned_error = None
 
     def _wait_for_completion(
         self,
@@ -305,7 +490,20 @@ class CascadeKVBackend(AllocatorBackendInterface):
     def _write_staging_lease(self, lease: StagingLease) -> tuple[int, ...]:
         transfer_event = getattr(lease, "transfer_event", None)
         if transfer_event is not None:
-            transfer_event.synchronize()
+            try:
+                transfer_event.synchronize()
+            except BaseException as transfer_error:
+                try:
+                    self._ensure_cuda_transfer_complete(
+                        getattr(lease, "gpu_connector", None),
+                        "store",
+                        transfer_event,
+                    )
+                except BaseException as recovery_error:
+                    lease.cuda_quarantined = True
+                    self._quarantine_cuda_objects(lease.objects, recovery_error)
+                    raise recovery_error from transfer_error
+                raise
 
         items: list[dict[str, Any]] = []
         blob_handles: list[int] = []
@@ -396,7 +594,9 @@ class CascadeKVBackend(AllocatorBackendInterface):
 
     @staticmethod
     def _release_lease_objects(lease: StagingLease) -> None:
-        if getattr(lease, "resources_released", False):
+        if getattr(lease, "resources_released", False) or getattr(
+            lease, "cuda_quarantined", False
+        ):
             return
         for memory_obj in lease.objects:
             memory_obj.ref_count_down()
@@ -448,6 +648,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
             for key in lease.keys:
                 self._put_tasks.discard(key)
                 self._pending_objects.pop(key, None)
+                self._pending_transfer_events.pop(key, None)
         self._finish_lease_futures(lease)
         self._release_lease_objects(lease)
 
@@ -468,6 +669,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
             for key in lease.keys:
                 self._put_tasks.discard(key)
                 self._pending_objects.pop(key, None)
+                self._pending_transfer_events.pop(key, None)
         self._finish_lease_futures(lease, error=error)
         self._release_lease_objects(lease)
         logger.error(
@@ -477,6 +679,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
             error,
         )
 
+    @_guard_operation
     def flush_async_writes(
         self,
         timeout: Optional[float] = None,
@@ -486,6 +689,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
             raise RuntimeError("CascadeKV asynchronous writes are not enabled")
         return self._write_scheduler.drain(timeout)
 
+    @_guard_operation
     def batched_submit_put_task(
         self,
         keys: Sequence[CacheEngineKey],
@@ -548,6 +752,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
                 with self._put_tasks_lock:
                     for key, memory_obj in zip(lease_keys, objects, strict=True):
                         self._pending_objects[key] = memory_obj
+                        self._pending_transfer_events.pop(key, None)
                 pending_installed = True
                 if self._write_scheduler is not None:
                     self._write_scheduler.enqueue(lease)
@@ -562,6 +767,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
                         for key in lease_keys:
                             self._put_tasks.discard(key)
                             self._pending_objects.pop(key, None)
+                            self._pending_transfer_events.pop(key, None)
                 if references_added:
                     for memory_obj in objects:
                         memory_obj.ref_count_down()
@@ -572,6 +778,40 @@ class CascadeKVBackend(AllocatorBackendInterface):
                         futures[index].set_exception(exc)
         return futures
 
+    def _batched_submit_put_task_serial(
+        self,
+        keys: Sequence[CacheEngineKey],
+        objs: list[MemoryObj],
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
+    ) -> list[Future]:
+        """Preserve the pre-pipeline single-I/O path for subclass fallback."""
+        if len(keys) != len(objs):
+            raise ValueError("keys and objs must have the same length")
+        futures: list[Future] = []
+        for key, memory_obj in zip(keys, objs, strict=True):
+            future: Future = Future()
+            futures.append(future)
+            with self._put_tasks_lock, self._entries_lock:
+                if key in self._put_tasks or key in self._entries:
+                    future.set_result(False)
+                    continue
+                self._put_tasks.add(key)
+            try:
+                stored = self._write_one(key, memory_obj)
+                if stored and on_complete_callback is not None:
+                    try:
+                        on_complete_callback(key)
+                    except Exception:
+                        logger.exception("storage put completion callback failed")
+                future.set_result(stored)
+            except Exception as error:
+                future.set_exception(error)
+            finally:
+                with self._put_tasks_lock:
+                    self._put_tasks.discard(key)
+        return futures
+
+    @_guard_async_operation
     async def async_batched_submit_put_task(
         self,
         keys: Sequence[CacheEngineKey],
@@ -586,9 +826,9 @@ class CascadeKVBackend(AllocatorBackendInterface):
             transfer_spec,
             on_complete_callback,
         )
-        for future in futures or []:
-            future.result()
+        await asyncio.gather(*(asyncio.wrap_future(future) for future in futures or []))
 
+    @_guard_operation
     def batched_put_from_gpu_blocking(
         self,
         keys: Sequence[CacheEngineKey],
@@ -620,9 +860,12 @@ class CascadeKVBackend(AllocatorBackendInterface):
                     if key in seen or key in self._put_tasks or key in self._entries:
                         continue
                     seen.add(key)
+                    self._put_tasks.add(key)
                     task_infos.append(
                         {"index": index, "key": key, "start": start, "end": end}
                     )
+
+            reserved_keys = {info["key"] for info in task_infos}
 
             lease_size = min(
                 self.write_slot_count,
@@ -631,26 +874,48 @@ class CascadeKVBackend(AllocatorBackendInterface):
             for lease_start in range(0, len(task_infos), lease_size):
                 lease_infos = task_infos[lease_start : lease_start + lease_size]
                 reserved_bytes = len(lease_infos) * self.blob_size
-                backpressure_seconds += scheduler.acquire_credits(
-                    reserved_bytes,
-                    timeout=float(self.config.blocking_timeout_secs),
-                )
                 objects: list[MemoryObj] = []
+                credits_acquired = False
                 pending_installed = False
                 enqueued = False
+                gpu_transfer_started = False
+                event = None
                 staging_start = time.perf_counter()
+                timeout_seconds = float(self.config.blocking_timeout_secs)
+                admission_deadline = time.monotonic() + timeout_seconds
                 try:
+                    backpressure_seconds += scheduler.acquire_credits(
+                        reserved_bytes,
+                        timeout=timeout_seconds,
+                    )
+                    credits_acquired = True
                     for info in lease_infos:
-                        memory_obj = self.write_memory_allocator.allocate(
-                            self.metadata.get_shapes(info["end"] - info["start"]),
-                            self.metadata.get_dtypes(),
-                        )
-                        if memory_obj is None:
-                            raise MemoryError(
-                                "CascadeKV async write slot allocation failed"
-                            )
+                        slot_wait_started = time.monotonic()
+                        while True:
+                            if (
+                                self.write_memory_allocator.address_manager.get_free_size()
+                                >= self.blob_size
+                            ):
+                                memory_obj = self.write_memory_allocator.allocate(
+                                    self.metadata.get_shapes(
+                                        info["end"] - info["start"]
+                                    ),
+                                    self.metadata.get_dtypes(),
+                                )
+                            else:
+                                memory_obj = None
+                            if memory_obj is not None:
+                                break
+                            remaining = admission_deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise TimeoutError(
+                                    "timed out waiting for a CascadeKV write slot"
+                                )
+                            time.sleep(min(0.001, remaining))
+                        backpressure_seconds += time.monotonic() - slot_wait_started
                         objects.append(memory_obj)
                     sizes = tuple(obj.get_physical_size() for obj in objects)
+                    gpu_transfer_started = True
                     gpu_connector.batched_from_gpu(
                         objects,
                         [info["start"] for info in lease_infos],
@@ -669,34 +934,55 @@ class CascadeKVBackend(AllocatorBackendInterface):
                     lease.futures = ()
                     lease.on_complete_callback = None
                     lease.transfer_event = event
+                    lease.gpu_connector = gpu_connector
+                    lease.cuda_quarantined = False
                     lease.resources_released = False
                     lease.io_outcome = None
                     lease.transition(LeaseState.PENDING)
                     with self._put_tasks_lock:
-                        self._put_tasks.update(lease.keys)
                         for key, memory_obj in zip(
                             lease.keys,
                             lease.objects,
                             strict=True,
                         ):
                             self._pending_objects[key] = memory_obj
+                            self._pending_transfer_events[key] = event
                     pending_installed = True
                     scheduler.enqueue(lease)
                     enqueued = True
+                    reserved_keys.difference_update(lease.keys)
                     for index in lease.indexes:
                         accepted[index] = True
                     accepted_bytes += sum(sizes)
                     staging_seconds += time.perf_counter() - staging_start
-                except BaseException:
+                except BaseException as transfer_error:
+                    recovery_error: Optional[BaseException] = None
+                    if gpu_transfer_started and not enqueued:
+                        try:
+                            self._ensure_cuda_transfer_complete(
+                                gpu_connector,
+                                "store",
+                                event,
+                            )
+                        except BaseException as error:
+                            recovery_error = error
+                            self._quarantine_cuda_objects(objects, error)
                     if pending_installed:
                         with self._put_tasks_lock:
                             for info in lease_infos:
                                 self._put_tasks.discard(info["key"])
                                 self._pending_objects.pop(info["key"], None)
-                    if not enqueued:
+                                self._pending_transfer_events.pop(info["key"], None)
+                    if not enqueued and recovery_error is None:
                         for memory_obj in objects:
                             memory_obj.ref_count_down()
-                        scheduler.release_credits(reserved_bytes)
+                        if credits_acquired:
+                            scheduler.release_credits(reserved_bytes)
+                    with self._put_tasks_lock:
+                        for key in reserved_keys:
+                            self._put_tasks.discard(key)
+                    if recovery_error is not None:
+                        raise recovery_error from transfer_error
                     raise
 
         snapshot = scheduler.snapshot()
@@ -747,6 +1033,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
             slot_wait_seconds=slot_wait_seconds,
         )
 
+    @_guard_operation
     def batched_get_to_gpu_blocking(
         self,
         keys: list[CacheEngineKey],
@@ -773,6 +1060,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
                 if memory_obj is None:
                     continue
                 memory_obj.ref_count_up()
+                transfer_event = self._pending_transfer_events.get(key)
                 pending_indexes.add(index)
                 pending_infos.append(
                     {
@@ -781,6 +1069,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
                         "start": start,
                         "end": end,
                         "size": memory_obj.get_physical_size(),
+                        "transfer_event": transfer_event,
                     }
                 )
 
@@ -813,19 +1102,58 @@ class CascadeKVBackend(AllocatorBackendInterface):
         try:
             for info in pending_infos:
                 gpu_start = time.perf_counter()
-                gpu_connector.to_gpu(
-                    info["memory_obj"],
-                    info["start"],
-                    info["end"],
-                    **kwargs,
-                )
-                event = gpu_connector.record_transfer_event("load")
-                wait_start = time.perf_counter()
-                event.synchronize()
-                slot_wait_seconds += time.perf_counter() - wait_start
-                gpu_seconds += time.perf_counter() - gpu_start
-                completed[info["index"]] = True
-                completed_bytes += info["size"]
+                load_started = False
+                load_event = None
+                try:
+                    transfer_event = info["transfer_event"]
+                    if transfer_event is not None:
+                        try:
+                            transfer_event.synchronize()
+                        except BaseException as transfer_error:
+                            try:
+                                self._ensure_cuda_transfer_complete(
+                                    gpu_connector,
+                                    "store",
+                                    transfer_event,
+                                )
+                            except BaseException as recovery_error:
+                                info["cuda_quarantined"] = True
+                                self._quarantine_cuda_objects(
+                                    [info["memory_obj"]],
+                                    recovery_error,
+                                )
+                                raise recovery_error from transfer_error
+                            raise
+                    load_started = True
+                    gpu_connector.to_gpu(
+                        info["memory_obj"],
+                        info["start"],
+                        info["end"],
+                        **kwargs,
+                    )
+                    load_event = gpu_connector.record_transfer_event("load")
+                    wait_start = time.perf_counter()
+                    load_event.synchronize()
+                    slot_wait_seconds += time.perf_counter() - wait_start
+                    gpu_seconds += time.perf_counter() - gpu_start
+                    completed[info["index"]] = True
+                    completed_bytes += info["size"]
+                except BaseException as transfer_error:
+                    if load_started:
+                        try:
+                            self._ensure_cuda_transfer_complete(
+                                gpu_connector,
+                                "load",
+                                load_event,
+                            )
+                        except BaseException as recovery_error:
+                            info["cuda_quarantined"] = True
+                            self._quarantine_cuda_objects(
+                                [info["memory_obj"]],
+                                recovery_error,
+                            )
+                            raise recovery_error from transfer_error
+                    raise
         except BaseException:
             for info in task_infos:
                 with self._entries_lock:
@@ -833,7 +1161,8 @@ class CascadeKVBackend(AllocatorBackendInterface):
             raise
         finally:
             for info in pending_infos:
-                info["memory_obj"].ref_count_down()
+                if not info.get("cuda_quarantined", False):
+                    info["memory_obj"].ref_count_down()
 
         if not task_infos:
             wall_seconds = time.perf_counter() - wall_start
@@ -878,7 +1207,8 @@ class CascadeKVBackend(AllocatorBackendInterface):
         short_io_chunks = 0
 
         def release_entry(entry: dict[str, Any]) -> None:
-            entry["memory_obj"].ref_count_down()
+            if not entry.get("cuda_quarantined", False):
+                entry["memory_obj"].ref_count_down()
             with self._entries_lock:
                 entry["metadata"].unpin()
 
@@ -935,6 +1265,16 @@ class CascadeKVBackend(AllocatorBackendInterface):
                 ring_completion = pump.get_completion()
                 storage_seconds += time.perf_counter() - storage_start
                 if ring_completion.error is not None:
+                    entry = ring_completion.item
+                    if entry is not None and not ring_completion.safe_to_reuse:
+                        entry["cuda_quarantined"] = True
+                        request_id = pump.unsafe_request_id(entry)
+                        assert request_id is not None
+                        self._quarantine_xds_object(
+                            request_id,
+                            entry["memory_obj"],
+                            ring_completion.error,
+                        )
                     raise ring_completion.error
                 entry = ring_completion.item
                 live_entries.pop(id(entry))
@@ -945,15 +1285,34 @@ class CascadeKVBackend(AllocatorBackendInterface):
                         and int(completion.completed_bytes) == entry["size"]
                     ):
                         gpu_start = time.perf_counter()
-                        gpu_connector.to_gpu(
-                            entry["memory_obj"],
-                            entry["start"],
-                            entry["end"],
-                            **kwargs,
-                        )
-                        event = gpu_connector.record_transfer_event("load")
-                        wait_start = time.perf_counter()
-                        event.synchronize()
+                        load_started = True
+                        load_event = None
+                        try:
+                            gpu_connector.to_gpu(
+                                entry["memory_obj"],
+                                entry["start"],
+                                entry["end"],
+                                **kwargs,
+                            )
+                            load_event = gpu_connector.record_transfer_event("load")
+                            wait_start = time.perf_counter()
+                            load_event.synchronize()
+                        except BaseException as transfer_error:
+                            if load_started:
+                                try:
+                                    self._ensure_cuda_transfer_complete(
+                                        gpu_connector,
+                                        "load",
+                                        load_event,
+                                    )
+                                except BaseException as recovery_error:
+                                    entry["cuda_quarantined"] = True
+                                    self._quarantine_cuda_objects(
+                                        [entry["memory_obj"]],
+                                        recovery_error,
+                                    )
+                                    raise recovery_error from transfer_error
+                            raise
                         slot_wait_seconds += time.perf_counter() - wait_start
                         gpu_seconds += time.perf_counter() - gpu_start
                         completed[entry["index"]] = True
@@ -967,6 +1326,28 @@ class CascadeKVBackend(AllocatorBackendInterface):
             if not input_closed:
                 pump.close_input()
             pump_thread.join(timeout=DEFAULT_IO_TIMEOUT_SECS)
+            if pump_thread.is_alive():
+                timeout_error = TimeoutError("timed out stopping CascadeKV read ring")
+                for entry in live_entries.values():
+                    entry["cuda_quarantined"] = True
+                    self._quarantine_cuda_objects(
+                        [entry["memory_obj"]],
+                        timeout_error,
+                    )
+            else:
+                for entry in live_entries.values():
+                    if not entry.get("cuda_quarantined", False) and not (
+                        pump.is_safe_to_reuse(entry)
+                    ):
+                        entry["cuda_quarantined"] = True
+                        assert pump.error is not None
+                        request_id = pump.unsafe_request_id(entry)
+                        assert request_id is not None
+                        self._quarantine_xds_object(
+                            request_id,
+                            entry["memory_obj"],
+                            pump.error,
+                        )
             for entry in live_entries.values():
                 release_entry(entry)
             for info in task_infos[next_task:]:
@@ -994,12 +1375,39 @@ class CascadeKVBackend(AllocatorBackendInterface):
             ),
         )
 
+    @_guard_operation
     def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         with self._put_tasks_lock:
             pending_obj = self._pending_objects.get(key)
             if pending_obj is not None:
                 pending_obj.ref_count_up()
+                transfer_event = self._pending_transfer_events.get(key)
+            else:
+                transfer_event = None
+        if pending_obj is not None:
+            try:
+                if transfer_event is not None:
+                    try:
+                        transfer_event.synchronize()
+                    except BaseException as transfer_error:
+                        try:
+                            self._ensure_cuda_transfer_complete(
+                                None,
+                                "store",
+                                transfer_event,
+                            )
+                        except BaseException as recovery_error:
+                            self._quarantine_cuda_objects(
+                                [pending_obj],
+                                recovery_error,
+                            )
+                            raise recovery_error from transfer_error
+                        raise
                 return pending_obj
+            except BaseException:
+                if not any(item is pending_obj for item in self._quarantined_objects):
+                    pending_obj.ref_count_down()
+                raise
 
         with self._entries_lock:
             blob_metadata = self._entries.get(key)
@@ -1010,7 +1418,12 @@ class CascadeKVBackend(AllocatorBackendInterface):
 
         memory_obj: Optional[MemoryObj] = None
         try:
-            memory_obj = self.read_memory_allocator.allocate(
+            read_allocator = getattr(
+                self,
+                "read_memory_allocator",
+                self.memory_allocator,
+            )
+            memory_obj = read_allocator.allocate(
                 blob_metadata.shapes,
                 blob_metadata.dtypes,
                 blob_metadata.fmt,
@@ -1043,6 +1456,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
             with self._entries_lock:
                 blob_metadata.unpin()
 
+    @_guard_operation
     def get_non_blocking(
         self,
         key: CacheEngineKey,
@@ -1056,6 +1470,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
             future.set_exception(exc)
         return future
 
+    @_guard_async_operation
     async def batched_async_contains(
         self,
         lookup_id: str,
@@ -1065,6 +1480,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
         del lookup_id
         return self.batched_contains(keys, pin)
 
+    @_guard_async_operation
     async def batched_get_non_blocking(
         self,
         lookup_id: str,
@@ -1080,22 +1496,139 @@ class CascadeKVBackend(AllocatorBackendInterface):
             results.append(memory_obj)
         return results
 
+    @_guard_operation
     def batched_get_blocking(
         self,
         keys: list[CacheEngineKey],
     ) -> list[Optional[MemoryObj]]:
-        return [self.get_blocking(key) for key in keys]
+        if not hasattr(self, "read_memory_allocator"):
+            return [self.get_blocking(key) for key in keys]
+        with self._put_tasks_lock:
+            if any(key in self._pending_objects for key in keys):
+                return [self.get_blocking(key) for key in keys]
 
+        results: list[Optional[MemoryObj]] = [None] * len(keys)
+        items: list[dict[str, Any]] = []
+        try:
+            for index, key in enumerate(keys):
+                with self._entries_lock:
+                    metadata = self._entries.get(key)
+                    if metadata is None:
+                        continue
+                    metadata.pin()
+                    self._entries.move_to_end(key)
+                memory_obj = self.read_memory_allocator.allocate(
+                    metadata.shapes,
+                    metadata.dtypes,
+                    metadata.fmt,
+                )
+                if memory_obj is None:
+                    with self._entries_lock:
+                        metadata.unpin()
+                    continue
+                try:
+                    offset, size = self._buffer_descriptor(memory_obj)
+                    if size != metadata.size:
+                        raise RuntimeError(
+                            "CascadeKV allocation size does not match stored blob: "
+                            f"allocated={size}, stored={metadata.size}"
+                        )
+                    items.append(
+                        {
+                            "index": index,
+                            "metadata": metadata,
+                            "memory_obj": memory_obj,
+                            "offset": offset,
+                            "size": size,
+                        }
+                    )
+                except BaseException:
+                    memory_obj.ref_count_down()
+                    with self._entries_lock:
+                        metadata.unpin()
+                    raise
+
+            pump = XDSReadRingPump(
+                queue_depth=int(self.config.cascadekv_io_queue_depth),
+                submit=lambda item: int(
+                    self.client.submit_read(
+                        item["metadata"].blob_handle,
+                        self.staging_buffer_ref,
+                        item["offset"],
+                        0,
+                        item["size"],
+                    )
+                ),
+                wait_any=self.client.wait_any_result,
+                timeout=DEFAULT_IO_TIMEOUT_SECS,
+            )
+            for item in items:
+                pump.put(item)
+            pump.close_input()
+            with self._io_lock:
+                pump.run()
+
+            first_error: Optional[BaseException] = None
+            for _ in items:
+                ring_completion = pump.get_completion()
+                item = ring_completion.item
+                if ring_completion.error is not None:
+                    if first_error is None:
+                        first_error = ring_completion.error
+                    if not ring_completion.safe_to_reuse:
+                        item["cuda_quarantined"] = True
+                        request_id = pump.unsafe_request_id(item)
+                        assert request_id is not None
+                        self._quarantine_xds_object(
+                            request_id,
+                            item["memory_obj"],
+                            ring_completion.error,
+                        )
+                else:
+                    try:
+                        self._validate_io_result(
+                            ring_completion.completion,
+                            item["size"],
+                            "read",
+                        )
+                        results[item["index"]] = item["memory_obj"]
+                    except BaseException as error:
+                        if first_error is None:
+                            first_error = error
+                if results[item["index"]] is None and not item.get(
+                    "cuda_quarantined", False
+                ):
+                    item["memory_obj"].ref_count_down()
+                with self._entries_lock:
+                    item["metadata"].unpin()
+            items.clear()
+            if first_error is not None:
+                for memory_obj in results:
+                    if memory_obj is not None:
+                        memory_obj.ref_count_down()
+                raise first_error
+            return results
+        except BaseException:
+            for item in items:
+                if not item.get("cuda_quarantined", False):
+                    item["memory_obj"].ref_count_down()
+                with self._entries_lock:
+                    item["metadata"].unpin()
+            raise
+
+    @_guard_operation
     def pin(self, key: CacheEngineKey) -> bool:
         with self._entries_lock:
             metadata = self._entries.get(key)
             return metadata.pin() if metadata is not None else False
 
+    @_guard_operation
     def unpin(self, key: CacheEngineKey) -> bool:
         with self._entries_lock:
             metadata = self._entries.get(key)
             return metadata.unpin() if metadata is not None else False
 
+    @_guard_operation
     def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
         with self._entries_lock:
             metadata = self._entries.get(key)
@@ -1107,6 +1640,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
         self.client.release_blob(metadata.blob_handle)
         return True
 
+    @_guard_operation
     def touch_cache(self) -> None:
         with self._entries_lock:
             for key in reversed(self._keys_in_request):
@@ -1115,48 +1649,88 @@ class CascadeKVBackend(AllocatorBackendInterface):
             self._keys_in_request.clear()
 
     def close(self) -> None:
-        if self._closed:
-            return
+        with self._lifecycle_condition:
+            while self._closing and not self._closed:
+                self._lifecycle_condition.wait()
+            if self._closed:
+                return
+            self._closing = True
+            self._teardown_started = True
+            while self._active_operations:
+                self._lifecycle_condition.wait()
+
         scheduler_error: Optional[BaseException] = None
-        if self._write_scheduler is not None:
-            try:
-                self._write_scheduler.close(timeout=DEFAULT_IO_TIMEOUT_SECS)
-            except TimeoutError:
-                raise
-            except BaseException as error:
-                scheduler_error = error
-        active_allocations = (
-            self.read_memory_allocator.num_active_allocations
-            + self.write_memory_allocator.num_active_allocations
-        )
-        if active_allocations:
-            raise RuntimeError(
-                "cannot close CascadeKVBackend with active staging allocations: "
-                f"{active_allocations}"
+        try:
+            if self._write_scheduler is not None:
+                try:
+                    self._write_scheduler.close(timeout=DEFAULT_IO_TIMEOUT_SECS)
+                except TimeoutError:
+                    raise
+                except BaseException as error:
+                    scheduler_error = error
+
+            active_allocations = (
+                self.read_memory_allocator.num_active_allocations
+                + self.write_memory_allocator.num_active_allocations
             )
-        with self._entries_lock:
-            blob_handles = [metadata.blob_handle for metadata in self._entries.values()]
-            self._entries.clear()
-        for blob_handle in blob_handles:
-            self.client.release_blob(blob_handle)
-        self.read_memory_allocator.close()
-        self.write_memory_allocator.close()
-        if self._host_registered:
-            unregister_status = int(
-                self._cudart.cudaHostUnregister(self.staging_base_ptr)
-            )
-            if unregister_status != 0:
-                error_string = self._cudart.cudaGetErrorString(unregister_status)
+            if active_allocations:
                 raise RuntimeError(
-                    "CascadeKV cudaHostUnregister failed: "
-                    f"status={unregister_status}, error={error_string}"
+                    "cannot close CascadeKVBackend with active staging allocations: "
+                    f"{active_allocations}"
                 )
-            self._host_registered = False
-        self.client.free_buffer(self.staging_buffer_ref)
-        client_close = getattr(self.client, "close", None)
-        if callable(client_close):
-            client_close()
-        self._closed = True
+
+            first_release_error: Optional[BaseException] = None
+            with self._entries_lock:
+                entries = tuple(self._entries.items())
+            for key, metadata in entries:
+                try:
+                    self.client.release_blob(metadata.blob_handle)
+                except BaseException as error:
+                    if first_release_error is None:
+                        first_release_error = error
+                    continue
+                with self._entries_lock:
+                    current = self._entries.get(key)
+                    if current is metadata:
+                        self._entries.pop(key)
+            if first_release_error is not None:
+                raise first_release_error
+
+            if not self._read_allocator_closed:
+                self.read_memory_allocator.close()
+                self._read_allocator_closed = True
+            if not self._write_allocator_closed:
+                self.write_memory_allocator.close()
+                self._write_allocator_closed = True
+            if self._host_registered:
+                unregister_status = int(
+                    self._cudart.cudaHostUnregister(self.staging_base_ptr)
+                )
+                if unregister_status != 0:
+                    error_string = self._cudart.cudaGetErrorString(unregister_status)
+                    raise RuntimeError(
+                        "CascadeKV cudaHostUnregister failed: "
+                        f"status={unregister_status}, error={error_string}"
+                    )
+                self._host_registered = False
+            if not self._buffer_freed:
+                assert self.staging_buffer_ref is not None
+                self.client.free_buffer(self.staging_buffer_ref)
+                self._buffer_freed = True
+            client_close = getattr(self.client, "close", None)
+            if callable(client_close) and not self._client_closed:
+                client_close()
+                self._client_closed = True
+        except BaseException:
+            with self._lifecycle_condition:
+                self._closing = False
+                self._lifecycle_condition.notify_all()
+            raise
+
+        with self._lifecycle_condition:
+            self._closed = True
+            self._closing = False
+            self._lifecycle_condition.notify_all()
         if scheduler_error is not None:
             logger.warning(
                 "CascadeKV async write scheduler closed after an I/O error: %s",

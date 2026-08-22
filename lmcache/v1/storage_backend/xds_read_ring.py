@@ -13,6 +13,7 @@ class ReadRingCompletion:
     item: Any
     completion: Optional[Any] = None
     error: Optional[BaseException] = None
+    safe_to_reuse: bool = True
 
 
 class XDSReadRingPump:
@@ -39,6 +40,8 @@ class XDSReadRingPump:
         self._input_closed = False
         self._failed = threading.Event()
         self._terminal_error: Optional[BaseException] = None
+        self._unsafe_item_ids: set[int] = set()
+        self._unsafe_request_ids: dict[int, int] = {}
 
     def put(self, item: Any) -> None:
         with self._state_lock:
@@ -62,11 +65,21 @@ class XDSReadRingPump:
     def error(self) -> Optional[BaseException]:
         return self._terminal_error
 
+    def is_safe_to_reuse(self, item: Any) -> bool:
+        """Return whether xDS can no longer DMA into the item's buffer."""
+        with self._state_lock:
+            return id(item) not in self._unsafe_item_ids
+
+    def unsafe_request_id(self, item: Any) -> Optional[int]:
+        """Return the still-owned xDS request ID for an unsafe item."""
+        with self._state_lock:
+            return self._unsafe_request_ids.get(id(item))
+
     def run(self) -> None:
         pending: dict[int, Any] = {}
         input_drained = False
         first_error: Optional[BaseException] = None
-        failed_items: list[Any] = []
+        failed_items: list[tuple[Any, bool]] = []
 
         while True:
             if first_error is None and not input_drained:
@@ -82,14 +95,23 @@ class XDSReadRingPump:
                         request_id = int(self._submit(item))
                     except BaseException as error:
                         first_error = error
-                        failed_items.append(item)
+                        failed_items.append((item, True))
                         self._failed.set()
                         break
                     if request_id in pending:
+                        existing_item = pending.pop(request_id)
                         first_error = RuntimeError(
                             f"xDS reused pending request ID {request_id}"
                         )
-                        failed_items.append(item)
+                        failed_items.extend(((existing_item, False), (item, False)))
+                        with self._state_lock:
+                            self._unsafe_item_ids.update((id(existing_item), id(item)))
+                            self._unsafe_request_ids.update(
+                                {
+                                    id(existing_item): request_id,
+                                    id(item): request_id,
+                                }
+                            )
                         self._failed.set()
                         break
                     pending[request_id] = item
@@ -101,7 +123,16 @@ class XDSReadRingPump:
                     if first_error is None:
                         first_error = error
                         self._failed.set()
-                    failed_items.extend(pending.values())
+                    unsafe_items = tuple(pending.values())
+                    failed_items.extend((item, False) for item in unsafe_items)
+                    with self._state_lock:
+                        self._unsafe_item_ids.update(id(item) for item in unsafe_items)
+                        self._unsafe_request_ids.update(
+                            {
+                                id(item): request_id
+                                for request_id, item in pending.items()
+                            }
+                        )
                     pending.clear()
                     continue
                 item = pending.pop(int(completion.request_id), None)
@@ -125,16 +156,20 @@ class XDSReadRingPump:
                     except queue.Empty:
                         break
                     if item is not self._SENTINEL:
-                        failed_items.append(item)
+                        failed_items.append((item, True))
                 self._terminal_error = first_error
                 if not failed_items:
                     self._completions.put(
                         ReadRingCompletion(item=None, error=first_error)
                     )
                 else:
-                    for item in failed_items:
+                    for item, safe_to_reuse in failed_items:
                         self._completions.put(
-                            ReadRingCompletion(item=item, error=first_error)
+                            ReadRingCompletion(
+                                item=item,
+                                error=first_error,
+                                safe_to_reuse=safe_to_reuse,
+                            )
                         )
                 return
             if input_drained:
