@@ -25,7 +25,7 @@ for output in "$disk" "$cascade"; do
   [[ "$output" != *"--enable-prefix-caching"* ]]
 done
 
-rg -q '^cascadekv_slot_count: 160$' "$CASCADE_CONFIG"
+rg -q '^cascadekv_slot_count: 320$' "$CASCADE_CONFIG"
 
 if BACKEND=unknown BENCHMARK_LOG=/tmp/unknown.log BENCHMARK_DRY_RUN=1 \
   bash "$RUNNER" >/dev/null 2>&1; then
