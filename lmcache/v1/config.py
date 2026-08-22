@@ -114,6 +114,36 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": _to_bool,
     },
     "cascadekv_slot_count": {"type": int, "default": 8, "env_converter": int},
+    "cascadekv_overlap": {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+    },
+    "cascadekv_async_write": {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+    },
+    "cascadekv_read_slot_count": {
+        "type": int,
+        "default": 8,
+        "env_converter": int,
+    },
+    "cascadekv_write_slot_count": {
+        "type": int,
+        "default": 64,
+        "env_converter": int,
+    },
+    "cascadekv_io_queue_depth": {
+        "type": int,
+        "default": 4,
+        "env_converter": int,
+    },
+    "cascadekv_write_window_size": {
+        "type": int,
+        "default": 64,
+        "env_converter": int,
+    },
     # Feature toggles
     "use_layerwise": {
         "type": bool,
@@ -656,11 +686,26 @@ def _validate_config(self):
             if value <= 0:
                 raise ValueError(f"{field_name} must be positive, got {value}")
 
-    if self.cascadekv_backend and self.cascadekv_slot_count <= 0:
-        raise ValueError(
-            "cascadekv_slot_count must be positive, "
-            f"got {self.cascadekv_slot_count}"
+    if self.cascadekv_backend:
+        positive_cascade_fields = (
+            "cascadekv_slot_count",
+            "cascadekv_read_slot_count",
+            "cascadekv_write_slot_count",
+            "cascadekv_io_queue_depth",
+            "cascadekv_write_window_size",
         )
+        for field_name in positive_cascade_fields:
+            value = getattr(self, field_name)
+            if value <= 0:
+                raise ValueError(f"{field_name} must be positive, got {value}")
+        if self.cascadekv_io_queue_depth > min(
+            self.cascadekv_read_slot_count,
+            self.cascadekv_write_slot_count,
+        ):
+            raise ValueError(
+                "cascadekv_io_queue_depth cannot exceed the read or write "
+                "slot count"
+            )
     return self
 
 

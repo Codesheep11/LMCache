@@ -750,6 +750,38 @@ def test_update_config_from_env_calls_validate():
             },
             "cascadekv_slot_count",
         ),
+        (
+            {
+                "xds_service_name": "xds0",
+                "cascadekv_backend": True,
+                "cascadekv_read_slot_count": 0,
+            },
+            "cascadekv_read_slot_count",
+        ),
+        (
+            {
+                "xds_service_name": "xds0",
+                "cascadekv_backend": True,
+                "cascadekv_write_slot_count": 0,
+            },
+            "cascadekv_write_slot_count",
+        ),
+        (
+            {
+                "xds_service_name": "xds0",
+                "cascadekv_backend": True,
+                "cascadekv_io_queue_depth": 0,
+            },
+            "cascadekv_io_queue_depth",
+        ),
+        (
+            {
+                "xds_service_name": "xds0",
+                "cascadekv_backend": True,
+                "cascadekv_write_window_size": 0,
+            },
+            "cascadekv_write_window_size",
+        ),
     ],
 )
 def test_xds_backend_config_rejects_invalid_combinations(overrides, message):
@@ -775,6 +807,13 @@ def test_xds_backend_config_accepts_each_service_path(monkeypatch):
     cascade.local_cpu = False
     cascade.max_local_cpu_size = 0
     cascade.validate()
+
+    assert cascade.cascadekv_overlap is True
+    assert cascade.cascadekv_async_write is True
+    assert cascade.cascadekv_read_slot_count == 8
+    assert cascade.cascadekv_write_slot_count == 64
+    assert cascade.cascadekv_io_queue_depth == 4
+    assert cascade.cascadekv_write_window_size == 64
 
     monkeypatch.setenv("LMCACHE_CASCADEKV_BACKEND", "true")
     monkeypatch.setenv("LMCACHE_XDS_SERVICE_NAME", "xds-env")

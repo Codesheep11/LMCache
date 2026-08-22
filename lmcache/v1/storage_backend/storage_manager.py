@@ -452,14 +452,14 @@ class StorageManager:
         """Let one selected backend stream KV chunks directly from GPU.
 
         The optional fast path is accepted only when backend filtering resolves
-        to the direct ``XDSBackend`` alone. Returning ``None`` means the caller
+        to one supported streaming backend. Returning ``None`` means the caller
         must preserve LMCache's regular allocate-and-put behavior.
         """
         active_backends = list(self.get_active_storage_backends(location=location))
         if len(active_backends) != 1:
             return None
         backend_name, backend = active_backends[0]
-        if backend_name != "XDSBackend":
+        if backend_name not in {"XDSBackend", "CascadeKVBackend"}:
             return None
         method = getattr(backend, "batched_put_from_gpu_blocking", None)
         if method is None:
@@ -570,7 +570,7 @@ class StorageManager:
         if len(active_backends) != 1:
             return None
         backend_name, backend = active_backends[0]
-        if backend_name != "XDSBackend":
+        if backend_name not in {"XDSBackend", "CascadeKVBackend"}:
             return None
         method = getattr(backend, "batched_get_to_gpu_blocking", None)
         if method is None:

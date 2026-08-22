@@ -58,6 +58,21 @@ def test_storage_manager_dispatches_xds_only_streaming_store():
     assert len(backend.put_calls) == 1
 
 
+def test_storage_manager_dispatches_cascadekv_only_streaming_store():
+    backend = FakeDirectBackend()
+    manager = make_storage_manager([("CascadeKVBackend", backend)])
+
+    result = manager.batched_put_from_gpu(
+        keys=["key"],
+        starts=[0],
+        ends=[256],
+        gpu_connector=SimpleNamespace(),
+    )
+
+    assert result == "put-result"
+    assert len(backend.put_calls) == 1
+
+
 def test_storage_manager_declines_streaming_store_with_multiple_backends():
     backend = FakeDirectBackend()
     manager = make_storage_manager(
@@ -87,6 +102,24 @@ def test_storage_manager_dispatches_requested_xds_streaming_retrieve():
         ends=[256],
         gpu_connector=SimpleNamespace(),
         location="XDSBackend",
+    )
+
+    assert result == "get-result"
+    assert len(backend.get_calls) == 1
+
+
+def test_storage_manager_dispatches_requested_cascadekv_streaming_retrieve():
+    backend = FakeDirectBackend()
+    manager = make_storage_manager(
+        [("LocalCPUBackend", object()), ("CascadeKVBackend", backend)]
+    )
+
+    result = manager.batched_get_to_gpu(
+        keys=["key"],
+        starts=[0],
+        ends=[256],
+        gpu_connector=SimpleNamespace(),
+        location="CascadeKVBackend",
     )
 
     assert result == "get-result"
