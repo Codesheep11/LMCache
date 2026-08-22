@@ -30,6 +30,23 @@ logger = init_logger(__name__)
 
 DEFAULT_BLOB_TIMEOUT_SECS = 5.0
 DEFAULT_IO_TIMEOUT_SECS = 30.0
+LEGACY_CASCADEKV_SLOT_COUNT_DEFAULT = 8
+CASCADEKV_READ_SLOT_COUNT_DEFAULT = 8
+CASCADEKV_WRITE_SLOT_COUNT_DEFAULT = 64
+
+
+def _resolve_slot_counts(config: LMCacheEngineConfig) -> tuple[int, int]:
+    """Resolve new read/write banks with compatibility for old slot configs."""
+    read_slots = int(config.cascadekv_read_slot_count)
+    write_slots = int(config.cascadekv_write_slot_count)
+    legacy_slots = int(config.cascadekv_slot_count)
+    if (
+        legacy_slots != LEGACY_CASCADEKV_SLOT_COUNT_DEFAULT
+        and read_slots == CASCADEKV_READ_SLOT_COUNT_DEFAULT
+        and write_slots == CASCADEKV_WRITE_SLOT_COUNT_DEFAULT
+    ):
+        return legacy_slots, legacy_slots
+    return read_slots, write_slots
 
 
 class CascadeKVBackend(AllocatorBackendInterface):
@@ -62,7 +79,10 @@ class CascadeKVBackend(AllocatorBackendInterface):
             int(service_metadata.blob_size_bytes),
             self.io_unit_size,
         )
-        self.staging_size = config.cascadekv_slot_count * self.blob_size
+        self.read_slot_count, self.write_slot_count = _resolve_slot_counts(config)
+        self.read_staging_size = self.read_slot_count * self.blob_size
+        self.write_staging_size = self.write_slot_count * self.blob_size
+        self.staging_size = self.read_staging_size + self.write_staging_size
         self.staging_view, self.staging_buffer_ref = xds_client.alloc_buffer(
             self.staging_size
         )
@@ -77,6 +97,35 @@ class CascadeKVBackend(AllocatorBackendInterface):
                 f"{self.staging_tensor.numel()} != {self.staging_size}"
             )
         self.staging_base_ptr = self.staging_tensor.data_ptr()
+        self._cudart = torch.cuda.cudart()
+        register_status = int(
+            self._cudart.cudaHostRegister(
+                self.staging_base_ptr,
+                self.staging_size,
+                0,
+            )
+        )
+        if register_status != 0:
+            xds_client.free_buffer(self.staging_buffer_ref)
+            error_string = self._cudart.cudaGetErrorString(register_status)
+            raise RuntimeError(
+                "CascadeKV cudaHostRegister failed: "
+                f"status={register_status}, error={error_string}"
+            )
+        self._host_registered = True
+
+        self.read_staging_tensor = self.staging_tensor[: self.read_staging_size]
+        self.write_staging_tensor = self.staging_tensor[self.read_staging_size :]
+        self.read_staging_base_ptr = self.read_staging_tensor.data_ptr()
+        self.write_staging_base_ptr = self.write_staging_tensor.data_ptr()
+        self.read_memory_allocator = TensorMemoryAllocator(
+            self.read_staging_tensor,
+            align_bytes=self.io_unit_size,
+        )
+        self.write_memory_allocator = TensorMemoryAllocator(
+            self.write_staging_tensor,
+            align_bytes=self.io_unit_size,
+        )
         self.memory_allocator = self.initialize_allocator(config, metadata)
 
     def __str__(self) -> str:
@@ -88,10 +137,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
         metadata: LMCacheMetadata,
     ) -> TensorMemoryAllocator:
         del config, metadata
-        return TensorMemoryAllocator(
-            self.staging_tensor,
-            align_bytes=self.io_unit_size,
-        )
+        return self.write_memory_allocator
 
     def get_allocator_backend(self) -> "CascadeKVBackend":
         return self
@@ -128,7 +174,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
         )
 
     def calculate_chunk_budget(self) -> int:
-        return self.config.cascadekv_slot_count
+        return self.write_slot_count
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self._put_tasks_lock:
@@ -297,7 +343,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
 
         memory_obj: Optional[MemoryObj] = None
         try:
-            memory_obj = self.allocate(
+            memory_obj = self.read_memory_allocator.allocate(
                 blob_metadata.shapes,
                 blob_metadata.dtypes,
                 blob_metadata.fmt,
@@ -404,7 +450,10 @@ class CascadeKVBackend(AllocatorBackendInterface):
     def close(self) -> None:
         if self._closed:
             return
-        active_allocations = self.memory_allocator.num_active_allocations
+        active_allocations = (
+            self.read_memory_allocator.num_active_allocations
+            + self.write_memory_allocator.num_active_allocations
+        )
         if active_allocations:
             raise RuntimeError(
                 "cannot close CascadeKVBackend with active staging allocations: "
@@ -415,7 +464,19 @@ class CascadeKVBackend(AllocatorBackendInterface):
             self._entries.clear()
         for blob_handle in blob_handles:
             self.client.release_blob(blob_handle)
-        self.memory_allocator.close()
+        self.read_memory_allocator.close()
+        self.write_memory_allocator.close()
+        if self._host_registered:
+            unregister_status = int(
+                self._cudart.cudaHostUnregister(self.staging_base_ptr)
+            )
+            if unregister_status != 0:
+                error_string = self._cudart.cudaGetErrorString(unregister_status)
+                raise RuntimeError(
+                    "CascadeKV cudaHostUnregister failed: "
+                    f"status={unregister_status}, error={error_string}"
+                )
+            self._host_registered = False
         self.client.free_buffer(self.staging_buffer_ref)
         client_close = getattr(self.client, "close", None)
         if callable(client_close):
