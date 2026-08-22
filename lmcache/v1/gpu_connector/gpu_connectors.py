@@ -136,6 +136,29 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
             # permute_kv_caches_to_contiguous is a no-op when already contiguous.
             self.kvcaches = permute_kv_caches_to_contiguous(self.kvcaches)
 
+    def record_transfer_event(self, direction: str) -> torch.cuda.Event:
+        """Record completion of the connector's current load or store work.
+
+        Args:
+            direction: ``"load"`` for staging-to-KV work on the current stream,
+                or ``"store"`` for KV-to-staging work on ``store_stream``.
+
+        Returns:
+            A CUDA event recorded after the selected transfer stream's work.
+
+        Raises:
+            ValueError: If ``direction`` is not ``"load"`` or ``"store"``.
+        """
+        if direction == "load":
+            stream = torch.cuda.current_stream()
+        elif direction == "store":
+            stream = self.store_stream
+        else:
+            raise ValueError(f"unknown transfer direction: {direction}")
+        event = torch.cuda.Event()
+        event.record(stream)
+        return event
+
 
 class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
     """
@@ -1430,6 +1453,7 @@ class SGLangGPUConnector(GPUConnectorInterface):
         self.kv_cache_pointers = torch.empty(
             self.num_kv_cache, dtype=torch.int64, device="cpu"
         )
+        self.store_stream = torch.cuda.Stream()
 
         if use_gpu:
             assert "chunk_size" in kwargs, (
