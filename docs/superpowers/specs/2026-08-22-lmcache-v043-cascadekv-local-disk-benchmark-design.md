@@ -10,7 +10,7 @@
 
 - Conda 环境：`xds043`
 - LMCache 源码：`/home/yangxc/workspace/LMCache-v043-xds`
-- vLLM 源码：`/home/yangxc/workspace/vllm`
+- vLLM 源码：`/home/yangxc/workspace/vllm-v0180`（`v0.18.0-xds`）
 - 模型：`/mnt/adminserver-nfsrdma/Model/Qwen3-30B-A3B`
 - GPU：4、5、6、7，tensor parallel size 为 4
 - SSD：两个后端均使用 `0000:aa:00.0`、`0000:d3:00.0`、
