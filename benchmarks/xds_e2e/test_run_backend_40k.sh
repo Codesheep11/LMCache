@@ -20,6 +20,7 @@ for output in "$disk" "$cascade"; do
   [[ "$output" == *"--repeat-count 20"* ]]
   [[ "$output" == *"--output-len 1"* ]]
   [[ "$output" == *"--tensor-parallel-size 4"* ]]
+  [[ "$output" == *"--no-enable-prefix-caching"* ]]
   [[ "$output" != *"--enable-prefix-caching"* ]]
 done
 

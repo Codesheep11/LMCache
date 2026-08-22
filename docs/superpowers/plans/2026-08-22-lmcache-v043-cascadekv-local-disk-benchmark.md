@@ -105,6 +105,7 @@ Build an array command around `/home/yangxc/workspace/vllm-v0180/benchmarks/benc
 --repeat-count 20
 --output-len 1
 --max-num-seqs 1
+--no-enable-prefix-caching
 --gpu-memory-utilization 0.85
 --seed 0
 ```
