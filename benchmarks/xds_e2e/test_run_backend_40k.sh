@@ -25,7 +25,15 @@ for output in "$disk" "$cascade"; do
   [[ "$output" != *"--enable-prefix-caching"* ]]
 done
 
-rg -q '^cascadekv_slot_count: 320$' "$CASCADE_CONFIG"
+rg -q '^max_local_cpu_size: 2$' "$CASCADE_CONFIG"
+rg -q '^xds_max_size: 500$' "$CASCADE_CONFIG"
+rg -q '^xds_enable_chunked_overlap: true$' "$CASCADE_CONFIG"
+rg -q '^xds_chunked_size_kb: 4096$' "$CASCADE_CONFIG"
+rg -q '^xds_write_window_size: 64$' "$CASCADE_CONFIG"
+if rg -q '^cascadekv_(slot|read_slot|write_slot|io_queue)' "$CASCADE_CONFIG"; then
+  echo "deprecated CascadeKV slot settings are still present" >&2
+  exit 1
+fi
 
 if BACKEND=unknown BENCHMARK_LOG=/tmp/unknown.log BENCHMARK_DRY_RUN=1 \
   bash "$RUNNER" >/dev/null 2>&1; then
