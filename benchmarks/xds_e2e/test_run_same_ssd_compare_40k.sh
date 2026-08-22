@@ -34,6 +34,13 @@ service_tail=${xds_tail#*"$service_marker"}
 [[ "$output" == *'0000:ec:00.0'* ]]
 [[ "$output" == *'0000:ed:00.0'* ]]
 
+cascade_only=$(RUN_MODE=cascadekv BENCHMARK_DRY_RUN=1 \
+  RESULT_DIR=/tmp/lmcache-v043-same-ssd-dry-run bash "$RUNNER")
+[[ "$cascade_only" != *"$filesystem_marker"* ]]
+[[ "$cascade_only" != *"$disk_marker"* ]]
+[[ "$cascade_only" == *"$service_marker"* ]]
+[[ "$cascade_only" == *"$cascade_marker"* ]]
+
 if rg -q 'lmcache\.__version__' "$RUNNER"; then
   echo 'manifest must not require lmcache.__version__' >&2
   exit 1

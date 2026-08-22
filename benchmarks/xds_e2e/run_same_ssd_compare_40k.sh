@@ -15,18 +15,29 @@ CONFIRM_TOKEN=ERASE-aa-d3-ec-ed
 BDFS=(0000:aa:00.0 0000:d3:00.0 0000:ec:00.0 0000:ed:00.0)
 RESULT_DIR=${RESULT_DIR:-$ROOT/test/results/lmcache-v043-cascadekv-disk-40k-$(date -u +%Y%m%dT%H%M%SZ)}
 BENCHMARK_DRY_RUN=${BENCHMARK_DRY_RUN:-0}
+RUN_MODE=${RUN_MODE:-all}
 SERVICE_PID=
 HUGEPAGES_REMOUNTED=0
 
 dry_run() {
   printf 'approved SSDs: %s\n' "${BDFS[*]}"
-  printf '%s filesystem --yes --confirm %s\n' "$SWITCH" "$CONFIRM_TOKEN"
-  printf 'BACKEND=disk BENCHMARK_LOG=%s/disk.log %s\n' "$RESULT_DIR" "$RUNNER"
-  printf '%s xds --yes --confirm %s\n' "$SWITCH" "$CONFIRM_TOKEN"
+  if [[ "$RUN_MODE" == all ]]; then
+    printf '%s filesystem --yes --confirm %s\n' "$SWITCH" "$CONFIRM_TOKEN"
+    printf 'BACKEND=disk BENCHMARK_LOG=%s/disk.log %s\n' "$RESULT_DIR" "$RUNNER"
+    printf '%s xds --yes --confirm %s\n' "$SWITCH" "$CONFIRM_TOKEN"
+  fi
   printf '%s --config %s --service-name xds0\n' "$SERVICE" "$SERVICE_CONFIG"
   printf 'BACKEND=cascadekv BENCHMARK_LOG=%s/cascadekv.log %s\n' \
     "$RESULT_DIR" "$RUNNER"
 }
+
+case "$RUN_MODE" in
+  all|cascadekv) ;;
+  *)
+    printf 'unsupported RUN_MODE=%s; expected all or cascadekv\n' "$RUN_MODE" >&2
+    exit 2
+    ;;
+esac
 
 if [[ "$BENCHMARK_DRY_RUN" == 1 ]]; then
   dry_run
@@ -143,17 +154,21 @@ main() {
   chmod 0755 "$RESULT_DIR"
   capture_manifest
 
-  printf '[1/5] switching the four approved SSDs to mdadm/ext4\n'
-  bash "$SWITCH" filesystem --yes --confirm "$CONFIRM_TOKEN"
-  mkdir -p "$CACHE_DIR"
-  chmod 0755 "$CACHE_DIR"
+  if [[ "$RUN_MODE" == all ]]; then
+    printf '[1/5] switching the four approved SSDs to mdadm/ext4\n'
+    bash "$SWITCH" filesystem --yes --confirm "$CONFIRM_TOKEN"
+    mkdir -p "$CACHE_DIR"
+    chmod 0755 "$CACHE_DIR"
 
-  printf '[2/5] running buffered Local Disk with one 40K group\n'
-  BACKEND=disk BENCHMARK_LOG="$RESULT_DIR/disk.log" bash "$RUNNER"
-  sync
+    printf '[2/5] running buffered Local Disk with one 40K group\n'
+    BACKEND=disk BENCHMARK_LOG="$RESULT_DIR/disk.log" bash "$RUNNER"
+    sync
 
-  printf '[3/5] destroying mdadm/ext4 metadata and returning SSDs to xDS\n'
-  bash "$SWITCH" xds --yes --confirm "$CONFIRM_TOKEN"
+    printf '[3/5] destroying mdadm/ext4 metadata and returning SSDs to xDS\n'
+    bash "$SWITCH" xds --yes --confirm "$CONFIRM_TOKEN"
+  else
+    printf '[resume] preserving the completed Local Disk result\n'
+  fi
 
   local hugepage_options
   hugepage_options=$(findmnt -no OPTIONS /dev/hugepages)
