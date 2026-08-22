@@ -5,6 +5,7 @@
 from collections import OrderedDict
 from concurrent.futures import Future
 from typing import Any, Callable, Optional, Sequence
+import asyncio
 import threading
 import time
 
@@ -15,10 +16,14 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import MemoryObj, TensorMemoryAllocator
+from lmcache.v1.memory_management import (
+    MemoryAllocatorInterface,
+    MemoryFormat,
+    MemoryObj,
+    TensorMemoryAllocator,
+)
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
-from lmcache.v1.storage_backend.cascadekv_backend import CascadeKVBackend
 from lmcache.v1.storage_backend.transfer_result import (
     BackendTransferResult,
     BackendWriteSubmissionResult,
@@ -36,7 +41,7 @@ from lmcache.v1.xds_utils import XDSBlobMetadata, align_to_io_unit
 logger = init_logger(__name__)
 
 
-class XDSBackend(CascadeKVBackend):
+class XDSBackend(AllocatorBackendInterface):
     """Allocator/storage backend whose registered pool resides on the GPU."""
 
     def __init__(
@@ -124,6 +129,295 @@ class XDSBackend(CascadeKVBackend):
                 commit=self._commit_async_lease,
                 rollback=self._rollback_async_lease,
             )
+
+    def __str__(self) -> str:
+        return self.__class__.__name__
+
+    def initialize_allocator(
+        self,
+        config: LMCacheEngineConfig,
+        metadata: LMCacheMetadata,
+    ) -> TensorMemoryAllocator:
+        del config, metadata
+        return self.memory_allocator
+
+    def get_allocator_backend(self) -> "XDSBackend":
+        return self
+
+    def get_memory_allocator(self) -> MemoryAllocatorInterface:
+        return self.memory_allocator
+
+    def allocate(
+        self,
+        shapes: Any,
+        dtypes: Any,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        eviction: bool = True,
+        busy_loop: bool = True,
+    ) -> Optional[MemoryObj]:
+        del eviction, busy_loop
+        return self.memory_allocator.allocate(shapes, dtypes, fmt)
+
+    def batched_allocate(
+        self,
+        shapes: Any,
+        dtypes: Any,
+        batch_size: int,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        eviction: bool = True,
+        busy_loop: bool = True,
+    ) -> Optional[list[MemoryObj]]:
+        del eviction, busy_loop
+        return self.memory_allocator.batched_allocate(
+            shapes,
+            dtypes,
+            batch_size,
+            fmt,
+        )
+
+    def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
+        with self._put_tasks_lock:
+            if key in self._put_tasks:
+                return True
+        with self._entries_lock:
+            metadata = self._entries.get(key)
+            if metadata is None:
+                return False
+            if pin:
+                metadata.pin()
+                self._keys_in_request.append(key)
+            return True
+
+    def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
+        with self._put_tasks_lock:
+            return key in self._put_tasks
+
+    @staticmethod
+    def _validate_io_result(
+        completion: Any,
+        expected_bytes: int,
+        operation: str,
+    ) -> None:
+        if int(completion.status) != 0:
+            raise RuntimeError(
+                f"xDS {operation} failed with status={completion.status}, "
+                f"error_code={completion.error_code}"
+            )
+        if int(completion.completed_bytes) != expected_bytes:
+            raise RuntimeError(
+                f"short xDS {operation}: expected {expected_bytes} bytes, "
+                f"completed {completion.completed_bytes}"
+            )
+
+    def _wait_for_completion(
+        self,
+        request_id: int,
+        expected_bytes: int,
+        operation: str,
+    ) -> None:
+        completion = self.client.wait_any_result(timeout=30.0)
+        if int(completion.request_id) != request_id:
+            raise RuntimeError(
+                "unexpected xDS completion request id: "
+                f"expected={request_id}, got={completion.request_id}"
+            )
+        self._validate_io_result(completion, expected_bytes, operation)
+
+    def _write_one(self, key: CacheEngineKey, memory_obj: MemoryObj) -> bool:
+        with self._entries_lock:
+            if key in self._entries:
+                return False
+
+        blob_handle = int(self.client.get_blob(timeout=5.0))
+        if blob_handle <= 0:
+            raise RuntimeError(f"xDS returned an invalid blob handle {blob_handle}")
+        try:
+            buffer_offset, size = self._buffer_descriptor(memory_obj)
+            with self._io_lock:
+                request_id = int(
+                    self.client.submit_write(
+                        blob_handle,
+                        self.buffer_ref,
+                        buffer_offset,
+                        0,
+                        size,
+                    )
+                )
+                self._wait_for_completion(request_id, size, "write")
+            with self._entries_lock:
+                self._entries[key] = XDSBlobMetadata(
+                    blob_handle=blob_handle,
+                    size=size,
+                    shapes=memory_obj.get_shapes(),
+                    dtypes=memory_obj.get_dtypes(),
+                    fmt=memory_obj.get_memory_format(),
+                )
+            return True
+        except Exception:
+            self.client.release_blob(blob_handle)
+            raise
+
+    def _batched_submit_put_task_serial(
+        self,
+        keys: Sequence[CacheEngineKey],
+        objs: list[MemoryObj],
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
+    ) -> list[Future]:
+        if len(keys) != len(objs):
+            raise ValueError("keys and objs must have the same length")
+        futures: list[Future] = []
+        for key, memory_obj in zip(keys, objs, strict=True):
+            future: Future = Future()
+            futures.append(future)
+            with self._put_tasks_lock, self._entries_lock:
+                if key in self._put_tasks or key in self._entries:
+                    future.set_result(False)
+                    continue
+                self._put_tasks.add(key)
+            try:
+                stored = self._write_one(key, memory_obj)
+                if stored and on_complete_callback is not None:
+                    try:
+                        on_complete_callback(key)
+                    except Exception:
+                        logger.exception("xDS put completion callback failed")
+                future.set_result(stored)
+            except Exception as error:
+                future.set_exception(error)
+            finally:
+                with self._put_tasks_lock:
+                    self._put_tasks.discard(key)
+        return futures
+
+    async def async_batched_submit_put_task(
+        self,
+        keys: Sequence[CacheEngineKey],
+        objs: list[MemoryObj],
+        transfer_spec: Any = None,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
+    ) -> None:
+        futures = await asyncio.to_thread(
+            self.batched_submit_put_task,
+            keys,
+            objs,
+            transfer_spec,
+            on_complete_callback,
+        )
+        await asyncio.gather(*(asyncio.wrap_future(item) for item in futures or []))
+
+    def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
+        with self._put_tasks_lock:
+            pending_obj = self._pending_objects.get(key)
+            if pending_obj is not None:
+                pending_obj.ref_count_up()
+                return pending_obj
+
+        with self._entries_lock:
+            blob_metadata = self._entries.get(key)
+            if blob_metadata is None:
+                return None
+            blob_metadata.pin()
+            self._entries.move_to_end(key)
+
+        memory_obj: Optional[MemoryObj] = None
+        try:
+            memory_obj = self.allocate(
+                blob_metadata.shapes,
+                blob_metadata.dtypes,
+                blob_metadata.fmt,
+            )
+            if memory_obj is None:
+                return None
+            buffer_offset, size = self._buffer_descriptor(memory_obj)
+            if size != blob_metadata.size:
+                raise RuntimeError(
+                    "xDS allocation size does not match stored blob: "
+                    f"allocated={size}, stored={blob_metadata.size}"
+                )
+            with self._io_lock:
+                request_id = int(
+                    self.client.submit_read(
+                        blob_metadata.blob_handle,
+                        self.buffer_ref,
+                        buffer_offset,
+                        0,
+                        size,
+                    )
+                )
+                self._wait_for_completion(request_id, size, "read")
+            return memory_obj
+        except Exception:
+            if memory_obj is not None:
+                memory_obj.ref_count_down()
+            raise
+        finally:
+            with self._entries_lock:
+                blob_metadata.unpin()
+
+    def get_non_blocking(
+        self,
+        key: CacheEngineKey,
+        location: Optional[str] = None,
+    ) -> Optional[Future]:
+        del location
+        future: Future = Future()
+        try:
+            future.set_result(self.get_blocking(key))
+        except Exception as error:
+            future.set_exception(error)
+        return future
+
+    async def batched_async_contains(
+        self,
+        lookup_id: str,
+        keys: list[CacheEngineKey],
+        pin: bool = False,
+    ) -> int:
+        del lookup_id
+        return self.batched_contains(keys, pin)
+
+    async def batched_get_non_blocking(
+        self,
+        lookup_id: str,
+        keys: list[CacheEngineKey],
+        transfer_spec: Any = None,
+    ) -> list[MemoryObj]:
+        del lookup_id, transfer_spec
+        results: list[MemoryObj] = []
+        for key in keys:
+            memory_obj = await asyncio.to_thread(self.get_blocking, key)
+            if memory_obj is None:
+                break
+            results.append(memory_obj)
+        return results
+
+    def pin(self, key: CacheEngineKey) -> bool:
+        with self._entries_lock:
+            metadata = self._entries.get(key)
+            return metadata.pin() if metadata is not None else False
+
+    def unpin(self, key: CacheEngineKey) -> bool:
+        with self._entries_lock:
+            metadata = self._entries.get(key)
+            return metadata.unpin() if metadata is not None else False
+
+    def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
+        with self._entries_lock:
+            metadata = self._entries.get(key)
+            if metadata is None:
+                return False
+            if metadata.is_pinned and not force:
+                return False
+            del self._entries[key]
+        self.client.release_blob(metadata.blob_handle)
+        return True
+
+    def touch_cache(self) -> None:
+        with self._entries_lock:
+            for key in reversed(self._keys_in_request):
+                if key in self._entries:
+                    self._entries.move_to_end(key)
+            self._keys_in_request.clear()
 
     def calculate_chunk_budget(self) -> int:
         return self.registered_size // self.blob_size
@@ -1047,7 +1341,7 @@ class XDSBackend(CascadeKVBackend):
         keys: list[CacheEngineKey],
     ) -> list[Optional[MemoryObj]]:
         if len(keys) <= 1 or self.config.xds_io_queue_depth <= 1:
-            return super().batched_get_blocking(keys)
+            return [self.get_blocking(key) for key in keys]
 
         results: list[Optional[MemoryObj]] = [None] * len(keys)
         read_items = []

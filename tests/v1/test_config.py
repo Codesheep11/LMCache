@@ -742,46 +742,6 @@ def test_update_config_from_env_calls_validate():
             },
             "xds_require_direct=false",
         ),
-        (
-            {
-                "xds_service_name": "xds0",
-                "cascadekv_backend": True,
-                "cascadekv_slot_count": 0,
-            },
-            "cascadekv_slot_count",
-        ),
-        (
-            {
-                "xds_service_name": "xds0",
-                "cascadekv_backend": True,
-                "cascadekv_read_slot_count": 0,
-            },
-            "cascadekv_read_slot_count",
-        ),
-        (
-            {
-                "xds_service_name": "xds0",
-                "cascadekv_backend": True,
-                "cascadekv_write_slot_count": 0,
-            },
-            "cascadekv_write_slot_count",
-        ),
-        (
-            {
-                "xds_service_name": "xds0",
-                "cascadekv_backend": True,
-                "cascadekv_io_queue_depth": 0,
-            },
-            "cascadekv_io_queue_depth",
-        ),
-        (
-            {
-                "xds_service_name": "xds0",
-                "cascadekv_backend": True,
-                "cascadekv_write_window_size": 0,
-            },
-            "cascadekv_write_window_size",
-        ),
     ],
 )
 def test_xds_backend_config_rejects_invalid_combinations(overrides, message):
@@ -820,3 +780,41 @@ def test_xds_backend_config_accepts_each_service_path(monkeypatch):
     from_env = LMCacheEngineConfig.from_env()
     assert from_env.cascadekv_backend is True
     assert from_env.xds_service_name == "xds-env"
+
+
+def test_cascadekv_parses_legacy_pipeline_configuration():
+    config = LMCacheEngineConfig.from_dict(
+        {
+            "cascadekv_backend": True,
+            "xds_service_name": "xds0",
+            "xds_max_size": 500,
+            "xds_enable_chunked_overlap": True,
+            "xds_chunked_size_kb": 4096,
+            "xds_write_window_size": 64,
+            "xds_idle_flush_time": 0.5,
+            "xds_max_flush_delay": 1.0,
+        }
+    )
+
+    assert config.xds_max_size == 500
+    assert config.xds_enable_chunked_overlap is True
+    assert config.xds_chunked_size_kb == 4096
+    assert config.xds_write_window_size == 64
+    assert config.xds_idle_flush_time == 0.5
+    assert config.xds_max_flush_delay == 1.0
+
+
+def test_cascadekv_ignores_bounded_pipeline_configuration():
+    config = LMCacheEngineConfig.from_dict(
+        {
+            "cascadekv_backend": True,
+            "xds_service_name": "xds0",
+            "cascadekv_slot_count": 0,
+            "cascadekv_read_slot_count": 0,
+            "cascadekv_write_slot_count": 0,
+            "cascadekv_io_queue_depth": 0,
+            "cascadekv_write_window_size": 0,
+        }
+    )
+
+    config.validate()

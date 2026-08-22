@@ -113,6 +113,23 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    "xds_max_size": {"type": float, "default": 10.0, "env_converter": float},
+    "xds_enable_chunked_overlap": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "xds_chunked_size_kb": {"type": int, "default": 4096, "env_converter": int},
+    "xds_idle_flush_time": {
+        "type": float,
+        "default": 0.5,
+        "env_converter": float,
+    },
+    "xds_max_flush_delay": {
+        "type": float,
+        "default": 1.0,
+        "env_converter": float,
+    },
     "cascadekv_slot_count": {"type": int, "default": 8, "env_converter": int},
     "cascadekv_overlap": {
         "type": bool,
@@ -687,44 +704,17 @@ def _validate_config(self):
                 raise ValueError(f"{field_name} must be positive, got {value}")
 
     if self.cascadekv_backend:
-        positive_cascade_fields = (
-            "cascadekv_slot_count",
-            "cascadekv_read_slot_count",
-            "cascadekv_write_slot_count",
-            "cascadekv_io_queue_depth",
-            "cascadekv_write_window_size",
+        positive_legacy_cascade_fields = (
+            "xds_max_size",
+            "xds_chunked_size_kb",
+            "xds_write_window_size",
+            "xds_idle_flush_time",
+            "xds_max_flush_delay",
         )
-        for field_name in positive_cascade_fields:
+        for field_name in positive_legacy_cascade_fields:
             value = getattr(self, field_name)
             if value <= 0:
                 raise ValueError(f"{field_name} must be positive, got {value}")
-        user_set_keys = getattr(self, "_user_set_keys", set())
-        legacy_explicit = "cascadekv_slot_count" in user_set_keys
-        split_explicit = bool(
-            {"cascadekv_read_slot_count", "cascadekv_write_slot_count"}
-            & user_set_keys
-        )
-        if legacy_explicit and not split_explicit:
-            effective_read_slots = self.cascadekv_slot_count
-            effective_write_slots = self.cascadekv_slot_count
-        elif (
-            not user_set_keys
-            and self.cascadekv_slot_count != 8
-            and self.cascadekv_read_slot_count == 8
-            and self.cascadekv_write_slot_count == 64
-        ):
-            effective_read_slots = self.cascadekv_slot_count
-            effective_write_slots = self.cascadekv_slot_count
-        else:
-            effective_read_slots = self.cascadekv_read_slot_count
-            effective_write_slots = self.cascadekv_write_slot_count
-        if self.cascadekv_io_queue_depth > min(
-            effective_read_slots,
-            effective_write_slots,
-        ):
-            raise ValueError(
-                "cascadekv_io_queue_depth cannot exceed the read or write slot count"
-            )
     return self
 
 

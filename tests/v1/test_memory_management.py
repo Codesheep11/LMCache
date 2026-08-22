@@ -903,6 +903,9 @@ class FakeXDSServiceAllocatorClient:
         self.lifecycle.append(("free_buffer", buffer_ref))
         self.freed.append(buffer_ref)
 
+    def close(self):
+        self.lifecycle.append(("close_client",))
+
 
 class FakeXDSServiceAllocatorCUDART:
     def __init__(self, lifecycle, register_status=0):
@@ -959,3 +962,25 @@ def test_xds_service_allocator_registration_failure_frees_buffer(monkeypatch):
         XDSServiceMemoryAllocator(client, 16384, 4096)
 
     assert client.freed == [73]
+
+
+def test_xds_service_allocator_can_own_client_lifecycle(monkeypatch):
+    lifecycle = []
+    client = FakeXDSServiceAllocatorClient(lifecycle)
+    runtime = FakeXDSServiceAllocatorCUDART(lifecycle)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: runtime)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    allocator = XDSServiceMemoryAllocator(
+        client,
+        16384,
+        4096,
+        close_client=True,
+    )
+
+    allocator.close()
+
+    assert lifecycle[-3:] == [
+        ("unregister", allocator.base_ptr),
+        ("free_buffer", 73),
+        ("close_client",),
+    ]

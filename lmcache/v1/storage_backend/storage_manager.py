@@ -1378,11 +1378,20 @@ class StorageManager:
 
             return created
 
+    def _get_backend_close_order(
+        self,
+    ) -> list[tuple[str, StorageBackendInterface]]:
+        """Close dependants before the LocalCPUBackend allocator owner."""
+        items = list(self.storage_backends.items())
+        return [item for item in items if item[0] != "LocalCPUBackend"] + [
+            item for item in items if item[0] == "LocalCPUBackend"
+        ]
+
     def close(self):
         logger.info("Closing StorageManager...")
 
         # Close all backends
-        for name, backend in self.storage_backends.items():
+        for name, backend in self._get_backend_close_order():
             try:
                 logger.info(f"Closing storage backend: {name}")
                 backend.close()

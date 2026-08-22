@@ -11,6 +11,7 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.memory_management import XDSServiceMemoryAllocator
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.gds_backend import GdsBackend
@@ -146,13 +147,19 @@ def CreateStorageBackends(
     # Reuse existing LocalCPUBackend when available so that
     # dependent backends (disk, remote, p2p, …) keep working.
     local_cpu_backend: Optional[LocalCPUBackend] = None
-    if existing_backends and "LocalCPUBackend" in existing_backends:
+    if (
+        not config.cascadekv_backend
+        and existing_backends
+        and "LocalCPUBackend" in existing_backends
+    ):
         _existing_cpu = existing_backends["LocalCPUBackend"]
         if isinstance(_existing_cpu, LocalCPUBackend):
             local_cpu_backend = _existing_cpu
 
     if metadata.role == "scheduler":
         # For scheduler role, local_cpu_backend is None
+        pass
+    elif config.cascadekv_backend:
         pass
     elif not config.enable_pd or config.local_cpu:
         if "LocalCPUBackend" in _skip:
@@ -178,6 +185,7 @@ def CreateStorageBackends(
         and selected_xds_backend not in _skip
     ):
         xds_client = connect_xds_client(config, metadata)
+        owned_cascade_cpu_backend: Optional[LocalCPUBackend] = None
         try:
             if config.xds_backend:
                 from lmcache.v1.storage_backend.xds_backend import XDSBackend
@@ -193,15 +201,40 @@ def CreateStorageBackends(
                     CascadeKVBackend,
                 )
 
+                service_metadata = xds_client.metadata
+                if service_metadata is None:
+                    raise RuntimeError("xDS service did not return metadata")
+                allocator = XDSServiceMemoryAllocator(
+                    xds_client,
+                    int(config.max_local_cpu_size * 1024**3),
+                    int(service_metadata.io_unit_size),
+                    close_client=True,
+                )
+                local_cpu_backend = LocalCPUBackend(
+                    config,
+                    metadata,
+                    dst_device,
+                    lmcache_worker,
+                    memory_allocator=allocator,
+                )
+                owned_cascade_cpu_backend = local_cpu_backend
+                storage_backends[str(local_cpu_backend)] = local_cpu_backend
                 xds_backend = CascadeKVBackend(
                     config,
                     metadata,
+                    loop,
+                    local_cpu_backend,
                     xds_client,
-                    dst_device="cpu",
+                    dst_device,
+                    lmcache_worker,
                 )
             storage_backends[str(xds_backend)] = xds_backend
         except Exception:
-            xds_client.close()
+            if owned_cascade_cpu_backend is not None:
+                storage_backends.pop(str(owned_cascade_cpu_backend), None)
+                owned_cascade_cpu_backend.close()
+            else:
+                xds_client.close()
             raise
 
     if config.enable_p2p and "P2PBackend" not in _skip:

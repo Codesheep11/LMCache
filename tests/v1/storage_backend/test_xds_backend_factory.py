@@ -56,10 +56,62 @@ class FakeCUDART:
         return f"fake CUDA error {status}"
 
 
+class FakeServiceAllocator:
+    instances = []
+
+    def __init__(self, client, size, align_bytes, close_client=False):
+        self.client = client
+        self.size = size
+        self.align_bytes = align_bytes
+        self.close_client = close_client
+        self.closed = False
+        self.instances.append(self)
+
+    def close(self):
+        self.closed = True
+        if self.close_client:
+            self.client.close()
+
+
+class FakeLegacyCascadeBackend:
+    instance = None
+
+    def __init__(
+        self,
+        config,
+        metadata,
+        loop,
+        local_cpu_backend,
+        xds_client,
+        dst_device,
+        lmcache_worker,
+    ):
+        self.config = config
+        self.metadata = metadata
+        self.loop = loop
+        self.local_cpu_backend = local_cpu_backend
+        self.client = xds_client
+        self.dst_device = dst_device
+        self.lmcache_worker = lmcache_worker
+        FakeLegacyCascadeBackend.instance = self
+
+    def __str__(self):
+        return "CascadeKVBackend"
+
+    def close(self):
+        self.client.close()
+
+
+class FailingLegacyCascadeBackend:
+    def __init__(self, *_args, **_kwargs):
+        raise RuntimeError("fake CascadeKV construction failure")
+
+
 @pytest.fixture(autouse=True)
 def fake_cudart(monkeypatch):
     runtime = FakeCUDART()
     monkeypatch.setattr(torch.cuda, "cudart", lambda: runtime)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     return runtime
 
 
@@ -91,7 +143,7 @@ def test_factory_constructs_only_selected_xds_backend(
 ):
     config = LMCacheEngineConfig.from_defaults()
     config.local_cpu = False
-    config.max_local_cpu_size = 0
+    config.max_local_cpu_size = 8192 / 1024**3 if cascade else 0
     config.xds_service_name = "xds0"
     config.xds_backend = direct
     config.cascadekv_backend = cascade
@@ -113,13 +165,15 @@ def test_factory_constructs_only_selected_xds_backend(
     assert expected in backends
     assert ({"XDSBackend", "CascadeKVBackend"} & backends.keys()) == {expected}
     backends[expected].close()
+    if cascade:
+        backends["LocalCPUBackend"].close()
     assert fake_client.closed is True
 
 
 def test_storage_manager_selects_direct_xds_allocator(metadata, monkeypatch):
     config = LMCacheEngineConfig.from_defaults()
     config.local_cpu = False
-    config.max_local_cpu_size = 0
+    config.max_local_cpu_size = 8192 / 1024**3
     config.xds_service_name = "xds0"
     config.xds_backend = True
     config.xds_require_direct = True
@@ -146,7 +200,7 @@ def test_storage_manager_selects_direct_xds_allocator(metadata, monkeypatch):
 def test_storage_manager_selects_cascadekv_allocator(metadata, monkeypatch):
     config = LMCacheEngineConfig.from_defaults()
     config.local_cpu = False
-    config.max_local_cpu_size = 0
+    config.max_local_cpu_size = 8192 / 1024**3
     config.xds_service_name = "xds0"
     config.cascadekv_backend = True
     config.cascadekv_slot_count = 2
@@ -168,6 +222,85 @@ def test_storage_manager_selects_cascadekv_allocator(metadata, monkeypatch):
 
     assert manager._get_allocator_backend(config) is backends["CascadeKVBackend"]
     backends["CascadeKVBackend"].close()
+    backends["LocalCPUBackend"].close()
+
+
+def test_factory_injects_service_dma_local_cpu_into_cascadekv(
+    metadata, monkeypatch
+):
+    config = LMCacheEngineConfig.from_defaults()
+    config.local_cpu = False
+    config.max_local_cpu_size = 8192 / 1024**3
+    config.xds_service_name = "xds0"
+    config.cascadekv_backend = True
+    client = FakeXDSClient()
+    loop = asyncio.new_event_loop()
+    FakeServiceAllocator.instances.clear()
+    FakeLegacyCascadeBackend.instance = None
+    monkeypatch.setattr(
+        "lmcache.v1.storage_backend.connect_xds_client",
+        lambda *_args, **_kwargs: client,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.storage_backend.XDSServiceMemoryAllocator",
+        FakeServiceAllocator,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.storage_backend.cascadekv_backend.CascadeKVBackend",
+        FakeLegacyCascadeBackend,
+    )
+
+    backends = CreateStorageBackends(config, metadata, loop, dst_device="cpu")
+
+    assert list(backends)[:2] == ["LocalCPUBackend", "CascadeKVBackend"]
+    assert len(FakeServiceAllocator.instances) == 1
+    allocator = FakeServiceAllocator.instances[0]
+    assert allocator.size == 8192
+    assert allocator.align_bytes == 4096
+    assert allocator.close_client is True
+    assert FakeLegacyCascadeBackend.instance.local_cpu_backend is backends[
+        "LocalCPUBackend"
+    ]
+    assert FakeLegacyCascadeBackend.instance.client is client
+
+
+def test_factory_cleans_service_dma_allocator_when_cascadekv_init_fails(
+    metadata, monkeypatch
+):
+    config = LMCacheEngineConfig.from_defaults()
+    config.local_cpu = False
+    config.max_local_cpu_size = 8192 / 1024**3
+    config.xds_service_name = "xds0"
+    config.cascadekv_backend = True
+    client = FakeXDSClient()
+    FakeServiceAllocator.instances.clear()
+    monkeypatch.setattr(
+        "lmcache.v1.storage_backend.connect_xds_client",
+        lambda *_args, **_kwargs: client,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.storage_backend.XDSServiceMemoryAllocator",
+        FakeServiceAllocator,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.storage_backend.cascadekv_backend.CascadeKVBackend",
+        FailingLegacyCascadeBackend,
+    )
+
+    with pytest.raises(RuntimeError, match="construction failure"):
+        CreateStorageBackends(
+            config,
+            metadata,
+            asyncio.new_event_loop(),
+            dst_device="cpu",
+        )
+
+    assert FakeServiceAllocator.instances[0].closed is True
+    assert client.closed is True
 
 
 def test_xds_read_skips_local_cpu_writeback(monkeypatch):

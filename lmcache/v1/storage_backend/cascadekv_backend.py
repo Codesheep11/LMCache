@@ -1,1486 +1,1646 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CascadeKV backend using xDS service-owned CPU staging memory."""
-
+# ruff: noqa: E501
 # Standard
 from collections import OrderedDict
 from concurrent.futures import Future
-from contextlib import contextmanager
-from functools import wraps
-from typing import Any, Callable, Iterator, Optional, Sequence, Union
-import asyncio
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import threading
+import asyncio
+import os
 import time
 
 # Third Party
 import torch
 
 # First Party
-from lmcache.utils import CacheEngineKey
 from lmcache.logging import init_logger
+from lmcache.observability import LMCStatsMonitor
+from lmcache.utils import CacheEngineKey
+from lmcache.v1.cache_controller.message import KVAdmitMsg, KVEvictMsg
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
+    GPUMemoryAllocator,
     MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
-    TensorMemoryAllocator,
+    XDSServiceMemoryAllocator,
 )
-from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.xds_utils import align_to_io_unit
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
-from lmcache.v1.storage_backend.transfer_result import (
-    BackendTransferResult,
-    BackendWriteSubmissionResult,
+from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.cascadekv_completion import (
+    CascadeKVCompletionPump,
+    CascadeKVRequestGroup,
 )
-from lmcache.v1.storage_backend.xds_read_ring import XDSReadRingPump
-from lmcache.v1.storage_backend.xds_write_scheduler import (
-    LeaseState,
-    SchedulerSnapshot,
-    StagingLease,
-    XDSAsyncWriteScheduler,
-)
-from lmcache.v1.xds_utils import XDSBlobMetadata, align_to_io_unit
-
+from lmcache.v1.cache_controller.worker import LMCacheWorker
+from lmcache.v1.xds_utils import XDSBlobMetadata
+from lmcache.storage_backend.evictor import LRUEvictor
+from lmcache.storage_backend.evictor.base_evictor import PutStatus
 
 logger = init_logger(__name__)
 
-DEFAULT_BLOB_TIMEOUT_SECS = 5.0
+DEFAULT_BLOB_ACQUIRE_TIMEOUT_SECS = 5.0
 DEFAULT_IO_TIMEOUT_SECS = 30.0
-LEGACY_CASCADEKV_SLOT_COUNT_DEFAULT = 8
-CASCADEKV_READ_SLOT_COUNT_DEFAULT = 8
-CASCADEKV_WRITE_SLOT_COUNT_DEFAULT = 64
-
-
-def _guard_operation(method: Callable[..., Any]) -> Callable[..., Any]:
-    """Reject new public operations after CascadeKV shutdown begins."""
-
-    @wraps(method)
-    def guarded(self: Any, *args: Any, **kwargs: Any) -> Any:
-        with self._active_operation():
-            return method(self, *args, **kwargs)
-
-    return guarded
-
-
-def _guard_async_operation(method: Callable[..., Any]) -> Callable[..., Any]:
-    """Async counterpart of :func:`_guard_operation`."""
-
-    @wraps(method)
-    async def guarded(self: Any, *args: Any, **kwargs: Any) -> Any:
-        with self._active_operation():
-            return await method(self, *args, **kwargs)
-
-    return guarded
-
-
-def _resolve_slot_counts(config: LMCacheEngineConfig) -> tuple[int, int]:
-    """Resolve new read/write banks with compatibility for old slot configs."""
-    read_slots = int(config.cascadekv_read_slot_count)
-    write_slots = int(config.cascadekv_write_slot_count)
-    legacy_slots = int(config.cascadekv_slot_count)
-    user_set_keys = getattr(config, "_user_set_keys", set())
-    legacy_explicit = "cascadekv_slot_count" in user_set_keys
-    split_explicit = bool(
-        {"cascadekv_read_slot_count", "cascadekv_write_slot_count"} & user_set_keys
-    )
-    if (legacy_explicit and not split_explicit) or (
-        not user_set_keys
-        and legacy_slots != LEGACY_CASCADEKV_SLOT_COUNT_DEFAULT
-        and read_slots == CASCADEKV_READ_SLOT_COUNT_DEFAULT
-        and write_slots == CASCADEKV_WRITE_SLOT_COUNT_DEFAULT
-    ):
-        return legacy_slots, legacy_slots
-    return read_slots, write_slots
 
 
 class CascadeKVBackend(AllocatorBackendInterface):
-    """xDS storage path that stages SSD I/O through service CPU memory."""
-
-    skip_local_cpu_writeback = True
-
     def __init__(
         self,
         config: LMCacheEngineConfig,
-        metadata: LMCacheMetadata,
+        metadata: Any,
+        loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
         xds_client: Any,
-        dst_device: str = "cpu",
-    ) -> None:
-        super().__init__(dst_device="cpu")
+        dst_device: str = "cuda",
+        lmcache_worker: Optional["LMCacheWorker"] = None,
+        lookup_server: Optional[Any] = None,
+    ):
+        super().__init__(dst_device)
         self.config = config
         self.metadata = metadata
         self.client = xds_client
-        self._closed = False
-        self._closing = False
-        self._teardown_started = False
-        self._active_operations = 0
-        self._lifecycle_condition = threading.Condition()
-        self._operation_local = threading.local()
-        self._buffer_freed = False
-        self._client_closed = False
-        self._host_registered = False
-        self._read_allocator_closed = False
-        self._write_allocator_closed = False
-        self._poisoned_error: Optional[BaseException] = None
-        self._quarantined_objects: list[MemoryObj] = []
-        self._quarantined_xds_requests: dict[int, MemoryObj] = {}
-        self._write_scheduler: Optional[XDSAsyncWriteScheduler] = None
-        self._entries: OrderedDict[CacheEngineKey, XDSBlobMetadata] = OrderedDict()
-        self._entries_lock = threading.RLock()
-        self._put_tasks: set[CacheEngineKey] = set()
-        self._pending_objects: dict[CacheEngineKey, MemoryObj] = {}
-        self._pending_transfer_events: dict[CacheEngineKey, Any] = {}
-        self._put_tasks_lock = threading.RLock()
-        self._async_admission_lock = threading.Lock()
-        self._io_lock = threading.Lock()
-        self._keys_in_request: list[CacheEngineKey] = []
-
-        service_metadata = xds_client.metadata
-        self.io_unit_size = int(service_metadata.io_unit_size)
-        self.blob_size = align_to_io_unit(
-            int(service_metadata.blob_size_bytes),
-            self.io_unit_size,
+        self.dict: OrderedDict[CacheEngineKey, XDSBlobMetadata] = OrderedDict()
+        self.dst_device = dst_device
+        self.lookup_server = lookup_server
+        self.loop = loop
+        self.local_cpu_backend = local_cpu_backend
+        self.lmcache_worker = lmcache_worker
+        self.instance_id = config.lmcache_instance_id
+        self.stats_monitor = LMCStatsMonitor.GetOrCreate()
+        self.usage = 0
+        self.blob_acquire_timeout_secs = DEFAULT_BLOB_ACQUIRE_TIMEOUT_SECS
+        self.io_timeout_secs = DEFAULT_IO_TIMEOUT_SECS
+        self.trace_io = os.environ.get("LMCACHE_TRACE_IO", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
         )
-        self.read_slot_count, self.write_slot_count = _resolve_slot_counts(config)
-        self.read_staging_size = self.read_slot_count * self.blob_size
-        self.write_staging_size = self.write_slot_count * self.blob_size
-        self.staging_size = self.read_staging_size + self.write_staging_size
-        self.staging_buffer_ref: Optional[int] = None
-        try:
-            self.staging_view, self.staging_buffer_ref = xds_client.alloc_buffer(
-                self.staging_size
+        self.cuda_device = (
+            torch.device(dst_device)
+            if torch.cuda.is_available() and str(dst_device).startswith("cuda")
+            else None
+        )
+        self.io_unit_size = int(xds_client.metadata.io_unit_size)
+        self.blob_size = int(xds_client.metadata.blob_size_bytes)
+        allocator = local_cpu_backend.get_memory_allocator()
+        if not isinstance(allocator, XDSServiceMemoryAllocator):
+            raise TypeError(
+                "CascadeKV requires LocalCPUBackend to use XDSServiceMemoryAllocator"
             )
-            self.staging_tensor = torch.frombuffer(
-                self.staging_view,
-                dtype=torch.uint8,
+        self.memory_allocator = allocator
+        self.completion_pump = CascadeKVCompletionPump(xds_client)
+        self._closed = False
+        requested_overlap_chunk_kb = getattr(config, "xds_chunked_size_kb", 4096)
+        self.chunked_gpu_overlap_requested = getattr(
+            config, "xds_enable_chunked_overlap", False
+        )
+        self.enable_chunked_gpu_overlap = (
+            self.chunked_gpu_overlap_requested
+            and self.cuda_device is not None
+            and self.io_unit_size > 0
+        )
+        # self.enable_chunked_gpu_overlap = False
+        self.chunked_gpu_overlap_size = align_to_io_unit(
+            max(int(requested_overlap_chunk_kb) * 1024, max(self.io_unit_size, 1)),
+            max(self.io_unit_size, 1),
+        )
+        if self.chunked_gpu_overlap_requested and self.cuda_device is None:
+            logger.warning(
+                "xds_enable_chunked_overlap is enabled, but CUDA is unavailable. "
+                "Falling back to the original xDS read path."
             )
-            if self.staging_tensor.numel() != self.staging_size:
-                raise RuntimeError(
-                    "xDS service returned an unexpected CPU staging buffer size: "
-                    f"{self.staging_tensor.numel()} != {self.staging_size}"
-                )
-            self.staging_base_ptr = self.staging_tensor.data_ptr()
-            self._cudart = torch.cuda.cudart()
-            register_status = int(
-                self._cudart.cudaHostRegister(
-                    self.staging_base_ptr,
-                    self.staging_size,
-                    0,
-                )
-            )
-            if register_status != 0:
-                error_string = self._cudart.cudaGetErrorString(register_status)
-                raise RuntimeError(
-                    "CascadeKV cudaHostRegister failed: "
-                    f"status={register_status}, error={error_string}"
-                )
-            self._host_registered = True
 
-            self.read_staging_tensor = self.staging_tensor[: self.read_staging_size]
-            self.write_staging_tensor = self.staging_tensor[self.read_staging_size :]
-            self.read_staging_base_ptr = self.read_staging_tensor.data_ptr()
-            self.write_staging_base_ptr = self.write_staging_tensor.data_ptr()
-            self.read_memory_allocator = TensorMemoryAllocator(
-                self.read_staging_tensor,
-                align_bytes=self.io_unit_size,
-            )
-            self.write_memory_allocator = TensorMemoryAllocator(
-                self.write_staging_tensor,
-                align_bytes=self.io_unit_size,
-            )
-            self.memory_allocator = self.initialize_allocator(config, metadata)
-            if config.cascadekv_async_write:
-                self._write_scheduler = XDSAsyncWriteScheduler(
-                    write_budget_bytes=self.write_staging_size,
-                    submit_write=self._submit_async_lease,
-                    commit=self._commit_async_lease,
-                    rollback=self._rollback_async_lease,
-                )
-        except BaseException:
-            self._cleanup_failed_initialization()
-            raise
+        xds_max_size = config.xds_max_size
+        self.evictor = LRUEvictor(max_cache_size=xds_max_size)
 
-    def _cleanup_failed_initialization(self) -> None:
-        """Best-effort unwind of service and CUDA resources during construction."""
-        try:
-            if self._write_scheduler is not None:
-                self._write_scheduler.close(timeout=DEFAULT_IO_TIMEOUT_SECS)
-        except BaseException:
-            logger.exception("failed to close CascadeKV scheduler after init failure")
-        try:
-            if self._host_registered:
-                self._cudart.cudaHostUnregister(self.staging_base_ptr)
-                self._host_registered = False
-        except BaseException:
-            logger.exception(
-                "failed to unregister CascadeKV staging after init failure"
-            )
-        try:
-            if self.staging_buffer_ref is not None and not self._buffer_freed:
-                self.client.free_buffer(self.staging_buffer_ref)
-                self._buffer_freed = True
-        except BaseException:
-            logger.exception("failed to free CascadeKV staging after init failure")
-        try:
-            client_close = getattr(self.client, "close", None)
-            if callable(client_close) and not self._client_closed:
-                client_close()
-                self._client_closed = True
-        except BaseException:
-            logger.exception("failed to close xDS client after CascadeKV init failure")
+        self.dict_lock = threading.RLock()
+        self.usage_lock = threading.RLock()
 
-    @contextmanager
-    def _active_operation(self, allow_poison: bool = False) -> Iterator[None]:
-        """Hold the backend lifecycle open for one re-entrant public operation."""
-        condition = getattr(self, "_lifecycle_condition", None)
-        if condition is None:
-            yield
-            return
-        depth = int(getattr(self._operation_local, "depth", 0))
-        if depth:
-            self._operation_local.depth = depth + 1
-            try:
-                yield
-            finally:
-                self._operation_local.depth = depth
-            return
-        with condition:
-            if self._closing or self._closed or self._teardown_started:
-                raise RuntimeError("CascadeKVBackend is closing or closed")
-            if self._poisoned_error is not None and not allow_poison:
-                raise RuntimeError(
-                    "CascadeKVBackend is poisoned by an incomplete transfer"
-                ) from self._poisoned_error
-            self._active_operations += 1
-            self._operation_local.depth = 1
-        try:
-            yield
-        finally:
-            with condition:
-                self._operation_local.depth = 0
-                self._active_operations -= 1
-                condition.notify_all()
+        self.write_window_size = getattr(config, "xds_write_window_size", 64)
+        self.idle_flush_time = getattr(config, "xds_idle_flush_time", 0.5)
+        self.max_flush_delay = getattr(config, "xds_max_flush_delay", 1.0)
+        self.read_bios = True
+        self.concurrency = True
 
-    def __str__(self) -> str:
-        return self.__class__.__name__
+        self.put_tasks: dict[CacheEngineKey, MemoryObj] = {}
+        self.put_callbacks: dict[CacheEngineKey, Any] = {}
+        self.put_tasks_lock = threading.RLock()
+
+        self.write_buffer: List[Tuple[CacheEngineKey, MemoryObj]] = []
+        self.flush_condition = threading.Condition(self.put_tasks_lock)
+
+        self.last_write_timestamp: float = 0.0
+        self.oldest_item_timestamp: float = 0.0
+
+        self.running = threading.Event()
+        self.running.set()
+        self.flush_thread = threading.Thread(
+            target=self._flush_loop, name="xDS-FlushThread", daemon=True
+        )
+        self.flush_thread.start()
+
+        self.keys_in_request: List[CacheEngineKey] = []
+
+        self.prefetch_tasks: dict[CacheEngineKey, Future] = {}
+        self.prefetch_lock = threading.RLock()
+
+        self.cumulative_read_bytes = 0
+        self.cumulative_read_time = 0.0
+        self.stats_lock = threading.Lock()
+        blob_size = self.blob_size
+        self.sleep_time = blob_size / (19 * 1024**3) / 2
+        logger.info(
+            f"xDS blob size: {blob_size} bytes, sleep time between reads: {self.sleep_time:.6f} seconds"
+        )
 
     def initialize_allocator(
-        self,
-        config: LMCacheEngineConfig,
-        metadata: LMCacheMetadata,
-    ) -> TensorMemoryAllocator:
+        self, config: LMCacheEngineConfig, metadata: Any
+    ) -> MemoryAllocatorInterface:
         del config, metadata
-        return self.write_memory_allocator
+        return self.local_cpu_backend.get_memory_allocator()
 
-    def get_allocator_backend(self) -> "CascadeKVBackend":
-        return self
+    def get_allocator_backend(self) -> LocalCPUBackend:
+        return self.local_cpu_backend
 
     def get_memory_allocator(self) -> MemoryAllocatorInterface:
         return self.memory_allocator
 
-    @_guard_operation
     def allocate(
         self,
-        shapes: Union[torch.Size, list[torch.Size]],
-        dtypes: Union[torch.dtype, list[torch.dtype]],
+        shapes: Any,
+        dtypes: Any,
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
     ) -> Optional[MemoryObj]:
-        del eviction, busy_loop
-        return self.memory_allocator.allocate(shapes, dtypes, fmt)
+        return self.local_cpu_backend.allocate(
+            shapes,
+            dtypes,
+            fmt,
+            eviction=eviction,
+            busy_loop=busy_loop,
+        )
 
-    @_guard_operation
     def batched_allocate(
         self,
-        shapes: Union[torch.Size, list[torch.Size]],
-        dtypes: Union[torch.dtype, list[torch.dtype]],
+        shapes: Any,
+        dtypes: Any,
         batch_size: int,
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
     ) -> Optional[list[MemoryObj]]:
-        del eviction, busy_loop
-        return self.memory_allocator.batched_allocate(
+        return self.local_cpu_backend.batched_allocate(
             shapes,
             dtypes,
             batch_size,
             fmt,
+            eviction=eviction,
+            busy_loop=busy_loop,
         )
 
     def calculate_chunk_budget(self) -> int:
-        return self.write_slot_count
+        return self.local_cpu_backend.calculate_chunk_budget()
 
-    @_guard_operation
+    def _allocate_memory_obj(self, shape, dtype, fmt) -> Optional[MemoryObj]:
+        return self.local_cpu_backend.allocate(shape, dtype, fmt)
+
+    def _get_buffer_offset(self, memory_obj: MemoryObj) -> int:
+        return self.memory_allocator.get_buffer_offset(memory_obj)
+
+    def _get_storage_size(self, memory_obj: MemoryObj) -> int:
+        storage_size = memory_obj.get_physical_size()
+        aligned_size = align_to_io_unit(storage_size, self.io_unit_size)
+        if storage_size != aligned_size:
+            raise ValueError(
+                "xDS backend requires memory objects to be io_unit aligned: "
+                f"physical_size={storage_size}, aligned_size={aligned_size}"
+            )
+        return storage_size
+
+    def _submit_read(
+        self,
+        group: CascadeKVRequestGroup[Any],
+        context: Any,
+        blob_handle: int,
+        memory_obj: MemoryObj,
+        blob_offset: int,
+        size: int,
+        memory_offset: int = 0,
+    ) -> int:
+        return self.completion_pump.submit(
+            group,
+            context,
+            lambda: self.client.submit_read(
+                blob_handle,
+                self.memory_allocator.buffer_ref,
+                self._get_buffer_offset(memory_obj) + memory_offset,
+                blob_offset,
+                size,
+            ),
+        )
+
+    def _submit_write(
+        self,
+        group: CascadeKVRequestGroup[Any],
+        context: Any,
+        blob_handle: int,
+        memory_obj: MemoryObj,
+        size: int,
+    ) -> int:
+        return self.completion_pump.submit(
+            group,
+            context,
+            lambda: self.client.submit_write(
+                blob_handle,
+                self.memory_allocator.buffer_ref,
+                self._get_buffer_offset(memory_obj),
+                0,
+                size,
+            ),
+        )
+
+    @staticmethod
+    def _validate_completion(completion: Any, expected_size: int) -> None:
+        if int(completion.status) != 0:
+            raise RuntimeError(
+                "xDS request failed: "
+                f"status={completion.status}, error={completion.error_code}"
+            )
+        if int(completion.completed_bytes) != expected_size:
+            raise RuntimeError(
+                "short xDS I/O: "
+                f"completed={completion.completed_bytes}, expected={expected_size}"
+            )
+
+    def _log_io_trace(
+        self,
+        op: str,
+        sizes: List[int],
+        elapsed_secs: float,
+        success: bool,
+    ) -> None:
+        if not self.trace_io:
+            return
+
+        print(
+            "[LMCACHE_IO_TRACE] "
+            f"backend={self.__class__.__name__} "
+            f"op={op} "
+            f"reqs={len(sizes)} "
+            f"total_bytes={sum(sizes)} "
+            f"sizes={sizes} "
+            f"elapsed_ms={elapsed_secs * 1000.0:.3f} "
+            f"success={int(success)}",
+            flush=True,
+        )
+
+    def _should_use_chunked_gpu_overlap(self, storage_size: int) -> bool:
+        del storage_size
+        return self.enable_chunked_gpu_overlap
+
+    def _should_prefer_blob_gpu_overlap(
+        self, xds_tasks_info: List[Dict[str, Any]]
+    ) -> bool:
+        # Force batched reads to use blob-granularity overlap so the batch path
+        # does not regress to chunk-level scheduling overhead while we evaluate
+        # overlap effectiveness. Single-blob reads still use chunk granularity.
+        return self.enable_chunked_gpu_overlap and len(xds_tasks_info) > 1
+
+    def _allocate_host_memory_obj(
+        self, shape, dtype, fmt, storage_size: int
+    ) -> Optional[MemoryObj]:
+        memory_obj = self._allocate_memory_obj(shape, dtype, fmt)
+        if memory_obj is None:
+            return None
+
+        allocated_storage_size = self._get_storage_size(memory_obj)
+        if allocated_storage_size != storage_size:
+            raise ValueError(
+                "Allocated memory object storage size does not match blob size: "
+                f"allocated={allocated_storage_size}, blob={storage_size}"
+            )
+        return memory_obj
+
+    def _allocate_device_memory_obj(
+        self, shape, dtype, fmt, storage_size: int
+    ) -> Optional[MemoryObj]:
+        if self.cuda_device is None:
+            return None
+
+        allocator = GPUMemoryAllocator(
+            storage_size,
+            device=self.cuda_device,
+            align_bytes=self.io_unit_size,
+        )
+        memory_obj = allocator.allocate(shape, dtype, fmt)
+        if memory_obj is None:
+            return None
+
+        allocated_storage_size = self._get_storage_size(memory_obj)
+        if allocated_storage_size != storage_size:
+            raise ValueError(
+                "Allocated GPU memory object storage size does not match blob size: "
+                f"allocated={allocated_storage_size}, blob={storage_size}"
+            )
+        return memory_obj
+
+    def _read_blob_to_host_blocking(
+        self,
+        blob_handle: int,
+        storage_size: int,
+        dtype,
+        shape,
+        fmt,
+        trace_op: str,
+    ) -> Optional[MemoryObj]:
+        memory_obj = self._allocate_host_memory_obj(shape, dtype, fmt, storage_size)
+        if memory_obj is None:
+            logger.debug("Memory allocation failed during xds host read.")
+            return None
+
+        group = self.completion_pump.create_group()
+        self._submit_read(
+            group,
+            storage_size,
+            blob_handle,
+            memory_obj,
+            0,
+            storage_size,
+        )
+        io_start = time.perf_counter()
+        try:
+            completed = group.wait_all(self.io_timeout_secs)[0]
+            self._validate_completion(completed.completion, completed.context)
+            self._log_io_trace(
+                trace_op, [storage_size], time.perf_counter() - io_start, True
+            )
+            return memory_obj
+        except Exception as e:
+            self._log_io_trace(
+                trace_op, [storage_size], time.perf_counter() - io_start, False
+            )
+            logger.error(
+                f"xDS host read operation failed or timed out: {e}",
+                exc_info=True,
+            )
+            memory_obj.ref_count_down()
+            return None
+
+    def _read_blob_to_device_chunked_blocking(
+        self,
+        blob_handle: int,
+        storage_size: int,
+        dtype,
+        shape,
+        fmt,
+        trace_op: str,
+    ) -> Optional[MemoryObj]:
+        staging_memory_obj = self._allocate_host_memory_obj(
+            shape, dtype, fmt, storage_size
+        )
+        if staging_memory_obj is None:
+            logger.debug("Memory allocation failed during xDS staged host read.")
+            return None
+
+        output_memory_obj = self._allocate_device_memory_obj(
+            shape, dtype, fmt, storage_size
+        )
+        if output_memory_obj is None:
+            logger.warning(
+                "GPU allocation failed for chunked xDS overlap path. "
+                "Falling back to the original host read path."
+            )
+            staging_memory_obj.ref_count_down()
+            return self._read_blob_to_host_blocking(
+                blob_handle, storage_size, dtype, shape, fmt, trace_op
+            )
+
+        staging_tensor = staging_memory_obj.tensor
+        output_tensor = output_memory_obj.tensor
+        assert staging_tensor is not None
+        assert output_tensor is not None
+
+        staging_bytes = staging_tensor.view(torch.uint8).flatten()
+        output_bytes = output_tensor.view(torch.uint8).flatten()
+        logical_bytes = output_memory_obj.get_size()
+        copy_stream = torch.cuda.Stream(device=self.cuda_device)
+        io_sizes: List[int] = []
+        io_start = time.perf_counter()
+
+        try:
+            group = self.completion_pump.create_group()
+            # Queue all chunk reads first so xDS can keep queue depth, then drain
+            # completions while GPU copies run asynchronously on the copy stream.
+            for offset in range(0, storage_size, self.chunked_gpu_overlap_size):
+                chunk_size = min(self.chunked_gpu_overlap_size, storage_size - offset)
+                io_sizes.append(chunk_size)
+                self._submit_read(
+                    group,
+                    (offset, chunk_size),
+                    blob_handle,
+                    staging_memory_obj,
+                    offset,
+                    chunk_size,
+                    memory_offset=offset,
+                )
+
+            while group.pending_count:
+                completed = group.wait_next(self.io_timeout_secs)
+                offset, chunk_size = completed.context
+                self._validate_completion(completed.completion, chunk_size)
+
+                remaining_logical_bytes = max(0, logical_bytes - offset)
+                copy_size = min(chunk_size, remaining_logical_bytes)
+                if copy_size > 0:
+                    with torch.cuda.stream(copy_stream):
+                        output_bytes[offset : offset + copy_size].copy_(
+                            staging_bytes[offset : offset + copy_size],
+                            non_blocking=True,
+                        )
+
+            copy_stream.synchronize()
+            self._log_io_trace(trace_op, io_sizes, time.perf_counter() - io_start, True)
+            return output_memory_obj
+        except Exception as e:
+            try:
+                copy_stream.synchronize()
+            except Exception:
+                logger.debug(
+                    "Chunked xDS overlap stream synchronize failed during error handling.",
+                    exc_info=True,
+                )
+            self._log_io_trace(
+                trace_op, io_sizes, time.perf_counter() - io_start, False
+            )
+            logger.error(
+                f"xDS chunked staged read operation failed or timed out: {e}",
+                exc_info=True,
+            )
+            output_memory_obj.ref_count_down()
+            return None
+        finally:
+            staging_memory_obj.ref_count_down()
+
+    async def _read_blob_to_device_chunked_async(
+        self,
+        blob_handle: int,
+        storage_size: int,
+        dtype,
+        shape,
+        fmt,
+        trace_op: str,
+    ) -> Optional[MemoryObj]:
+        staging_memory_obj = self._allocate_host_memory_obj(
+            shape, dtype, fmt, storage_size
+        )
+        if staging_memory_obj is None:
+            logger.debug("Memory allocation failed during async xDS staged host read.")
+            return None
+
+        output_memory_obj = self._allocate_device_memory_obj(
+            shape, dtype, fmt, storage_size
+        )
+        if output_memory_obj is None:
+            staging_memory_obj.ref_count_down()
+            raise RuntimeError("GPU allocation failed for chunked xDS overlap path")
+
+        staging_tensor = staging_memory_obj.tensor
+        output_tensor = output_memory_obj.tensor
+        assert staging_tensor is not None
+        assert output_tensor is not None
+
+        staging_bytes = staging_tensor.view(torch.uint8).flatten()
+        output_bytes = output_tensor.view(torch.uint8).flatten()
+        logical_bytes = output_memory_obj.get_size()
+        copy_stream = torch.cuda.Stream(device=self.cuda_device)
+        io_sizes: List[int] = []
+        io_start = time.perf_counter()
+
+        try:
+            group = self.completion_pump.create_group()
+            # Queue all chunk reads first so xDS can keep queue depth, then drain
+            # completions while GPU copies run asynchronously on the copy stream.
+            for offset in range(0, storage_size, self.chunked_gpu_overlap_size):
+                chunk_size = min(self.chunked_gpu_overlap_size, storage_size - offset)
+                io_sizes.append(chunk_size)
+                self._submit_read(
+                    group,
+                    (offset, chunk_size),
+                    blob_handle,
+                    staging_memory_obj,
+                    offset,
+                    chunk_size,
+                    memory_offset=offset,
+                )
+
+            while group.pending_count:
+                completed = await asyncio.to_thread(
+                    group.wait_next,
+                    self.io_timeout_secs,
+                )
+                offset, chunk_size = completed.context
+                self._validate_completion(completed.completion, chunk_size)
+
+                remaining_logical_bytes = max(0, logical_bytes - offset)
+                copy_size = min(chunk_size, remaining_logical_bytes)
+                if copy_size > 0:
+                    with torch.cuda.stream(copy_stream):
+                        output_bytes[offset : offset + copy_size].copy_(
+                            staging_bytes[offset : offset + copy_size],
+                            non_blocking=True,
+                        )
+
+            copy_stream.synchronize()
+            self._log_io_trace(trace_op, io_sizes, time.perf_counter() - io_start, True)
+            return output_memory_obj
+        except Exception:
+            try:
+                copy_stream.synchronize()
+            except Exception:
+                logger.debug(
+                    "Chunked xDS overlap stream synchronize failed during async error handling.",
+                    exc_info=True,
+                )
+            self._log_io_trace(
+                trace_op, io_sizes, time.perf_counter() - io_start, False
+            )
+            output_memory_obj.ref_count_down()
+            raise
+        finally:
+            staging_memory_obj.ref_count_down()
+
+    def _flush_loop(self):
+        while self.running.is_set():
+            tasks_to_process = []
+            with self.flush_condition:
+                self.flush_condition.wait(timeout=0.1)
+
+                if not self.write_buffer:
+                    continue
+
+                now = time.monotonic()
+
+                should_flush = False
+                if len(self.write_buffer) >= self.write_window_size:
+                    should_flush = True
+                elif (now - self.oldest_item_timestamp) > self.max_flush_delay:
+                    should_flush = True
+                    logger.debug("Flushing xDS write buffer: max delay expired.")
+
+                if should_flush:
+                    tasks_to_process = self.write_buffer
+                    self.write_buffer = []
+
+            if tasks_to_process:
+                self._perform_batch_write(tasks_to_process)
+
+    def _perform_batch_write(self, tasks: List[Tuple[CacheEngineKey, MemoryObj]]):
+        if not tasks:
+            return
+
+        keys = [task[0] for task in tasks]
+        memory_objs = [task[1] for task in tasks]
+        batch_size = len(keys)
+        blob_handles = []
+        usage_added = 0
+        io_sizes: List[int] = []
+
+        try:
+            blob_handles = [
+                self.completion_pump.call_client(
+                    lambda: self.client.get_blob(timeout=self.blob_acquire_timeout_secs)
+                )
+                for _ in range(batch_size)
+            ]
+
+            group = self.completion_pump.create_group()
+            total_size = 0
+            for i in range(batch_size):
+                memory_obj = memory_objs[i]
+                storage_size = self._get_storage_size(memory_obj)
+                total_size += storage_size
+                io_sizes.append(storage_size)
+                self._submit_write(
+                    group,
+                    storage_size,
+                    blob_handles[i],
+                    memory_obj,
+                    storage_size,
+                )
+
+            with self.usage_lock:
+                self.usage += total_size
+                self.stats_monitor.update_local_storage_usage(self.usage)
+                usage_added = total_size
+
+            io_start = time.perf_counter()
+            try:
+                completed_requests = group.wait_all(self.io_timeout_secs)
+                for completed in completed_requests:
+                    self._validate_completion(
+                        completed.completion,
+                        completed.context,
+                    )
+            except Exception:
+                self._log_io_trace(
+                    "write_batch", io_sizes, time.perf_counter() - io_start, False
+                )
+                raise
+            else:
+                self._log_io_trace(
+                    "write_batch", io_sizes, time.perf_counter() - io_start, True
+                )
+
+            for i in range(batch_size):
+                self.insert_key(keys[i], memory_objs[i], blob_handles[i])
+                callback = self.put_callbacks.pop(keys[i], None)
+                if callback is not None:
+                    try:
+                        callback(keys[i])
+                    except Exception:
+                        logger.exception("CascadeKV put completion callback failed")
+                memory_objs[i].ref_count_down()
+
+        except Exception as e:
+            logger.error(f"xDS batch write failed: {e}", exc_info=True)
+            if usage_added > 0:
+                with self.usage_lock:
+                    self.usage -= usage_added
+                    self.stats_monitor.update_local_storage_usage(self.usage)
+            for handle in blob_handles:
+                self.completion_pump.call_client(
+                    lambda handle=handle: self.client.release_blob(handle)
+                )
+            for mem_obj in memory_objs:
+                mem_obj.ref_count_down()
+        finally:
+            with self.put_tasks_lock:
+                for key in keys:
+                    self.put_callbacks.pop(key, None)
+                    if key in self.put_tasks:
+                        del self.put_tasks[key]
+
+    def __str__(self):
+        return self.__class__.__name__
+
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
-        with self._put_tasks_lock:
-            if key in self._put_tasks:
+        with self.put_tasks_lock:
+            if key in self.put_tasks:
                 return True
-        with self._entries_lock:
-            metadata = self._entries.get(key)
-            if metadata is None:
+        with self.dict_lock:
+            if key not in self.dict:
                 return False
             if pin:
-                metadata.pin()
-                self._keys_in_request.append(key)
+                self.dict[key].pin()
+                self.keys_in_request.append(key)
             return True
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
-        with self._put_tasks_lock:
-            return key in self._put_tasks
+        return False
 
-    def _buffer_descriptor(self, memory_obj: MemoryObj) -> tuple[int, int]:
-        offset = memory_obj.raw_data.data_ptr() - self.staging_base_ptr
-        size = memory_obj.get_physical_size()
-        if offset < 0 or offset + size > self.staging_size:
-            raise ValueError(
-                "CascadeKV memory object is outside the registered staging range"
-            )
-        if offset % self.io_unit_size != 0 or size % self.io_unit_size != 0:
-            raise ValueError(
-                "CascadeKV memory object must be I/O-unit aligned: "
-                f"offset={offset}, size={size}, io_unit={self.io_unit_size}"
-            )
-        if size > self.blob_size:
-            raise ValueError(
-                "CascadeKV memory object size "
-                f"{size} exceeds blob size {self.blob_size}"
-            )
-        return offset, size
+    def pin(self, key: CacheEngineKey) -> bool:
+        with self.dict_lock:
+            if key in self.dict:
+                self.dict[key].pin()
+                return True
+            return False
 
-    @staticmethod
-    def _ensure_cuda_transfer_complete(
-        gpu_connector: Any,
-        direction: str,
-        event: Any = None,
-    ) -> None:
-        """Prove stream completion before a staging slot can be recycled."""
-        errors: list[BaseException] = []
-        if event is not None:
-            try:
-                event.synchronize()
-                return
-            except BaseException as error:
-                errors.append(error)
-        if gpu_connector is not None:
-            try:
-                recovery_event = gpu_connector.record_transfer_event(direction)
-                recovery_event.synchronize()
-                return
-            except BaseException as error:
-                errors.append(error)
-        try:
-            torch.cuda.synchronize()
-            return
-        except BaseException as error:
-            errors.append(error)
-        raise RuntimeError(
-            "could not establish CUDA transfer completion for CascadeKV slot reuse"
-        ) from errors[0]
+    def unpin(self, key: CacheEngineKey) -> bool:
+        with self.dict_lock:
+            if key in self.dict:
+                self.dict[key].unpin()
+                return True
+            return False
 
-    def _quarantine_cuda_objects(
-        self,
-        memory_objs: Sequence[MemoryObj],
-        error: BaseException,
-    ) -> None:
-        """Retain unsafe staging slots and reject future backend operations."""
-        self._quarantined_objects.extend(memory_objs)
-        self._poisoned_error = error
-
-    def _quarantine_xds_object(
-        self,
-        request_id: int,
-        memory_obj: MemoryObj,
-        error: BaseException,
-    ) -> None:
-        """Retain a staging slot until its exact late xDS completion is drained."""
-        self._quarantined_objects.append(memory_obj)
-        self._quarantined_xds_requests[request_id] = memory_obj
-        self._poisoned_error = error
-
-    def drain_quarantined_xds_transfers(
-        self,
-        timeout: float = DEFAULT_IO_TIMEOUT_SECS,
-    ) -> None:
-        """Drain exact late xDS completions and make quarantined slots reusable."""
-        with self._active_operation(allow_poison=True):
-            pending = dict(self._quarantined_xds_requests)
-            while pending:
-                completion = self.client.wait_any_result(timeout=timeout)
-                request_id = int(completion.request_id)
-                memory_obj = pending.pop(request_id, None)
-                if memory_obj is None:
-                    raise RuntimeError(
-                        "xDS returned an unknown completion while draining "
-                        f"quarantined CascadeKV request {request_id}"
-                    )
-                memory_obj.ref_count_down()
-                self._quarantined_xds_requests.pop(request_id, None)
-                self._quarantined_objects = [
-                    item for item in self._quarantined_objects if item is not memory_obj
-                ]
-            if not self._quarantined_objects:
-                self._poisoned_error = None
-
-    def _wait_for_completion(
-        self,
-        request_id: int,
-        expected_bytes: int,
-        operation: str,
-    ) -> None:
-        completion = self.client.wait_any_result(timeout=DEFAULT_IO_TIMEOUT_SECS)
-        if int(completion.request_id) != request_id:
-            raise RuntimeError(
-                "unexpected xDS completion request id: "
-                f"expected={request_id}, got={completion.request_id}"
-            )
-        self._validate_io_result(completion, expected_bytes, operation)
-
-    @staticmethod
-    def _validate_io_result(
-        completion: Any,
-        expected_bytes: int,
-        operation: str,
-    ) -> None:
-        if int(completion.status) != 0:
-            raise RuntimeError(
-                f"xDS {operation} failed with status={completion.status}, "
-                f"error_code={completion.error_code}"
-            )
-        if int(completion.completed_bytes) != expected_bytes:
-            raise RuntimeError(
-                f"short xDS {operation}: expected {expected_bytes} bytes, "
-                f"completed {completion.completed_bytes}"
-            )
-
-    def _write_one(self, key: CacheEngineKey, memory_obj: MemoryObj) -> bool:
-        with self._entries_lock:
-            if key in self._entries:
+    def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
+        del force
+        with self.dict_lock:
+            if key not in self.dict:
                 return False
-
-        blob_handle = int(self.client.get_blob(timeout=DEFAULT_BLOB_TIMEOUT_SECS))
-        if blob_handle <= 0:
-            raise RuntimeError(f"xDS returned an invalid blob handle {blob_handle}")
-
-        try:
-            buffer_offset, size = self._buffer_descriptor(memory_obj)
-            with self._io_lock:
-                request_id = int(
-                    self.client.submit_write(
-                        blob_handle,
-                        self.staging_buffer_ref,
-                        buffer_offset,
-                        0,
-                        size,
-                    )
-                )
-                self._wait_for_completion(request_id, size, "write")
-
-            metadata = XDSBlobMetadata(
-                blob_handle=blob_handle,
-                size=size,
-                shapes=memory_obj.get_shapes(),
-                dtypes=memory_obj.get_dtypes(),
-                fmt=memory_obj.get_memory_format(),
+            metadata = self.dict.pop(key)
+            blob_handle = metadata.blob_handle
+            size = metadata.size
+        with self.usage_lock:
+            self.usage -= size
+            self.stats_monitor.update_local_storage_usage(self.usage)
+        self.completion_pump.call_client(lambda: self.client.release_blob(blob_handle))
+        if self.lmcache_worker is not None:
+            self.lmcache_worker.put_msg(
+                KVEvictMsg(self.instance_id, key.worker_id, key.chunk_hash, "xds")
             )
-            with self._entries_lock:
-                self._entries[key] = metadata
-            return True
-        except Exception:
-            self.client.release_blob(blob_handle)
-            raise
+        return True
 
-    def _write_staging_lease(self, lease: StagingLease) -> tuple[int, ...]:
-        transfer_event = getattr(lease, "transfer_event", None)
-        if transfer_event is not None:
-            try:
-                transfer_event.synchronize()
-            except BaseException as transfer_error:
-                try:
-                    self._ensure_cuda_transfer_complete(
-                        getattr(lease, "gpu_connector", None),
-                        "store",
-                        transfer_event,
-                    )
-                except BaseException as recovery_error:
-                    lease.cuda_quarantined = True
-                    self._quarantine_cuda_objects(lease.objects, recovery_error)
-                    raise recovery_error from transfer_error
-                raise
-
-        items: list[dict[str, Any]] = []
-        blob_handles: list[int] = []
-        try:
-            for memory_obj, expected_size in zip(
-                lease.objects,
-                lease.sizes,
-                strict=True,
-            ):
-                blob_handle = int(
-                    self.client.get_blob(timeout=DEFAULT_BLOB_TIMEOUT_SECS)
+    def insert_key(
+        self, key: CacheEngineKey, memory_obj: MemoryObj, blob_handle: int
+    ) -> None:
+        size = self._get_storage_size(memory_obj)
+        shapes = memory_obj.get_shapes()
+        dtypes = memory_obj.get_dtypes()
+        fmt = memory_obj.metadata.fmt
+        has_stored = False
+        delete_size = 0
+        with self.dict_lock:
+            if key in self.dict:
+                old_metadata = self.dict.pop(key)
+                self.completion_pump.call_client(
+                    lambda: self.client.release_blob(old_metadata.blob_handle)
                 )
-                if blob_handle <= 0:
-                    raise RuntimeError(
-                        f"xDS returned an invalid blob handle {blob_handle}"
-                    )
-                blob_handles.append(blob_handle)
-                offset, size = self._buffer_descriptor(memory_obj)
-                if size != expected_size:
-                    raise RuntimeError(
-                        "CascadeKV staging size changed after write admission"
-                    )
-                items.append(
-                    {
-                        "blob_handle": blob_handle,
-                        "offset": offset,
-                        "size": size,
-                    }
-                )
-
-            pump = XDSReadRingPump(
-                queue_depth=self.config.cascadekv_io_queue_depth,
-                submit=lambda item: int(
-                    self.client.submit_write(
-                        item["blob_handle"],
-                        self.staging_buffer_ref,
-                        item["offset"],
-                        0,
-                        item["size"],
-                    )
-                ),
-                wait_any=self.client.wait_any_result,
-                timeout=DEFAULT_IO_TIMEOUT_SECS,
+                delete_size = old_metadata.size
+                has_stored = True
+            self.dict[key] = XDSBlobMetadata(
+                blob_handle,
+                size,
+                shapes,
+                dtypes,
+                fmt,
             )
-            for item in items:
-                pump.put(item)
-            pump.close_input()
-            with self._io_lock:
-                pump.run()
 
-            failures: list[str] = []
-            first_error: Optional[BaseException] = None
-            for _ in items:
-                ring_completion = pump.get_completion()
-                if ring_completion.error is not None:
-                    if first_error is None:
-                        first_error = ring_completion.error
-                    continue
-                item = ring_completion.item
-                completion = ring_completion.completion
-                if (
-                    int(completion.status) != 0
-                    or int(completion.completed_bytes) != item["size"]
-                ):
-                    failures.append(
-                        f"request {completion.request_id} "
-                        f"status={completion.status} "
-                        f"completed={completion.completed_bytes} "
-                        f"expected={item['size']}"
-                    )
-            if first_error is None and pump.error is not None:
-                first_error = pump.error
-            if first_error is not None:
-                raise first_error
-            if failures:
-                if all("status=0" in failure for failure in failures):
-                    raise RuntimeError("short xDS write: " + "; ".join(failures))
-                raise RuntimeError(
-                    "CascadeKV async write failed: " + "; ".join(failures)
-                )
-            outcome = tuple(blob_handles)
-            lease.io_outcome = outcome
-            return outcome
-        except BaseException:
-            for blob_handle in blob_handles:
-                self.client.release_blob(blob_handle)
-            raise
+        if has_stored:
+            with self.usage_lock:
+                self.usage -= delete_size
+            logger.warning(f"Key {key} already exists in xDS backend, overwritten.")
 
-    @staticmethod
-    def _release_lease_objects(lease: StagingLease) -> None:
-        if getattr(lease, "resources_released", False) or getattr(
-            lease, "cuda_quarantined", False
-        ):
-            return
-        for memory_obj in lease.objects:
-            memory_obj.ref_count_down()
-        lease.resources_released = True
+        if self.lmcache_worker is not None and not has_stored:
+            self.lmcache_worker.put_msg(
+                KVAdmitMsg(self.instance_id, key.worker_id, key.chunk_hash, "xds")
+            )
 
-    def _finish_lease_futures(
-        self,
-        lease: StagingLease,
-        error: Optional[BaseException] = None,
-    ) -> None:
-        futures = tuple(getattr(lease, "futures", ()))
-        callback = getattr(lease, "on_complete_callback", None)
-        for key, future in zip(lease.keys, futures, strict=False):
-            if error is not None:
-                if not future.done():
-                    future.set_exception(error)
-                continue
-            if callback is not None:
-                try:
-                    callback(key)
-                except Exception:
-                    logger.exception("CascadeKV put completion callback failed")
-            if not future.done():
-                future.set_result(True)
+    def touch_cache(self):
+        with self.dict_lock:
+            for key in reversed(self.keys_in_request):
+                if key in self.dict:
+                    self.evictor.update_on_get(key, self.dict)
+            self.keys_in_request = []
 
-    def _submit_async_lease(self, lease: StagingLease) -> tuple[int, ...]:
-        return self._write_staging_lease(lease)
-
-    def _commit_async_lease(self, lease: StagingLease, outcome: Any) -> None:
-        blob_handles = tuple(outcome)
-        if len(blob_handles) != len(lease.keys):
-            raise RuntimeError("CascadeKV write outcome has the wrong handle count")
-        with self._entries_lock:
-            for key, memory_obj, size, blob_handle in zip(
-                lease.keys,
-                lease.objects,
-                lease.sizes,
-                blob_handles,
-                strict=True,
-            ):
-                self._entries[key] = XDSBlobMetadata(
-                    blob_handle=blob_handle,
-                    size=size,
-                    shapes=memory_obj.get_shapes(),
-                    dtypes=memory_obj.get_dtypes(),
-                    fmt=memory_obj.get_memory_format(),
-                )
-        with self._put_tasks_lock:
-            for key in lease.keys:
-                self._put_tasks.discard(key)
-                self._pending_objects.pop(key, None)
-                self._pending_transfer_events.pop(key, None)
-        self._finish_lease_futures(lease)
-        self._release_lease_objects(lease)
-
-    def _rollback_async_lease(
-        self,
-        lease: StagingLease,
-        error: BaseException,
-    ) -> None:
-        blob_handles = tuple(getattr(lease, "io_outcome", ()) or ())
-        with self._entries_lock:
-            for key, blob_handle in zip(lease.keys, blob_handles, strict=False):
-                metadata = self._entries.get(key)
-                if metadata is not None and metadata.blob_handle == blob_handle:
-                    self._entries.pop(key)
-        for blob_handle in blob_handles:
-            self.client.release_blob(blob_handle)
-        with self._put_tasks_lock:
-            for key in lease.keys:
-                self._put_tasks.discard(key)
-                self._pending_objects.pop(key, None)
-                self._pending_transfer_events.pop(key, None)
-        self._finish_lease_futures(lease, error=error)
-        self._release_lease_objects(lease)
-        logger.error(
-            "[CascadeKV Async Rollback] chunks=%d bytes=%d error=%s",
-            len(lease.keys),
-            lease.credited_bytes,
-            error,
-        )
-
-    @_guard_operation
-    def flush_async_writes(
-        self,
-        timeout: Optional[float] = None,
-    ) -> SchedulerSnapshot:
-        """Wait until all admitted CascadeKV writes are durable."""
-        if self._write_scheduler is None:
-            raise RuntimeError("CascadeKV asynchronous writes are not enabled")
-        return self._write_scheduler.drain(timeout)
-
-    @_guard_operation
     def batched_submit_put_task(
         self,
         keys: Sequence[CacheEngineKey],
-        objs: list[MemoryObj],
+        memory_objs: List[MemoryObj],
         transfer_spec: Any = None,
-        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
-    ) -> Optional[list[Future]]:
+        on_complete_callback: Any = None,
+    ) -> None:
         del transfer_spec
-        if len(keys) != len(objs):
-            raise ValueError("keys and objs must have the same length")
+        if not keys:
+            return
+        keys_to_process, objs_to_process = [], []
+        with self.put_tasks_lock, self.dict_lock:
+            for key, memory_obj in zip(keys, memory_objs, strict=False):
+                if key not in self.put_tasks and key not in self.dict:
+                    keys_to_process.append(key)
+                    objs_to_process.append(memory_obj)
+        if not keys_to_process:
+            return
 
-        futures: list[Future] = [Future() for _ in keys]
-        task_infos: list[tuple[int, CacheEngineKey, MemoryObj]] = []
-        seen: set[CacheEngineKey] = set()
-        with self._put_tasks_lock, self._entries_lock:
-            for index, (key, memory_obj) in enumerate(zip(keys, objs, strict=True)):
-                if key in seen or key in self._put_tasks or key in self._entries:
-                    futures[index].set_result(False)
-                    continue
-                seen.add(key)
-                self._put_tasks.add(key)
-                task_infos.append((index, key, memory_obj))
-
-        window_size = min(
-            self.write_slot_count,
-            int(self.config.cascadekv_write_window_size),
+        total_storage_size = sum(
+            self._get_storage_size(mem_obj) for mem_obj in objs_to_process
         )
-        for window_start in range(0, len(task_infos), window_size):
-            window = task_infos[window_start : window_start + window_size]
-            indexes = tuple(item[0] for item in window)
-            lease_keys = tuple(item[1] for item in window)
-            objects = tuple(item[2] for item in window)
-            sizes = tuple(memory_obj.get_physical_size() for memory_obj in objects)
-            credited_bytes = sum(sizes)
-            credits_acquired = False
-            references_added = False
-            pending_installed = False
-            try:
-                if self._write_scheduler is not None:
-                    self._write_scheduler.acquire_credits(
-                        credited_bytes,
-                        timeout=float(self.config.blocking_timeout_secs),
-                    )
-                    credits_acquired = True
-                for memory_obj in objects:
+        with self.dict_lock:
+            evict_keys, put_status = self.evictor.update_on_put(
+                self.dict, total_storage_size
+            )
+
+        if put_status == PutStatus.ILLEGAL:
+            logger.warning(
+                f"Batch write failed: total size {total_storage_size} is too large for the cache."
+            )
+            return
+
+        if evict_keys:
+            for evict_key in evict_keys:
+                self.remove(evict_key)
+            if self.lookup_server is not None:
+                self.lookup_server.batched_remove(evict_keys)
+
+        if self.read_bios:
+            with self.flush_condition:
+                if not self.write_buffer:
+                    self.oldest_item_timestamp = time.monotonic()
+
+                for key, memory_obj in zip(
+                    keys_to_process, objs_to_process, strict=False
+                ):
                     memory_obj.ref_count_up()
-                references_added = True
-                lease = StagingLease(
-                    keys=lease_keys,
-                    indexes=indexes,
-                    objects=objects,
-                    sizes=sizes,
-                    credited_bytes=credited_bytes,
-                )
-                lease.futures = tuple(futures[index] for index in indexes)
-                lease.on_complete_callback = on_complete_callback
-                lease.resources_released = False
-                lease.io_outcome = None
-                lease.transition(LeaseState.PENDING)
-                with self._put_tasks_lock:
-                    for key, memory_obj in zip(lease_keys, objects, strict=True):
-                        self._pending_objects[key] = memory_obj
-                        self._pending_transfer_events.pop(key, None)
-                pending_installed = True
-                if self._write_scheduler is not None:
-                    self._write_scheduler.enqueue(lease)
-                else:
-                    lease.transition(LeaseState.INFLIGHT)
-                    outcome = self._write_staging_lease(lease)
-                    self._commit_async_lease(lease, outcome)
-                    lease.transition(LeaseState.COMMITTED)
-            except BaseException as exc:
-                if pending_installed:
-                    with self._put_tasks_lock:
-                        for key in lease_keys:
-                            self._put_tasks.discard(key)
-                            self._pending_objects.pop(key, None)
-                            self._pending_transfer_events.pop(key, None)
-                if references_added:
-                    for memory_obj in objects:
-                        memory_obj.ref_count_down()
-                if credits_acquired and self._write_scheduler is not None:
-                    self._write_scheduler.release_credits(credited_bytes)
-                for index in indexes:
-                    if not futures[index].done():
-                        futures[index].set_exception(exc)
-        return futures
+                    self.write_buffer.append((key, memory_obj))
+                    self.put_tasks[key] = memory_obj
+                    if on_complete_callback is not None:
+                        self.put_callbacks[key] = on_complete_callback
 
-    def _batched_submit_put_task_serial(
-        self,
-        keys: Sequence[CacheEngineKey],
-        objs: list[MemoryObj],
-        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
-    ) -> list[Future]:
-        """Preserve the pre-pipeline single-I/O path for subclass fallback."""
-        if len(keys) != len(objs):
-            raise ValueError("keys and objs must have the same length")
-        futures: list[Future] = []
-        for key, memory_obj in zip(keys, objs, strict=True):
-            future: Future = Future()
-            futures.append(future)
-            with self._put_tasks_lock, self._entries_lock:
-                if key in self._put_tasks or key in self._entries:
-                    future.set_result(False)
-                    continue
-                self._put_tasks.add(key)
-            try:
-                stored = self._write_one(key, memory_obj)
-                if stored and on_complete_callback is not None:
-                    try:
-                        on_complete_callback(key)
-                    except Exception:
-                        logger.exception("storage put completion callback failed")
-                future.set_result(stored)
-            except Exception as error:
-                future.set_exception(error)
-            finally:
-                with self._put_tasks_lock:
-                    self._put_tasks.discard(key)
-        return futures
+                self.last_write_timestamp = time.monotonic()
 
-    @_guard_async_operation
+                if len(self.write_buffer) >= self.write_window_size:
+                    self.flush_condition.notify()
+        else:
+            tasks_to_write_now = []
+            with self.put_tasks_lock:
+                for key, memory_obj in zip(
+                    keys_to_process, objs_to_process, strict=False
+                ):
+                    memory_obj.ref_count_up()
+                    tasks_to_write_now.append((key, memory_obj))
+                    self.put_tasks[key] = memory_obj
+                    if on_complete_callback is not None:
+                        self.put_callbacks[key] = on_complete_callback
+
+            self._perform_batch_write(tasks_to_write_now)
+
     async def async_batched_submit_put_task(
         self,
         keys: Sequence[CacheEngineKey],
-        objs: list[MemoryObj],
+        memory_objs: List[MemoryObj],
         transfer_spec: Any = None,
-        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
+        on_complete_callback: Any = None,
     ) -> None:
-        futures = await asyncio.to_thread(
+        await asyncio.to_thread(
             self.batched_submit_put_task,
             keys,
-            objs,
+            memory_objs,
             transfer_spec,
             on_complete_callback,
         )
-        await asyncio.gather(*(asyncio.wrap_future(future) for future in futures or []))
 
-    @_guard_operation
-    def batched_put_from_gpu_blocking(
-        self,
-        keys: Sequence[CacheEngineKey],
-        starts: list[int],
-        ends: list[int],
-        gpu_connector: Any,
-        **kwargs: Any,
-    ) -> Optional[BackendWriteSubmissionResult]:
-        """Gather a logical batch into bounded CPU slots for async SSD writes."""
-        if not self.config.cascadekv_overlap or self._write_scheduler is None:
-            return None
-        if not (len(keys) == len(starts) == len(ends)):
-            raise ValueError("CascadeKV streaming write inputs must have equal lengths")
+    def batched_get_blocking(
+        self, keys: List[CacheEngineKey]
+    ) -> List[Optional[MemoryObj]]:
+        if not self.concurrency:
+            mem_objs = []
+            for key in keys:
+                mem_objs.append(self.get_blocking(key))
+            return mem_objs
+        else:
+            if not keys:
+                return []
+            results: Dict[CacheEngineKey, Optional[MemoryObj]] = {
+                key: None for key in keys
+            }
 
-        scheduler = self._write_scheduler
-        scheduler.check_healthy()
-        accepted = [False] * len(keys)
-        accepted_bytes = 0
-        staging_seconds = 0.0
-        backpressure_seconds = 0.0
+            remaining_keys = list(keys)
 
-        with self._async_admission_lock:
-            task_infos: list[dict[str, Any]] = []
-            seen: set[CacheEngineKey] = set()
-            with self._put_tasks_lock, self._entries_lock:
-                for index, (key, start, end) in enumerate(
-                    zip(keys, starts, ends, strict=True)
-                ):
-                    if key in seen or key in self._put_tasks or key in self._entries:
-                        continue
-                    seen.add(key)
-                    self._put_tasks.add(key)
-                    task_infos.append(
-                        {"index": index, "key": key, "start": start, "end": end}
-                    )
+            keys_after_put_tasks_check = []
+            with self.put_tasks_lock:
+                for key in remaining_keys:
+                    if key in self.put_tasks:
+                        mem_obj = self.put_tasks[key]
+                        mem_obj.ref_count_up()
+                        results[key] = mem_obj
+                    else:
+                        keys_after_put_tasks_check.append(key)
 
-            reserved_keys = {info["key"] for info in task_infos}
+            if not keys_after_put_tasks_check:
+                return [results.get(key) for key in keys]
 
-            lease_size = min(
-                self.write_slot_count,
-                int(self.config.cascadekv_write_window_size),
-            )
-            for lease_start in range(0, len(task_infos), lease_size):
-                lease_infos = task_infos[lease_start : lease_start + lease_size]
-                reserved_bytes = len(lease_infos) * self.blob_size
-                objects: list[MemoryObj] = []
-                credits_acquired = False
-                pending_installed = False
-                enqueued = False
-                gpu_transfer_started = False
-                event = None
-                staging_start = time.perf_counter()
-                timeout_seconds = float(self.config.blocking_timeout_secs)
-                admission_deadline = time.monotonic() + timeout_seconds
-                try:
-                    backpressure_seconds += scheduler.acquire_credits(
-                        reserved_bytes,
-                        timeout=timeout_seconds,
-                    )
-                    credits_acquired = True
-                    for info in lease_infos:
-                        slot_wait_started = time.monotonic()
-                        while True:
-                            if (
-                                self.write_memory_allocator.address_manager.get_free_size()
-                                >= self.blob_size
-                            ):
-                                memory_obj = self.write_memory_allocator.allocate(
-                                    self.metadata.get_shapes(
-                                        info["end"] - info["start"]
-                                    ),
-                                    self.metadata.get_dtypes(),
-                                )
+            keys_after_prefetch_check = []
+            prefetch_futures_to_wait: List[Tuple[CacheEngineKey, Future]] = []
+            with self.prefetch_lock:
+                for key in keys_after_put_tasks_check:
+                    if key in self.prefetch_tasks:
+                        prefetch_futures_to_wait.append((key, self.prefetch_tasks[key]))
+                    else:
+                        keys_after_prefetch_check.append(key)
+
+            if prefetch_futures_to_wait:
+                for key, future in prefetch_futures_to_wait:
+                    try:
+                        memory_obj = future.result(timeout=self.io_timeout_secs)
+                        if memory_obj:
+                            if self.local_cpu_backend.contains(key, pin=True):
+                                results[key] = memory_obj
                             else:
-                                memory_obj = None
-                            if memory_obj is not None:
-                                break
-                            remaining = admission_deadline - time.monotonic()
-                            if remaining <= 0:
-                                raise TimeoutError(
-                                    "timed out waiting for a CascadeKV write slot"
+                                logger.warning(
+                                    f"Prefetched obj {key} was evicted from CPU. Re-reading."
                                 )
-                            time.sleep(min(0.001, remaining))
-                        backpressure_seconds += time.monotonic() - slot_wait_started
-                        objects.append(memory_obj)
-                    sizes = tuple(obj.get_physical_size() for obj in objects)
-                    gpu_transfer_started = True
-                    gpu_connector.batched_from_gpu(
-                        objects,
-                        [info["start"] for info in lease_infos],
-                        [info["end"] for info in lease_infos],
-                        **kwargs,
-                    )
-                    event = gpu_connector.record_transfer_event("store")
-                    lease = StagingLease(
-                        keys=tuple(info["key"] for info in lease_infos),
-                        indexes=tuple(info["index"] for info in lease_infos),
-                        objects=tuple(objects),
-                        sizes=sizes,
-                        credited_bytes=sum(sizes),
-                        reserved_bytes=reserved_bytes,
-                    )
-                    lease.futures = ()
-                    lease.on_complete_callback = None
-                    lease.transfer_event = event
-                    lease.gpu_connector = gpu_connector
-                    lease.cuda_quarantined = False
-                    lease.resources_released = False
-                    lease.io_outcome = None
-                    lease.transition(LeaseState.PENDING)
-                    with self._put_tasks_lock:
-                        for key, memory_obj in zip(
-                            lease.keys,
-                            lease.objects,
-                            strict=True,
-                        ):
-                            self._pending_objects[key] = memory_obj
-                            self._pending_transfer_events[key] = event
-                    pending_installed = True
-                    scheduler.enqueue(lease)
-                    enqueued = True
-                    reserved_keys.difference_update(lease.keys)
-                    for index in lease.indexes:
-                        accepted[index] = True
-                    accepted_bytes += sum(sizes)
-                    staging_seconds += time.perf_counter() - staging_start
-                except BaseException as transfer_error:
-                    recovery_error: Optional[BaseException] = None
-                    if gpu_transfer_started and not enqueued:
-                        try:
-                            self._ensure_cuda_transfer_complete(
-                                gpu_connector,
-                                "store",
-                                event,
+                                keys_after_prefetch_check.append(key)
+                        else:
+                            logger.warning(
+                                f"Prefetch task for {key} returned None. Will attempt xDS read."
                             )
-                        except BaseException as error:
-                            recovery_error = error
-                            self._quarantine_cuda_objects(objects, error)
-                    if pending_installed:
-                        with self._put_tasks_lock:
-                            for info in lease_infos:
-                                self._put_tasks.discard(info["key"])
-                                self._pending_objects.pop(info["key"], None)
-                                self._pending_transfer_events.pop(info["key"], None)
-                    if not enqueued and recovery_error is None:
-                        for memory_obj in objects:
-                            memory_obj.ref_count_down()
-                        if credits_acquired:
-                            scheduler.release_credits(reserved_bytes)
-                    with self._put_tasks_lock:
-                        for key in reserved_keys:
-                            self._put_tasks.discard(key)
-                    if recovery_error is not None:
-                        raise recovery_error from transfer_error
-                    raise
+                            keys_after_prefetch_check.append(key)
+                    except Exception as e:
+                        logger.error(
+                            f"Waiting for prefetch task for {key} failed: {e}. Will attempt xDS read.",
+                            exc_info=True,
+                        )
+                        keys_after_prefetch_check.append(key)
 
-        snapshot = scheduler.snapshot()
-        return BackendWriteSubmissionResult(
-            accepted=tuple(accepted),
-            accepted_bytes=accepted_bytes,
-            durable=False,
-            staging_seconds=staging_seconds,
-            backpressure_seconds=backpressure_seconds,
-            queue_depth=snapshot.queued_leases,
-            outstanding_bytes=snapshot.outstanding_bytes,
-        )
+            if not keys_after_prefetch_check:
+                return [results.get(key) for key in keys]
+            remaining_keys = keys_after_prefetch_check
 
-    def _make_transfer_result(
-        self,
-        completed: Sequence[bool],
-        *,
-        requested_bytes: int,
-        completed_bytes: int,
-        peak_staging_bytes: int,
-        storage_seconds: float,
-        gpu_seconds: float,
-        overlap_seconds: float,
-        slot_wait_seconds: float,
-        short_io_chunks: int,
-        peak_inflight_io: int,
-    ) -> BackendTransferResult:
-        return BackendTransferResult(
-            completed=tuple(completed),
-            requested_bytes=requested_bytes,
-            completed_bytes=completed_bytes,
-            device="cpu",
-            window_size=self.read_slot_count,
-            window_count=(len(completed) + self.read_slot_count - 1)
-            // self.read_slot_count,
-            peak_staging_bytes=peak_staging_bytes,
-            storage_seconds=storage_seconds,
-            gpu_seconds=gpu_seconds,
-            overlap_seconds=overlap_seconds,
-            bank_wait_seconds=slot_wait_seconds,
-            short_io_chunks=short_io_chunks,
-            timeout_chunks=0,
-            logical_chunk_count=len(completed),
-            read_slot_count=self.read_slot_count,
-            write_slot_count=self.write_slot_count,
-            io_queue_depth=self.config.cascadekv_io_queue_depth,
-            peak_inflight_io=peak_inflight_io,
-            slot_wait_seconds=slot_wait_seconds,
-        )
+            xds_tasks_info = []
+            if remaining_keys:
+                with self.dict_lock:
+                    for key in remaining_keys:
+                        if key in self.dict:
+                            self.evictor.update_on_get(key, self.dict)
+                            metadata = self.dict[key]
+                            xds_tasks_info.append(
+                                {
+                                    "key": key,
+                                    "blob_handle": metadata.blob_handle,
+                                    "storage_size": metadata.size,
+                                    "dtype": metadata.dtypes,
+                                    "shape": metadata.shapes,
+                                    "fmt": metadata.fmt,
+                                }
+                            )
 
-    @_guard_operation
+            if xds_tasks_info:
+                start_time = time.time()
+                xds_results, total_read_bytes = self._perform_batched_xds_read(
+                    xds_tasks_info
+                )
+                end_time = time.time()
+                read_time = end_time - start_time
+                if total_read_bytes > 0:
+                    with self.stats_lock:
+                        self.cumulative_read_bytes += total_read_bytes
+                        self.cumulative_read_time += read_time
+                        logger.info(
+                            f"current average read bandwidth: "
+                            f"{(self.cumulative_read_bytes / self.cumulative_read_time) / (1024 * 1024):.2f} MB/s"
+                        )
+
+                for task_info, result_obj in zip(
+                    xds_tasks_info, xds_results, strict=False
+                ):
+                    results[task_info["key"]] = result_obj
+
+            return [results.get(key) for key in keys]
+
     def batched_get_to_gpu_blocking(
         self,
-        keys: list[CacheEngineKey],
-        starts: list[int],
-        ends: list[int],
+        keys: List[CacheEngineKey],
+        starts: List[int],
+        ends: List[int],
         gpu_connector: Any,
-        **kwargs: Any,
-    ) -> Optional[BackendTransferResult]:
-        """Overlap bounded SSD reads with CPU-to-GPU copies by completion."""
-        if not self.config.cascadekv_overlap:
+        **kwargs,
+    ) -> Optional[List[Optional[MemoryObj]]]:
+        if not self.enable_chunked_gpu_overlap or len(keys) <= 1:
             return None
-        if not (len(keys) == len(starts) == len(ends)):
-            raise ValueError("CascadeKV streaming read inputs must have equal lengths")
 
-        wall_start = time.perf_counter()
-        completed = [False] * len(keys)
-        pending_infos: list[dict[str, Any]] = []
-        pending_indexes: set[int] = set()
-        with self._put_tasks_lock:
-            for index, (key, start, end) in enumerate(
-                zip(keys, starts, ends, strict=True)
-            ):
-                memory_obj = self._pending_objects.get(key)
-                if memory_obj is None:
-                    continue
-                memory_obj.ref_count_up()
-                transfer_event = self._pending_transfer_events.get(key)
-                pending_indexes.add(index)
-                pending_infos.append(
-                    {
-                        "index": index,
-                        "memory_obj": memory_obj,
-                        "start": start,
-                        "end": end,
-                        "size": memory_obj.get_physical_size(),
-                        "transfer_event": transfer_event,
-                    }
-                )
-
-        task_infos: list[dict[str, Any]] = []
-        for index, (key, start, end) in enumerate(zip(keys, starts, ends, strict=True)):
-            if index in pending_indexes:
-                continue
-            with self._entries_lock:
-                blob_metadata = self._entries.get(key)
-                if blob_metadata is None:
-                    continue
-                blob_metadata.pin()
-                self._entries.move_to_end(key)
-            task_infos.append(
-                {
-                    "index": index,
-                    "metadata": blob_metadata,
-                    "start": start,
-                    "end": end,
-                }
+        if len(keys) != len(starts) or len(keys) != len(ends):
+            raise ValueError(
+                "xDS batched_get_to_gpu_blocking requires keys, starts, and ends "
+                "to have the same length."
             )
 
-        requested_bytes = sum(info["size"] for info in pending_infos) + sum(
-            info["metadata"].size for info in task_infos
-        )
-        completed_bytes = 0
-        storage_seconds = 0.0
-        gpu_seconds = 0.0
-        slot_wait_seconds = 0.0
-        try:
-            for info in pending_infos:
-                gpu_start = time.perf_counter()
-                load_started = False
-                load_event = None
-                try:
-                    transfer_event = info["transfer_event"]
-                    if transfer_event is not None:
-                        try:
-                            transfer_event.synchronize()
-                        except BaseException as transfer_error:
-                            try:
-                                self._ensure_cuda_transfer_complete(
-                                    gpu_connector,
-                                    "store",
-                                    transfer_event,
-                                )
-                            except BaseException as recovery_error:
-                                info["cuda_quarantined"] = True
-                                self._quarantine_cuda_objects(
-                                    [info["memory_obj"]],
-                                    recovery_error,
-                                )
-                                raise recovery_error from transfer_error
-                            raise
-                    load_started = True
-                    gpu_connector.to_gpu(
-                        info["memory_obj"],
-                        info["start"],
-                        info["end"],
-                        **kwargs,
-                    )
-                    load_event = gpu_connector.record_transfer_event("load")
-                    wait_start = time.perf_counter()
-                    load_event.synchronize()
-                    slot_wait_seconds += time.perf_counter() - wait_start
-                    gpu_seconds += time.perf_counter() - gpu_start
-                    completed[info["index"]] = True
-                    completed_bytes += info["size"]
-                except BaseException as transfer_error:
-                    if load_started:
-                        try:
-                            self._ensure_cuda_transfer_complete(
-                                gpu_connector,
-                                "load",
-                                load_event,
-                            )
-                        except BaseException as recovery_error:
-                            info["cuda_quarantined"] = True
-                            self._quarantine_cuda_objects(
-                                [info["memory_obj"]],
-                                recovery_error,
-                            )
-                            raise recovery_error from transfer_error
-                    raise
-        except BaseException:
-            for info in task_infos:
-                with self._entries_lock:
-                    info["metadata"].unpin()
-            raise
-        finally:
-            for info in pending_infos:
-                if not info.get("cuda_quarantined", False):
-                    info["memory_obj"].ref_count_down()
+        results: List[Optional[MemoryObj]] = [None] * len(keys)
+        remaining_indexes = list(range(len(keys)))
 
-        if not task_infos:
-            wall_seconds = time.perf_counter() - wall_start
-            return self._make_transfer_result(
-                completed,
-                requested_bytes=requested_bytes,
-                completed_bytes=completed_bytes,
-                peak_staging_bytes=0,
-                storage_seconds=storage_seconds,
-                gpu_seconds=gpu_seconds,
-                overlap_seconds=max(0.0, storage_seconds + gpu_seconds - wall_seconds),
-                slot_wait_seconds=slot_wait_seconds,
-                short_io_chunks=0,
-                peak_inflight_io=0,
-            )
+        indexes_after_put_tasks_check = []
+        with self.put_tasks_lock:
+            for idx in remaining_indexes:
+                key = keys[idx]
+                if key in self.put_tasks:
+                    memory_obj = self.put_tasks[key]
+                    memory_obj.ref_count_up()
+                    results[idx] = memory_obj
+                    gpu_connector.to_gpu(memory_obj, starts[idx], ends[idx], **kwargs)
+                else:
+                    indexes_after_put_tasks_check.append(idx)
 
-        pump = XDSReadRingPump(
-            queue_depth=self.config.cascadekv_io_queue_depth,
-            submit=lambda entry: int(
-                self.client.submit_read(
-                    entry["metadata"].blob_handle,
-                    self.staging_buffer_ref,
-                    entry["offset"],
-                    0,
-                    entry["size"],
-                )
-            ),
-            wait_any=self.client.wait_any_result,
-            timeout=DEFAULT_IO_TIMEOUT_SECS,
-        )
+        if not indexes_after_put_tasks_check:
+            return results
 
-        def run_pump() -> None:
-            with self._io_lock:
-                pump.run()
+        indexes_after_prefetch_check = []
+        prefetch_futures_to_wait: List[Tuple[int, Future]] = []
+        with self.prefetch_lock:
+            for idx in indexes_after_put_tasks_check:
+                key = keys[idx]
+                if key in self.prefetch_tasks:
+                    prefetch_futures_to_wait.append((idx, self.prefetch_tasks[key]))
+                else:
+                    indexes_after_prefetch_check.append(idx)
 
-        pump_thread = threading.Thread(target=run_pump, name="cascadekv-read-ring")
-        live_entries: dict[int, dict[str, Any]] = {}
-        next_task = 0
-        input_closed = False
-        peak_staging_bytes = 0
-        submitted_count = 0
-        short_io_chunks = 0
-
-        def release_entry(entry: dict[str, Any]) -> None:
-            if not entry.get("cuda_quarantined", False):
-                entry["memory_obj"].ref_count_down()
-            with self._entries_lock:
-                entry["metadata"].unpin()
-
-        def fill_free_slots() -> None:
-            nonlocal next_task, input_closed, peak_staging_bytes, submitted_count
-            while len(live_entries) < self.read_slot_count and next_task < len(
-                task_infos
-            ):
-                info = task_infos[next_task]
-                next_task += 1
-                memory_obj = self.read_memory_allocator.allocate(
-                    info["metadata"].shapes,
-                    info["metadata"].dtypes,
-                    info["metadata"].fmt,
-                )
-                if memory_obj is None:
-                    with self._entries_lock:
-                        info["metadata"].unpin()
-                    continue
-                try:
-                    offset, size = self._buffer_descriptor(memory_obj)
-                    if size != info["metadata"].size:
-                        raise RuntimeError(
-                            "CascadeKV allocation size does not match stored blob: "
-                            f"allocated={size}, stored={info['metadata'].size}"
-                        )
-                    entry = {
-                        **info,
-                        "memory_obj": memory_obj,
-                        "offset": offset,
-                        "size": size,
-                    }
-                    pump.put(entry)
-                except BaseException:
-                    memory_obj.ref_count_down()
-                    with self._entries_lock:
-                        info["metadata"].unpin()
-                    raise
-                live_entries[id(entry)] = entry
-                submitted_count += 1
-                peak_staging_bytes = max(
-                    peak_staging_bytes,
-                    sum(item["size"] for item in live_entries.values()),
-                )
-            if next_task == len(task_infos) and not input_closed:
-                pump.close_input()
-                input_closed = True
-
-        pump_thread.start()
-        try:
-            fill_free_slots()
-            while live_entries:
-                storage_start = time.perf_counter()
-                ring_completion = pump.get_completion()
-                storage_seconds += time.perf_counter() - storage_start
-                if ring_completion.error is not None:
-                    entry = ring_completion.item
-                    if entry is not None and not ring_completion.safe_to_reuse:
-                        entry["cuda_quarantined"] = True
-                        request_id = pump.unsafe_request_id(entry)
-                        assert request_id is not None
-                        self._quarantine_xds_object(
-                            request_id,
-                            entry["memory_obj"],
-                            ring_completion.error,
-                        )
-                    raise ring_completion.error
-                entry = ring_completion.item
-                live_entries.pop(id(entry))
-                try:
-                    completion = ring_completion.completion
-                    if (
-                        int(completion.status) == 0
-                        and int(completion.completed_bytes) == entry["size"]
-                    ):
-                        gpu_start = time.perf_counter()
-                        load_started = True
-                        load_event = None
-                        try:
-                            gpu_connector.to_gpu(
-                                entry["memory_obj"],
-                                entry["start"],
-                                entry["end"],
-                                **kwargs,
-                            )
-                            load_event = gpu_connector.record_transfer_event("load")
-                            wait_start = time.perf_counter()
-                            load_event.synchronize()
-                        except BaseException as transfer_error:
-                            if load_started:
-                                try:
-                                    self._ensure_cuda_transfer_complete(
-                                        gpu_connector,
-                                        "load",
-                                        load_event,
-                                    )
-                                except BaseException as recovery_error:
-                                    entry["cuda_quarantined"] = True
-                                    self._quarantine_cuda_objects(
-                                        [entry["memory_obj"]],
-                                        recovery_error,
-                                    )
-                                    raise recovery_error from transfer_error
-                            raise
-                        slot_wait_seconds += time.perf_counter() - wait_start
-                        gpu_seconds += time.perf_counter() - gpu_start
-                        completed[entry["index"]] = True
-                        completed_bytes += entry["size"]
-                    elif int(completion.status) == 0:
-                        short_io_chunks += 1
-                finally:
-                    release_entry(entry)
-                fill_free_slots()
-        finally:
-            if not input_closed:
-                pump.close_input()
-            pump_thread.join(timeout=DEFAULT_IO_TIMEOUT_SECS)
-            if pump_thread.is_alive():
-                timeout_error = TimeoutError("timed out stopping CascadeKV read ring")
-                for entry in live_entries.values():
-                    entry["cuda_quarantined"] = True
-                    self._quarantine_cuda_objects(
-                        [entry["memory_obj"]],
-                        timeout_error,
-                    )
-            else:
-                for entry in live_entries.values():
-                    if not entry.get("cuda_quarantined", False) and not (
-                        pump.is_safe_to_reuse(entry)
-                    ):
-                        entry["cuda_quarantined"] = True
-                        assert pump.error is not None
-                        request_id = pump.unsafe_request_id(entry)
-                        assert request_id is not None
-                        self._quarantine_xds_object(
-                            request_id,
-                            entry["memory_obj"],
-                            pump.error,
-                        )
-            for entry in live_entries.values():
-                release_entry(entry)
-            for info in task_infos[next_task:]:
-                with self._entries_lock:
-                    info["metadata"].unpin()
-        if pump_thread.is_alive():
-            raise TimeoutError("timed out stopping CascadeKV read ring")
-        if pump.error is not None:
-            raise pump.error
-
-        wall_seconds = time.perf_counter() - wall_start
-        return self._make_transfer_result(
-            completed,
-            requested_bytes=requested_bytes,
-            completed_bytes=completed_bytes,
-            peak_staging_bytes=peak_staging_bytes,
-            storage_seconds=storage_seconds,
-            gpu_seconds=gpu_seconds,
-            overlap_seconds=max(0.0, storage_seconds + gpu_seconds - wall_seconds),
-            slot_wait_seconds=slot_wait_seconds,
-            short_io_chunks=short_io_chunks,
-            peak_inflight_io=min(
-                int(self.config.cascadekv_io_queue_depth),
-                submitted_count,
-            ),
-        )
-
-    @_guard_operation
-    def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
-        with self._put_tasks_lock:
-            pending_obj = self._pending_objects.get(key)
-            if pending_obj is not None:
-                pending_obj.ref_count_up()
-                transfer_event = self._pending_transfer_events.get(key)
-            else:
-                transfer_event = None
-        if pending_obj is not None:
+        for idx, future in prefetch_futures_to_wait:
+            key = keys[idx]
             try:
-                if transfer_event is not None:
-                    try:
-                        transfer_event.synchronize()
-                    except BaseException as transfer_error:
-                        try:
-                            self._ensure_cuda_transfer_complete(
-                                None,
-                                "store",
-                                transfer_event,
-                            )
-                        except BaseException as recovery_error:
-                            self._quarantine_cuda_objects(
-                                [pending_obj],
-                                recovery_error,
-                            )
-                            raise recovery_error from transfer_error
-                        raise
-                return pending_obj
-            except BaseException:
-                if not any(item is pending_obj for item in self._quarantined_objects):
-                    pending_obj.ref_count_down()
-                raise
+                memory_obj = future.result(timeout=self.io_timeout_secs)
+                if memory_obj:
+                    if self.local_cpu_backend.contains(key, pin=True):
+                        results[idx] = memory_obj
+                        gpu_connector.to_gpu(
+                            memory_obj, starts[idx], ends[idx], **kwargs
+                        )
+                    else:
+                        logger.warning(
+                            f"Prefetched obj {key} was evicted from CPU. Re-reading."
+                        )
+                        indexes_after_prefetch_check.append(idx)
+                else:
+                    logger.warning(
+                        f"Prefetch task for {key} returned None. Will attempt xDS read."
+                    )
+                    indexes_after_prefetch_check.append(idx)
+            except Exception as e:
+                logger.error(
+                    f"Waiting for prefetch task for {key} failed: {e}. "
+                    "Will attempt xDS read.",
+                    exc_info=True,
+                )
+                indexes_after_prefetch_check.append(idx)
 
-        with self._entries_lock:
-            blob_metadata = self._entries.get(key)
-            if blob_metadata is None:
-                return None
-            blob_metadata.pin()
-            self._entries.move_to_end(key)
+        if not indexes_after_prefetch_check:
+            return results
 
-        memory_obj: Optional[MemoryObj] = None
+        xds_tasks_info = []
+        with self.dict_lock:
+            for idx in indexes_after_prefetch_check:
+                key = keys[idx]
+                if key not in self.dict:
+                    continue
+                self.evictor.update_on_get(key, self.dict)
+                metadata = self.dict[key]
+                xds_tasks_info.append(
+                    {
+                        "index": idx,
+                        "key": key,
+                        "blob_handle": metadata.blob_handle,
+                        "storage_size": metadata.size,
+                        "dtype": metadata.dtypes,
+                        "shape": metadata.shapes,
+                        "fmt": metadata.fmt,
+                        "start": starts[idx],
+                        "end": ends[idx],
+                    }
+                )
+
+        if not xds_tasks_info:
+            return results
+
+        start_time = time.time()
+        total_read_bytes = self._perform_batched_connector_overlap_xds_read(
+            xds_tasks_info,
+            results,
+            gpu_connector,
+            **kwargs,
+        )
+        read_time = time.time() - start_time
+        if total_read_bytes > 0:
+            with self.stats_lock:
+                self.cumulative_read_bytes += total_read_bytes
+                self.cumulative_read_time += read_time
+                logger.info(
+                    "current average read bandwidth: "
+                    f"{(self.cumulative_read_bytes / self.cumulative_read_time) / (1024 * 1024):.2f} MB/s"
+                )
+
+        return results
+
+    def _perform_batched_connector_overlap_xds_read(
+        self,
+        xds_tasks_info: List[Dict[str, Any]],
+        results: List[Optional[MemoryObj]],
+        gpu_connector: Any,
+        **kwargs,
+    ) -> int:
+        if not xds_tasks_info:
+            return 0
+
+        group = self.completion_pump.create_group()
+        io_sizes: List[int] = []
+        total_request_bytes = 0
+        completed_indexes = set()
+        io_start = time.perf_counter()
+
         try:
-            read_allocator = getattr(
-                self,
-                "read_memory_allocator",
-                self.memory_allocator,
+            for submit_idx, task_info in enumerate(xds_tasks_info):
+                storage_size = task_info["storage_size"]
+                memory_obj = self._allocate_host_memory_obj(
+                    task_info["shape"],
+                    task_info["dtype"],
+                    task_info["fmt"],
+                    storage_size,
+                )
+                if memory_obj is None:
+                    logger.warning(
+                        "Host allocation failed during connector-overlap xDS read."
+                    )
+                    continue
+
+                results[task_info["index"]] = memory_obj
+                io_sizes.append(storage_size)
+                total_request_bytes += storage_size
+                self._submit_read(
+                    group,
+                    task_info,
+                    task_info["blob_handle"],
+                    memory_obj,
+                    0,
+                    storage_size,
+                )
+                if submit_idx + 1 < len(xds_tasks_info):
+                    time.sleep(self.sleep_time)
+
+            if not io_sizes:
+                return 0
+
+            while group.pending_count:
+                completed = group.wait_next(self.io_timeout_secs)
+                completion = completed.context
+                self._validate_completion(
+                    completed.completion,
+                    completion["storage_size"],
+                )
+                memory_obj = results[completion["index"]]
+                if memory_obj is None:
+                    continue
+
+                gpu_connector.to_gpu(
+                    memory_obj,
+                    completion["start"],
+                    completion["end"],
+                    **kwargs,
+                )
+                completed_indexes.add(completion["index"])
+
+            self._log_io_trace(
+                "read_batch_connector_overlap",
+                io_sizes,
+                time.perf_counter() - io_start,
+                True,
             )
-            memory_obj = read_allocator.allocate(
-                blob_metadata.shapes,
-                blob_metadata.dtypes,
-                blob_metadata.fmt,
+            return total_request_bytes
+        except Exception as e:
+            self._log_io_trace(
+                "read_batch_connector_overlap",
+                io_sizes,
+                time.perf_counter() - io_start,
+                False,
+            )
+            logger.error(
+                f"xDS batched connector-overlap read operation failed or timed out: {e}",
+                exc_info=True,
+            )
+            for task_info in xds_tasks_info:
+                idx = task_info["index"]
+                if idx in completed_indexes:
+                    continue
+                memory_obj = results[idx]
+                if memory_obj is not None:
+                    memory_obj.ref_count_down()
+                    results[idx] = None
+            return 0
+
+    def _perform_batched_xds_read(
+        self, xds_tasks_info: List[Dict[str, Any]]
+    ) -> Tuple[List[Optional[MemoryObj]], int]:
+        if not xds_tasks_info:
+            return [], 0
+
+        if any(
+            self._should_use_chunked_gpu_overlap(task_info["storage_size"])
+            for task_info in xds_tasks_info
+        ):
+            if self._should_prefer_blob_gpu_overlap(xds_tasks_info):
+                return self._perform_batched_blob_overlap_xds_read(xds_tasks_info)
+            return self._perform_batched_chunked_xds_read(xds_tasks_info)
+
+        group = self.completion_pump.create_group()
+        allocated_memory_objs: List[Optional[MemoryObj]] = []
+        total_request_bytes = 0
+        io_sizes: List[int] = []
+
+        for task_info in xds_tasks_info:
+            memory_obj = self._allocate_memory_obj(
+                task_info["shape"], task_info["dtype"], task_info["fmt"]
             )
             if memory_obj is None:
-                return None
-            buffer_offset, size = self._buffer_descriptor(memory_obj)
-            if size != blob_metadata.size:
-                raise RuntimeError(
-                    "CascadeKV allocation size does not match stored blob: "
-                    f"allocated={size}, stored={blob_metadata.size}"
+                logger.warning(
+                    "Memory allocation failed during batched read, this task will be skipped."
                 )
-            with self._io_lock:
-                request_id = int(
-                    self.client.submit_read(
-                        blob_metadata.blob_handle,
-                        self.staging_buffer_ref,
-                        buffer_offset,
-                        0,
-                        size,
-                    )
+                allocated_memory_objs.append(None)
+                continue
+            storage_size = self._get_storage_size(memory_obj)
+            if storage_size != task_info["storage_size"]:
+                raise ValueError(
+                    "Allocated memory object storage size does not match blob size: "
+                    f"allocated={storage_size}, blob={task_info['storage_size']}"
                 )
-                self._wait_for_completion(request_id, size, "read")
-            return memory_obj
-        except Exception:
-            if memory_obj is not None:
-                memory_obj.ref_count_down()
-            raise
-        finally:
-            with self._entries_lock:
-                blob_metadata.unpin()
+            allocated_memory_objs.append(memory_obj)
+            self._submit_read(
+                group,
+                storage_size,
+                task_info["blob_handle"],
+                memory_obj,
+                0,
+                storage_size,
+            )
+            total_request_bytes += storage_size
+            io_sizes.append(storage_size)
 
-    @_guard_operation
-    def get_non_blocking(
-        self,
-        key: CacheEngineKey,
-        location: Optional[str] = None,
-    ) -> Optional[Future]:
-        del location
-        future: Future = Future()
+        if not io_sizes:
+            return allocated_memory_objs, 0
+
         try:
-            future.set_result(self.get_blocking(key))
-        except Exception as exc:
-            future.set_exception(exc)
-        return future
+            io_start = time.perf_counter()
+            for completed in group.wait_all(self.io_timeout_secs):
+                self._validate_completion(
+                    completed.completion,
+                    completed.context,
+                )
+            self._log_io_trace(
+                "read_batch", io_sizes, time.perf_counter() - io_start, True
+            )
+            return allocated_memory_objs, total_request_bytes
+        except Exception as e:
+            self._log_io_trace(
+                "read_batch", io_sizes, time.perf_counter() - io_start, False
+            )
+            logger.error(
+                f"xDS batch read operation failed or timed out: {e}", exc_info=True
+            )
+            for mem_obj in allocated_memory_objs:
+                if mem_obj:
+                    mem_obj.ref_count_down()
+            return [None] * len(xds_tasks_info), 0
 
-    @_guard_async_operation
+    def _perform_batched_blob_overlap_xds_read(
+        self, xds_tasks_info: List[Dict[str, Any]]
+    ) -> Tuple[List[Optional[MemoryObj]], int]:
+        results: List[Optional[MemoryObj]] = [None] * len(xds_tasks_info)
+        staging_memory_objs: List[Optional[MemoryObj]] = [None] * len(xds_tasks_info)
+        group = self.completion_pump.create_group()
+        io_sizes: List[int] = []
+        total_request_bytes = 0
+        copy_stream = torch.cuda.Stream(device=self.cuda_device)
+        issued_gpu_copy = False
+        io_start = time.perf_counter()
+
+        try:
+            for idx, task_info in enumerate(xds_tasks_info):
+                storage_size = task_info["storage_size"]
+                if self._should_use_chunked_gpu_overlap(storage_size):
+                    staging_memory_obj = self._allocate_host_memory_obj(
+                        task_info["shape"],
+                        task_info["dtype"],
+                        task_info["fmt"],
+                        storage_size,
+                    )
+                    if staging_memory_obj is None:
+                        logger.warning(
+                            "Host staging allocation failed during batched blob-overlap xDS read."
+                        )
+                        continue
+
+                    output_memory_obj = self._allocate_device_memory_obj(
+                        task_info["shape"],
+                        task_info["dtype"],
+                        task_info["fmt"],
+                        storage_size,
+                    )
+                    if output_memory_obj is None:
+                        logger.warning(
+                            "GPU allocation failed during batched blob-overlap xDS read. "
+                            "Falling back to host read for this blob."
+                        )
+                        staging_memory_obj.ref_count_down()
+                        memory_obj = self._allocate_host_memory_obj(
+                            task_info["shape"],
+                            task_info["dtype"],
+                            task_info["fmt"],
+                            storage_size,
+                        )
+                        if memory_obj is None:
+                            logger.warning(
+                                "Host allocation fallback failed during batched blob-overlap xDS read."
+                            )
+                            continue
+
+                        results[idx] = memory_obj
+                        io_sizes.append(storage_size)
+                        total_request_bytes += storage_size
+                        self._submit_read(
+                            group,
+                            {"kind": "host", "expected_size": storage_size},
+                            task_info["blob_handle"],
+                            memory_obj,
+                            0,
+                            storage_size,
+                        )
+                        continue
+
+                    staging_memory_objs[idx] = staging_memory_obj
+                    results[idx] = output_memory_obj
+                    staging_tensor = staging_memory_obj.tensor
+                    output_tensor = output_memory_obj.tensor
+                    assert staging_tensor is not None
+                    assert output_tensor is not None
+
+                    io_sizes.append(storage_size)
+                    total_request_bytes += storage_size
+                    self._submit_read(
+                        group,
+                        {
+                            "kind": "blob",
+                            "expected_size": storage_size,
+                            "logical_bytes": output_memory_obj.get_size(),
+                            "staging_bytes": staging_tensor.view(torch.uint8).flatten(),
+                            "output_bytes": output_tensor.view(torch.uint8).flatten(),
+                        },
+                        task_info["blob_handle"],
+                        staging_memory_obj,
+                        0,
+                        storage_size,
+                    )
+                    continue
+
+                memory_obj = self._allocate_host_memory_obj(
+                    task_info["shape"],
+                    task_info["dtype"],
+                    task_info["fmt"],
+                    storage_size,
+                )
+                if memory_obj is None:
+                    logger.warning(
+                        "Memory allocation failed during batched blob-overlap xDS read, this task will be skipped."
+                    )
+                    continue
+
+                results[idx] = memory_obj
+                io_sizes.append(storage_size)
+                total_request_bytes += storage_size
+                self._submit_read(
+                    group,
+                    {"kind": "host", "expected_size": storage_size},
+                    task_info["blob_handle"],
+                    memory_obj,
+                    0,
+                    storage_size,
+                )
+
+            if not io_sizes:
+                return results, 0
+
+            while group.pending_count:
+                completed = group.wait_next(self.io_timeout_secs)
+                completion = completed.context
+                self._validate_completion(
+                    completed.completion,
+                    completion["expected_size"],
+                )
+                if completion["kind"] != "blob":
+                    continue
+
+                copy_size = completion["logical_bytes"]
+                if copy_size <= 0:
+                    continue
+
+                issued_gpu_copy = True
+                with torch.cuda.stream(copy_stream):
+                    completion["output_bytes"][:copy_size].copy_(
+                        completion["staging_bytes"][:copy_size],
+                        non_blocking=True,
+                    )
+
+            if issued_gpu_copy:
+                copy_stream.synchronize()
+
+            self._log_io_trace(
+                "read_batch_blob_overlap",
+                io_sizes,
+                time.perf_counter() - io_start,
+                True,
+            )
+            return results, total_request_bytes
+        except Exception as e:
+            try:
+                if issued_gpu_copy:
+                    copy_stream.synchronize()
+            except Exception:
+                logger.debug(
+                    "Blob-overlap xDS batch copy stream synchronize failed during error handling.",
+                    exc_info=True,
+                )
+
+            self._log_io_trace(
+                "read_batch_blob_overlap",
+                io_sizes,
+                time.perf_counter() - io_start,
+                False,
+            )
+            logger.error(
+                f"xDS batched blob-overlap read operation failed or timed out: {e}",
+                exc_info=True,
+            )
+            for memory_obj in results:
+                if memory_obj is not None:
+                    memory_obj.ref_count_down()
+            return [None] * len(xds_tasks_info), 0
+        finally:
+            for staging_memory_obj in staging_memory_objs:
+                if staging_memory_obj is not None:
+                    staging_memory_obj.ref_count_down()
+
+    def _perform_batched_chunked_xds_read(
+        self, xds_tasks_info: List[Dict[str, Any]]
+    ) -> Tuple[List[Optional[MemoryObj]], int]:
+        results: List[Optional[MemoryObj]] = [None] * len(xds_tasks_info)
+        staging_memory_objs: List[Optional[MemoryObj]] = [None] * len(xds_tasks_info)
+        group = self.completion_pump.create_group()
+        io_sizes: List[int] = []
+        total_request_bytes = 0
+        copy_stream = torch.cuda.Stream(device=self.cuda_device)
+        issued_gpu_copy = False
+        io_start = time.perf_counter()
+
+        try:
+            for idx, task_info in enumerate(xds_tasks_info):
+                storage_size = task_info["storage_size"]
+                if self._should_use_chunked_gpu_overlap(storage_size):
+                    staging_memory_obj = self._allocate_host_memory_obj(
+                        task_info["shape"],
+                        task_info["dtype"],
+                        task_info["fmt"],
+                        storage_size,
+                    )
+                    if staging_memory_obj is None:
+                        logger.warning(
+                            "Host staging allocation failed during batched chunked xDS read."
+                        )
+                        continue
+
+                    output_memory_obj = self._allocate_device_memory_obj(
+                        task_info["shape"],
+                        task_info["dtype"],
+                        task_info["fmt"],
+                        storage_size,
+                    )
+                    if output_memory_obj is None:
+                        logger.warning(
+                            "GPU allocation failed during batched chunked xDS read. "
+                            "Falling back to host read for this blob."
+                        )
+                        staging_memory_obj.ref_count_down()
+                        memory_obj = self._allocate_host_memory_obj(
+                            task_info["shape"],
+                            task_info["dtype"],
+                            task_info["fmt"],
+                            storage_size,
+                        )
+                        if memory_obj is None:
+                            logger.warning(
+                                "Host allocation fallback failed during batched chunked xDS read."
+                            )
+                            continue
+
+                        results[idx] = memory_obj
+                        io_sizes.append(storage_size)
+                        total_request_bytes += storage_size
+                        self._submit_read(
+                            group,
+                            {
+                                "kind": "host",
+                                "index": idx,
+                                "expected_size": storage_size,
+                            },
+                            task_info["blob_handle"],
+                            memory_obj,
+                            0,
+                            storage_size,
+                        )
+                        continue
+
+                    staging_memory_objs[idx] = staging_memory_obj
+                    results[idx] = output_memory_obj
+                    logical_bytes = output_memory_obj.get_size()
+                    staging_tensor = staging_memory_obj.tensor
+                    output_tensor = output_memory_obj.tensor
+                    assert staging_tensor is not None
+                    assert output_tensor is not None
+                    staging_bytes = staging_tensor.view(torch.uint8).flatten()
+                    output_bytes = output_tensor.view(torch.uint8).flatten()
+
+                    for offset in range(0, storage_size, self.chunked_gpu_overlap_size):
+                        chunk_size = min(
+                            self.chunked_gpu_overlap_size, storage_size - offset
+                        )
+                        io_sizes.append(chunk_size)
+                        self._submit_read(
+                            group,
+                            {
+                                "kind": "chunk",
+                                "index": idx,
+                                "offset": offset,
+                                "chunk_size": chunk_size,
+                                "expected_size": chunk_size,
+                                "logical_bytes": logical_bytes,
+                                "staging_bytes": staging_bytes,
+                                "output_bytes": output_bytes,
+                            },
+                            task_info["blob_handle"],
+                            staging_memory_obj,
+                            offset,
+                            chunk_size,
+                            memory_offset=offset,
+                        )
+                    total_request_bytes += storage_size
+                    continue
+
+                memory_obj = self._allocate_host_memory_obj(
+                    task_info["shape"],
+                    task_info["dtype"],
+                    task_info["fmt"],
+                    storage_size,
+                )
+                if memory_obj is None:
+                    logger.warning(
+                        "Memory allocation failed during batched xDS read, this task will be skipped."
+                    )
+                    continue
+
+                results[idx] = memory_obj
+                io_sizes.append(storage_size)
+                total_request_bytes += storage_size
+                self._submit_read(
+                    group,
+                    {
+                        "kind": "host",
+                        "index": idx,
+                        "expected_size": storage_size,
+                    },
+                    task_info["blob_handle"],
+                    memory_obj,
+                    0,
+                    storage_size,
+                )
+
+            if not io_sizes:
+                return results, 0
+
+            while group.pending_count:
+                completed = group.wait_next(self.io_timeout_secs)
+                completion = completed.context
+                self._validate_completion(
+                    completed.completion,
+                    completion["expected_size"],
+                )
+                if completion["kind"] != "chunk":
+                    continue
+
+                offset = completion["offset"]
+                chunk_size = completion["chunk_size"]
+                remaining_logical_bytes = max(0, completion["logical_bytes"] - offset)
+                copy_size = min(chunk_size, remaining_logical_bytes)
+                if copy_size <= 0:
+                    continue
+
+                issued_gpu_copy = True
+                with torch.cuda.stream(copy_stream):
+                    completion["output_bytes"][offset : offset + copy_size].copy_(
+                        completion["staging_bytes"][offset : offset + copy_size],
+                        non_blocking=True,
+                    )
+
+            if issued_gpu_copy:
+                copy_stream.synchronize()
+
+            self._log_io_trace(
+                "read_batch_chunked",
+                io_sizes,
+                time.perf_counter() - io_start,
+                True,
+            )
+            return results, total_request_bytes
+        except Exception as e:
+            try:
+                if issued_gpu_copy:
+                    copy_stream.synchronize()
+            except Exception:
+                logger.debug(
+                    "Chunked xDS batch copy stream synchronize failed during error handling.",
+                    exc_info=True,
+                )
+
+            self._log_io_trace(
+                "read_batch_chunked",
+                io_sizes,
+                time.perf_counter() - io_start,
+                False,
+            )
+            logger.error(
+                f"xDS batched chunked read operation failed or timed out: {e}",
+                exc_info=True,
+            )
+            for memory_obj in results:
+                if memory_obj is not None:
+                    memory_obj.ref_count_down()
+            return [None] * len(xds_tasks_info), 0
+        finally:
+            for staging_memory_obj in staging_memory_objs:
+                if staging_memory_obj is not None:
+                    staging_memory_obj.ref_count_down()
+
     async def batched_async_contains(
         self,
         lookup_id: str,
-        keys: list[CacheEngineKey],
+        keys: List[CacheEngineKey],
         pin: bool = False,
     ) -> int:
         del lookup_id
         return self.batched_contains(keys, pin)
 
-    @_guard_async_operation
     async def batched_get_non_blocking(
         self,
         lookup_id: str,
@@ -1488,251 +1648,254 @@ class CascadeKVBackend(AllocatorBackendInterface):
         transfer_spec: Any = None,
     ) -> list[MemoryObj]:
         del lookup_id, transfer_spec
-        results: list[MemoryObj] = []
-        for key in keys:
-            memory_obj = await asyncio.to_thread(self.get_blocking, key)
-            if memory_obj is None:
-                break
-            results.append(memory_obj)
-        return results
+        results = await asyncio.to_thread(self.batched_get_blocking, keys)
+        if any(result is None for result in results):
+            raise KeyError("CascadeKV key disappeared after async contains")
+        return [result for result in results if result is not None]
 
-    @_guard_operation
-    def batched_get_blocking(
+    def get_non_blocking(
         self,
-        keys: list[CacheEngineKey],
-    ) -> list[Optional[MemoryObj]]:
-        if not hasattr(self, "read_memory_allocator"):
-            return [self.get_blocking(key) for key in keys]
-        with self._put_tasks_lock:
-            if any(key in self._pending_objects for key in keys):
-                return [self.get_blocking(key) for key in keys]
+        key: CacheEngineKey,
+        location: Optional[str] = None,
+    ) -> Optional["Future"]:
+        del location
+        if self.enable_chunked_gpu_overlap:
+            with self.dict_lock:
+                if key not in self.dict:
+                    return None
 
-        results: list[Optional[MemoryObj]] = [None] * len(keys)
-        items: list[dict[str, Any]] = []
-        try:
-            for index, key in enumerate(keys):
-                with self._entries_lock:
-                    metadata = self._entries.get(key)
-                    if metadata is None:
-                        continue
+                metadata = self.dict[key]
+                if self._should_use_chunked_gpu_overlap(metadata.size):
+                    self.evictor.update_on_get(key, self.dict)
                     metadata.pin()
-                    self._entries.move_to_end(key)
-                memory_obj = self.read_memory_allocator.allocate(
-                    metadata.shapes,
-                    metadata.dtypes,
-                    metadata.fmt,
-                )
-                if memory_obj is None:
-                    with self._entries_lock:
-                        metadata.unpin()
-                    continue
-                try:
-                    offset, size = self._buffer_descriptor(memory_obj)
-                    if size != metadata.size:
-                        raise RuntimeError(
-                            "CascadeKV allocation size does not match stored blob: "
-                            f"allocated={size}, stored={metadata.size}"
-                        )
-                    items.append(
-                        {
-                            "index": index,
-                            "metadata": metadata,
-                            "memory_obj": memory_obj,
-                            "offset": offset,
-                            "size": size,
-                        }
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.async_load_bytes_from_xds_to_device(
+                            blob_handle=metadata.blob_handle,
+                            storage_size=metadata.size,
+                            dtype=metadata.dtypes,
+                            shape=metadata.shapes,
+                            fmt=metadata.fmt,
+                        ),
+                        self.loop,
                     )
-                except BaseException:
-                    memory_obj.ref_count_down()
-                    with self._entries_lock:
-                        metadata.unpin()
-                    raise
+                    future.add_done_callback(
+                        lambda f: self._finish_async_device_read(key, f)
+                    )
+                    return future
+        return self.submit_prefetch_task(key)
 
-            pump = XDSReadRingPump(
-                queue_depth=int(self.config.cascadekv_io_queue_depth),
-                submit=lambda item: int(
-                    self.client.submit_read(
-                        item["metadata"].blob_handle,
-                        self.staging_buffer_ref,
-                        item["offset"],
-                        0,
-                        item["size"],
-                    )
-                ),
-                wait_any=self.client.wait_any_result,
-                timeout=DEFAULT_IO_TIMEOUT_SECS,
+    def _remove_prefetch_task(self, key: CacheEngineKey, future: Future):
+        with self.prefetch_lock:
+            self.prefetch_tasks.pop(key, None)
+
+        try:
+            future.result()
+        except Exception as e:
+            logger.warning(f"Prefetch task for {key} failed: {e}. Unpinning entry.")
+            with self.dict_lock:
+                if key in self.dict:
+                    self.dict[key].unpin()
+
+    def _finish_async_device_read(self, key: CacheEngineKey, future: Future):
+        try:
+            future.result()
+        except Exception as e:
+            logger.warning(f"Async xDS device read for {key} failed: {e}.")
+        finally:
+            with self.dict_lock:
+                if key in self.dict:
+                    self.dict[key].unpin()
+
+    def submit_prefetch_task(self, key: CacheEngineKey) -> Optional[Future]:
+        with self.prefetch_lock:
+            if key in self.prefetch_tasks:
+                logger.debug(f"Prefetch task for {key} is already in progress.")
+                return self.prefetch_tasks[key]
+
+            with self.dict_lock:
+                if key not in self.dict:
+                    return None
+                self.dict[key].pin()
+                metadata = self.dict[key]
+                blob_info = {
+                    "key": key,
+                    "blob_handle": metadata.blob_handle,
+                    "storage_size": metadata.size,
+                    "dtype": metadata.dtypes,
+                    "shape": metadata.shapes,
+                    "fmt": metadata.fmt,
+                }
+            assert blob_info["dtype"] is not None and blob_info["shape"] is not None
+
+            coro = self.async_load_bytes_from_xds(
+                blob_info["key"],
+                blob_info["blob_handle"],
+                blob_info["storage_size"],
+                blob_info["dtype"],
+                blob_info["shape"],
+                blob_info["fmt"],
             )
-            for item in items:
-                pump.put(item)
-            pump.close_input()
-            with self._io_lock:
-                pump.run()
+            future = asyncio.run_coroutine_threadsafe(coro, self.loop)
 
-            first_error: Optional[BaseException] = None
-            for _ in items:
-                ring_completion = pump.get_completion()
-                item = ring_completion.item
-                if ring_completion.error is not None:
-                    if first_error is None:
-                        first_error = ring_completion.error
-                    if not ring_completion.safe_to_reuse:
-                        item["cuda_quarantined"] = True
-                        request_id = pump.unsafe_request_id(item)
-                        assert request_id is not None
-                        self._quarantine_xds_object(
-                            request_id,
-                            item["memory_obj"],
-                            ring_completion.error,
-                        )
-                else:
-                    try:
-                        self._validate_io_result(
-                            ring_completion.completion,
-                            item["size"],
-                            "read",
-                        )
-                        results[item["index"]] = item["memory_obj"]
-                    except BaseException as error:
-                        if first_error is None:
-                            first_error = error
-                if results[item["index"]] is None and not item.get(
-                    "cuda_quarantined", False
-                ):
-                    item["memory_obj"].ref_count_down()
-                with self._entries_lock:
-                    item["metadata"].unpin()
-            items.clear()
-            if first_error is not None:
-                for memory_obj in results:
-                    if memory_obj is not None:
-                        memory_obj.ref_count_down()
-                raise first_error
-            return results
-        except BaseException:
-            for item in items:
-                if not item.get("cuda_quarantined", False):
-                    item["memory_obj"].ref_count_down()
-                with self._entries_lock:
-                    item["metadata"].unpin()
+            future.add_done_callback(lambda f: self._remove_prefetch_task(key, f))
+
+            self.prefetch_tasks[key] = future
+            return future
+
+    async def async_load_bytes_from_xds(
+        self,
+        key: CacheEngineKey,
+        blob_handle: int,
+        storage_size: int,
+        dtype,
+        shape,
+        fmt,
+    ) -> Optional[MemoryObj]:
+
+        memory_obj = self._allocate_memory_obj(shape, dtype, fmt)
+        if memory_obj is None:
+            logger.debug("Memory allocation failed during async xds load.")
+            return None
+
+        allocated_storage_size = self._get_storage_size(memory_obj)
+        if allocated_storage_size != storage_size:
+            raise ValueError(
+                "Allocated memory object storage size does not match blob size: "
+                f"allocated={allocated_storage_size}, blob={storage_size}"
+            )
+
+        group = self.completion_pump.create_group()
+        self._submit_read(
+            group,
+            None,
+            blob_handle,
+            memory_obj,
+            0,
+            storage_size,
+        )
+        io_start = time.perf_counter()
+        try:
+            completed = await asyncio.to_thread(
+                group.wait_all,
+                self.io_timeout_secs,
+            )
+            self._validate_completion(completed[0].completion, storage_size)
+        except Exception:
+            self._log_io_trace(
+                "read_prefetch", [storage_size], time.perf_counter() - io_start, False
+            )
             raise
+        else:
+            self._log_io_trace(
+                "read_prefetch", [storage_size], time.perf_counter() - io_start, True
+            )
 
-    @_guard_operation
-    def pin(self, key: CacheEngineKey) -> bool:
-        with self._entries_lock:
-            metadata = self._entries.get(key)
-            return metadata.pin() if metadata is not None else False
+        with self.dict_lock:
+            if key in self.dict:
+                self.dict[key].unpin()
 
-    @_guard_operation
-    def unpin(self, key: CacheEngineKey) -> bool:
-        with self._entries_lock:
-            metadata = self._entries.get(key)
-            return metadata.unpin() if metadata is not None else False
+        self.local_cpu_backend.submit_put_task(key, memory_obj)
 
-    @_guard_operation
-    def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
-        with self._entries_lock:
-            metadata = self._entries.get(key)
-            if metadata is None:
-                return False
-            if metadata.is_pinned and not force:
-                return False
-            del self._entries[key]
-        self.client.release_blob(metadata.blob_handle)
-        return True
+        return memory_obj
 
-    @_guard_operation
-    def touch_cache(self) -> None:
-        with self._entries_lock:
-            for key in reversed(self._keys_in_request):
-                if key in self._entries:
-                    self._entries.move_to_end(key)
-            self._keys_in_request.clear()
+    async def async_load_bytes_from_xds_to_device(
+        self, blob_handle: int, storage_size: int, dtype, shape, fmt
+    ) -> Optional[MemoryObj]:
+        return await self._read_blob_to_device_chunked_async(
+            blob_handle,
+            storage_size,
+            dtype,
+            shape,
+            fmt,
+            "read_non_blocking_chunked",
+        )
+
+    def submit_put_task(
+        self, key: CacheEngineKey, memory_obj: MemoryObj
+    ) -> Optional[Future]:
+        logger.warning(
+            "CascadeKVBackend.submit_put_task is deprecated, use batched_submit_put_task instead."
+        )
+        self.batched_submit_put_task([key], [memory_obj])
+        return None
+
+    def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
+        # logger.warning("CascadeKVBackend.get_blocking is deprecated, use batched_get_blocking instead.")
+        # results = self.batched_get_blocking([key])
+        # return results[0] if results else None
+        with self.dict_lock:
+            if key not in self.dict:
+                return None
+
+            self.evictor.update_on_get(key, self.dict)
+
+            metadata = self.dict[key]
+            blob_handle = metadata.blob_handle
+            dtype = metadata.dtypes
+            shape = metadata.shapes
+            fmt = metadata.fmt
+            start_time = time.time()
+            if self._should_use_chunked_gpu_overlap(metadata.size):
+                memory_obj = self._read_blob_to_device_chunked_blocking(
+                    blob_handle,
+                    metadata.size,
+                    dtype,
+                    shape,
+                    fmt,
+                    "read_blocking_chunked",
+                )
+            else:
+                memory_obj = self._read_blob_to_host_blocking(
+                    blob_handle,
+                    metadata.size,
+                    dtype,
+                    shape,
+                    fmt,
+                    "read_blocking",
+                )
+
+            if memory_obj is None:
+                return None
+
+            end_time = time.time()
+            read_time = end_time - start_time
+            total_read_bytes = metadata.size
+            with self.stats_lock:
+                self.cumulative_read_bytes += total_read_bytes
+                self.cumulative_read_time += read_time
+                logger.info(
+                    f"current average read bandwidth: "
+                    f"{(self.cumulative_read_bytes / self.cumulative_read_time) / (1024 * 1024):.2f} MB/s"
+                )
+            return memory_obj
 
     def close(self) -> None:
-        with self._lifecycle_condition:
-            while self._closing and not self._closed:
-                self._lifecycle_condition.wait()
-            if self._closed:
-                return
-            self._closing = True
-            self._teardown_started = True
-            while self._active_operations:
-                self._lifecycle_condition.wait()
+        if self._closed:
+            return
+        print("xDS Blob Backend closing...")
+        logger.info("Closing xDS blob backend...")
+        self.running.clear()
 
-        scheduler_error: Optional[BaseException] = None
-        try:
-            if self._write_scheduler is not None:
-                try:
-                    self._write_scheduler.close(timeout=DEFAULT_IO_TIMEOUT_SECS)
-                except TimeoutError:
-                    raise
-                except BaseException as error:
-                    scheduler_error = error
+        logger.info("Waiting for flush thread to finish...")
+        with self.flush_condition:
+            self.flush_condition.notify()
+        self.flush_thread.join(timeout=5)
+        if self.flush_thread.is_alive():
+            logger.warning(f"{self.flush_thread.name} did not exit gracefully.")
 
-            active_allocations = (
-                self.read_memory_allocator.num_active_allocations
-                + self.write_memory_allocator.num_active_allocations
+        if self.write_buffer:
+            logger.info(
+                f"Flushing {len(self.write_buffer)} remaining items from write buffer before shutdown."
             )
-            if active_allocations:
-                raise RuntimeError(
-                    "cannot close CascadeKVBackend with active staging allocations: "
-                    f"{active_allocations}"
-                )
+            self._perform_batch_write(self.write_buffer)
+            self.write_buffer = []
 
-            first_release_error: Optional[BaseException] = None
-            with self._entries_lock:
-                entries = tuple(self._entries.items())
-            for key, metadata in entries:
-                try:
-                    self.client.release_blob(metadata.blob_handle)
-                except BaseException as error:
-                    if first_release_error is None:
-                        first_release_error = error
-                    continue
-                with self._entries_lock:
-                    current = self._entries.get(key)
-                    if current is metadata:
-                        self._entries.pop(key)
-            if first_release_error is not None:
-                raise first_release_error
+        if self.lookup_server is not None:
+            with self.dict_lock:
+                keys_to_remove = list(self.dict.keys())
+            if keys_to_remove:
+                self.lookup_server.batched_remove(keys_to_remove)
 
-            if not self._read_allocator_closed:
-                self.read_memory_allocator.close()
-                self._read_allocator_closed = True
-            if not self._write_allocator_closed:
-                self.write_memory_allocator.close()
-                self._write_allocator_closed = True
-            if self._host_registered:
-                unregister_status = int(
-                    self._cudart.cudaHostUnregister(self.staging_base_ptr)
-                )
-                if unregister_status != 0:
-                    error_string = self._cudart.cudaGetErrorString(unregister_status)
-                    raise RuntimeError(
-                        "CascadeKV cudaHostUnregister failed: "
-                        f"status={unregister_status}, error={error_string}"
-                    )
-                self._host_registered = False
-            if not self._buffer_freed:
-                assert self.staging_buffer_ref is not None
-                self.client.free_buffer(self.staging_buffer_ref)
-                self._buffer_freed = True
-            client_close = getattr(self.client, "close", None)
-            if callable(client_close) and not self._client_closed:
-                client_close()
-                self._client_closed = True
-        except BaseException:
-            with self._lifecycle_condition:
-                self._closing = False
-                self._lifecycle_condition.notify_all()
-            raise
-
-        with self._lifecycle_condition:
-            self._closed = True
-            self._closing = False
-            self._lifecycle_condition.notify_all()
-        if scheduler_error is not None:
-            logger.warning(
-                "CascadeKV async write scheduler closed after an I/O error: %s",
-                scheduler_error,
-            )
+        self.completion_pump.close()
+        self._closed = True
+        logger.info("xDS blob backend closed.")

@@ -1539,7 +1539,13 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
 class XDSServiceMemoryAllocator(TensorMemoryAllocator):
     """Allocate LMCache objects from one xDS service-owned CPU DMA buffer."""
 
-    def __init__(self, client: Any, size: int, align_bytes: int):
+    def __init__(
+        self,
+        client: Any,
+        size: int,
+        align_bytes: int,
+        close_client: bool = False,
+    ):
         """Allocate, pin, and wrap an xDS service CPU buffer.
 
         Args:
@@ -1557,6 +1563,8 @@ class XDSServiceMemoryAllocator(TensorMemoryAllocator):
         self._view: Optional[memoryview] = None
         self._cudart: Any = None
         self._host_registered = False
+        self._close_client = close_client
+        self._client_closed = False
         self._closed = False
 
         view, buffer_ref = client.alloc_buffer(size)
@@ -1617,6 +1625,9 @@ class XDSServiceMemoryAllocator(TensorMemoryAllocator):
         if self.buffer_ref is not None:
             self.client.free_buffer(self.buffer_ref)
             self.buffer_ref = None
+        if self._close_client and not self._client_closed:
+            self.client.close()
+            self._client_closed = True
         self._closed = True
 
 
