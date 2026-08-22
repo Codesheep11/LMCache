@@ -1,0 +1,8 @@
+chunk_size: 256
+local_cpu: false
+max_local_cpu_size: 1
+local_disk: "file:///mnt/lmcache-raid0/disk-cache"
+max_local_disk_size: 1000
+use_layerwise: true
+save_unfull_chunk: true
+
