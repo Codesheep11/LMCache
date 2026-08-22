@@ -13,7 +13,8 @@
 - vLLM 源码：`/home/yangxc/workspace/vllm`
 - 模型：`/mnt/adminserver-nfsrdma/Model/Qwen3-30B-A3B`
 - GPU：4、5、6、7，tensor parallel size 为 4
-- xDS 服务：`xds0`，使用已授权测试的 NUMA1 四块原始 NVMe
+- SSD：两个后端均使用 `0000:aa:00.0`、`0000:d3:00.0`、
+  `0000:ec:00.0`、`0000:ed:00.0` 这四块已授权测试的 NUMA1 NVMe
 
 ## 后端配置
 
@@ -21,9 +22,11 @@
 `save_unfull_chunk: true` 和 `local_cpu: false`。
 
 CascadeKV 使用外部 xDS 服务和服务分配的有界 CPU staging slots；测试前验证
-单个 layer chunk 的实际物理大小不超过现有 6 MiB blob。Local Disk 使用 LMCache
-原生 buffered file I/O，缓存目录为测试专用目录，保留 Linux page cache 的默认行为，
-并在报告中明确标记为 buffered Local Disk。
+单个 layer chunk 的实际物理大小不超过现有 6 MiB blob。Local Disk 阶段使用
+`switch_lmcache_test_ssds.sh` 将同四块 SSD 绑定到内核 NVMe 驱动，组成四盘 mdadm
+RAID0 并格式化为 ext4；LMCache 在 `/mnt/lmcache-raid0/disk-cache` 上使用原生
+buffered file I/O。该结果保留 Linux page cache 的默认行为，并在报告中明确标记为
+buffered Local Disk。
 
 ## 工作负载
 
@@ -31,10 +34,10 @@ CascadeKV 使用外部 xDS 服务和服务分配的有界 CPU staging slots；�
 
 - 固定随机种子 0
 - 5 个不同 prompt，每个重复 20 次
-- 输入长度 26,530--30,000 tokens
+- 输入长度固定为 40,000 tokens
 - 输出 1 token
 - `max_num_seqs=1`
-- eager mode，最大模型长度 40,000
+- eager mode，最大模型长度 40,960
 - vLLM automatic prefix caching 不启用，使重复请求必须经过 LMCache
 
 第一次出现的 prompt 负责写入，后续重复 prompt 负责读取。模型初始化时间不计入
@@ -42,9 +45,11 @@ CascadeKV 使用外部 xDS 服务和服务分配的有界 CPU staging slots；�
 
 ## 执行顺序与隔离
 
-首版先各执行一轮：Local Disk 后执行 CascadeKV。每轮使用独立进程；Local Disk
-开始前清空专用缓存目录，CascadeKV 开始前启动干净的 xDS 服务实例。若首轮无错误，
-再单独扩展为交错顺序的三轮稳定性测试，不把额外轮次混入首版结果。
+每个后端只执行一组，顺序固定为 Local Disk 后执行 CascadeKV。每组使用独立进程。
+测试开始时通过已有 SSD 切换脚本重建四盘 mdadm RAID0/ext4，并清空专用缓存目录；
+Local Disk 完成后卸载并销毁文件系统 RAID 元数据，再把同四块 SSD 绑定回
+`uio_pci_generic`，最后启动干净的 xDS 服务实例执行 CascadeKV。测试结束后设备
+保持为 xDS 状态。
 
 ## 验收与输出
 
@@ -59,4 +64,4 @@ CascadeKV 使用外部 xDS 服务和服务分配的有界 CPU staging slots；�
 - 总耗时、请求吞吐、每 prompt 平均耗时和缓存命中证据
 - 环境版本、Git commit、GPU/SSD 映射及异常说明
 
-首轮数字只作为功能与初步性能数据；只有完成后续交错三轮后才报告稳定性能结论。
+单组数字作为功能验证和初步性能数据，不将其表述为多轮稳定性能结论。
