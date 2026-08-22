@@ -82,8 +82,11 @@ xds_service_name: xds0
 xds_backend: false
 cascadekv_backend: true
 xds_require_direct: false
-cascadekv_slot_count: 8
+cascadekv_slot_count: 160
 ```
+
+At 6 MiB per logical slot, 160 slots reserve about 960 MiB per TP rank and
+cover all 157 chunks in a 40,000-token prompt.
 
 The disk-only 1 GiB LocalCPU allocation is the allocator required by LMCache's LocalDisk backend; `local_cpu: false` prevents it from becoming a cache tier.
 

@@ -39,5 +39,9 @@ if rg -q 'lmcache\.__version__' "$RUNNER"; then
   exit 1
 fi
 rg -q 'metadata\.version\("lmcache"\)' "$RUNNER"
+if rg -q '\| rg ' "$RUNNER"; then
+  echo 'orchestrator must not require rg in the root login PATH' >&2
+  exit 1
+fi
 
 printf 'LMCACHE_V043_SAME_SSD_ORCHESTRATOR_TESTS_OK\n'

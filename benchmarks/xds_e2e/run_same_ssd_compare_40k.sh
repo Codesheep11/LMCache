@@ -155,10 +155,15 @@ main() {
   printf '[3/5] destroying mdadm/ext4 metadata and returning SSDs to xDS\n'
   bash "$SWITCH" xds --yes --confirm "$CONFIRM_TOKEN"
 
-  if ! findmnt -no OPTIONS /dev/hugepages | tr ',' '\n' | rg -qx rw; then
-    mount -o remount,rw /dev/hugepages
-    HUGEPAGES_REMOUNTED=1
-  fi
+  local hugepage_options
+  hugepage_options=$(findmnt -no OPTIONS /dev/hugepages)
+  case ",$hugepage_options," in
+    *,rw,*) ;;
+    *)
+      mount -o remount,rw /dev/hugepages
+      HUGEPAGES_REMOUNTED=1
+      ;;
+  esac
 
   printf '[4/5] starting xDS service\n'
   env XDS_SERVICE_ALLOWED_UID=0 "$SERVICE" \

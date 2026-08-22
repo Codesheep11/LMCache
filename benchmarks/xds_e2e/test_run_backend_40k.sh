@@ -4,6 +4,7 @@ set -euo pipefail
 
 ROOT=/home/yangxc/workspace/LMCache-v043-xds
 RUNNER=$ROOT/benchmarks/xds_e2e/run_backend_40k.sh
+CASCADE_CONFIG=$ROOT/benchmarks/xds_e2e/cascadekv_40k.yaml
 
 disk=$(BACKEND=disk BENCHMARK_LOG=/tmp/disk.log BENCHMARK_DRY_RUN=1 bash "$RUNNER")
 cascade=$(BACKEND=cascadekv BENCHMARK_LOG=/tmp/cascade.log BENCHMARK_DRY_RUN=1 bash "$RUNNER")
@@ -23,6 +24,8 @@ for output in "$disk" "$cascade"; do
   [[ "$output" == *"--no-enable-prefix-caching"* ]]
   [[ "$output" != *"--enable-prefix-caching"* ]]
 done
+
+rg -q '^cascadekv_slot_count: 160$' "$CASCADE_CONFIG"
 
 if BACKEND=unknown BENCHMARK_LOG=/tmp/unknown.log BENCHMARK_DRY_RUN=1 \
   bash "$RUNNER" >/dev/null 2>&1; then

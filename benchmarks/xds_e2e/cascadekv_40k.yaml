@@ -7,5 +7,4 @@ xds_service_name: xds0
 xds_backend: false
 cascadekv_backend: true
 xds_require_direct: false
-cascadekv_slot_count: 8
-
+cascadekv_slot_count: 160

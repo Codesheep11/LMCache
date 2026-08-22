@@ -28,6 +28,10 @@ RAID0 并格式化为 ext4；LMCache 在 `/mnt/lmcache-raid0/disk-cache` 上使�
 buffered file I/O。该结果保留 Linux page cache 的默认行为，并在报告中明确标记为
 buffered Local Disk。
 
+40,000 tokens 在 `chunk_size: 256` 下需要 157 个逻辑 chunk。CascadeKV 使用
+`cascadekv_slot_count: 160`，即每个 TP rank 约 960 MiB 有界 staging；这可以覆盖
+完整 prompt，并与 Local Disk 每个 rank 的 1 GiB allocator 保持相近的内存预算。
+
 ## 工作负载
 
 复用 `/home/yangxc/workspace/test` 的 `benchmark_prefix_caching.py` 方法：
