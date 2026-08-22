@@ -39,6 +39,11 @@ class FakeClient:
         return FakeCompletion(request_id)
 
 
+class FailingWaitClient(FakeClient):
+    def wait_any_result(self, _timeout):
+        raise TimeoutError("xDS completion timed out")
+
+
 def _run_pump(pump, items):
     for item in items:
         pump.put(item)
@@ -85,3 +90,20 @@ def test_read_ring_reports_unknown_completion_after_draining_inflight():
     assert client.next_request_id == 3
     assert len(failures) == 1
     assert "unknown completion request 999" in str(failures[0].error)
+
+
+def test_read_ring_wait_failure_releases_all_pending_items_and_stops():
+    client = FailingWaitClient()
+    pump = XDSReadRingPump(2, client.submit, client.wait_any_result, 1.0)
+    worker = _run_pump(pump, ["first", "second", "not-submitted"])
+
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    results = [pump.get_completion() for _ in range(3)]
+    assert {result.item for result in results} == {
+        "first",
+        "second",
+        "not-submitted",
+    }
+    assert all(isinstance(result.error, TimeoutError) for result in results)

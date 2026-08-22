@@ -69,6 +69,7 @@ class FakeXDSClient:
             completion = self.next_completion
             if completion.request_id is None:
                 completion.request_id = self._last_request_id
+            self._pending_request_ids.remove(completion.request_id)
             self.next_completion = None
             return completion
         request_id = self._pending_request_ids.pop(0)
@@ -82,6 +83,51 @@ class FakeXDSClient:
 
     def close(self):
         self.calls.append("close")
+
+
+class FakeTransferEvent:
+    def __init__(self):
+        self.synchronized = False
+
+    def synchronize(self):
+        self.synchronized = True
+
+
+class FakeStreamingGPUConnector:
+    def __init__(self, backend, fail_scatter=False, fail_gather=False):
+        self.backend = backend
+        self.fail_scatter = fail_scatter
+        self.fail_gather = fail_gather
+        self.events = []
+        self.scatter_ranges = []
+        self.gather_ranges = []
+        self.peak_active = 0
+
+    def _record_peak(self):
+        self.peak_active = max(
+            self.peak_active,
+            self.backend.get_memory_allocator().num_active_allocations,
+        )
+
+    def to_gpu(self, memory_obj, start, end, **kwargs):
+        del memory_obj, kwargs
+        self._record_peak()
+        if self.fail_scatter:
+            raise RuntimeError("scatter failed")
+        self.scatter_ranges.append((start, end))
+
+    def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
+        del kwargs
+        self._record_peak()
+        if self.fail_gather:
+            raise RuntimeError("gather failed")
+        self.gather_ranges.append((len(memory_objs), tuple(starts), tuple(ends)))
+
+    def record_transfer_event(self, direction):
+        assert direction in ("load", "store")
+        event = FakeTransferEvent()
+        self.events.append(event)
+        return event
 
 
 @pytest.fixture
@@ -253,3 +299,186 @@ def test_xds_backend_batched_read_uses_bounded_ring(
         assert result is not None
         result.ref_count_down()
     backend.close()
+
+
+def _five_keys():
+    return [
+        CacheEngineKey("test-model", 1, 0, 200 + index, torch.float16)
+        for index in range(5)
+    ]
+
+
+def _store_keys_sequentially(backend, metadata, keys):
+    for key in keys:
+        source = backend.allocate(metadata.get_shapes(), metadata.get_dtypes())
+        assert source is not None
+        futures = backend.batched_submit_put_task([key], [source])
+        assert futures is not None
+        assert futures[0].result() is True
+        source.ref_count_down()
+
+
+def test_xds_backend_windowed_read_bounds_registered_gpu_staging(
+    direct_config,
+    direct_metadata,
+):
+    direct_config.xds_read_slot_count = 2
+    direct_config.xds_write_slot_count = 2
+    direct_config.xds_io_queue_depth = 1
+    client = FakeXDSClient()
+    client.metadata.gpu_buffer_size_bytes = 4 * 4096
+    backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
+    keys = _five_keys()
+    _store_keys_sequentially(backend, direct_metadata, keys)
+    connector = FakeStreamingGPUConnector(backend)
+    starts = [index * 4 for index in range(5)]
+    ends = [start + 4 for start in starts]
+
+    result = backend.batched_get_to_gpu_blocking(
+        keys, starts, ends, connector, slot_mapping=object()
+    )
+
+    assert result is not None
+    assert result.completed == (True, True, True, True, True)
+    assert connector.scatter_ranges == list(zip(starts, ends, strict=True))
+    assert connector.peak_active <= 2
+    assert backend.get_memory_allocator().num_active_allocations == 0
+    assert result.peak_staging_bytes <= 2 * 4096
+    assert result.peak_inflight_io == 1
+    assert all(event.synchronized for event in connector.events)
+    backend.close()
+
+
+def test_xds_backend_windowed_write_bounds_registered_gpu_staging(
+    direct_config,
+    direct_metadata,
+):
+    direct_config.xds_read_slot_count = 2
+    direct_config.xds_write_slot_count = 2
+    direct_config.xds_io_queue_depth = 1
+    client = FakeXDSClient()
+    client.metadata.gpu_buffer_size_bytes = 4 * 4096
+    backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
+    connector = FakeStreamingGPUConnector(backend)
+    keys = _five_keys()
+    starts = [index * 4 for index in range(5)]
+    ends = [start + 4 for start in starts]
+
+    result = backend.batched_put_from_gpu_blocking(
+        keys, starts, ends, connector, slot_mapping=object()
+    )
+
+    assert result is not None
+    assert result.completed == (True, True, True, True, True)
+    assert [entry[0] for entry in connector.gather_ranges] == [2, 2, 1]
+    assert connector.peak_active <= 2
+    assert backend.get_memory_allocator().num_active_allocations == 0
+    assert result.peak_staging_bytes <= 2 * 4096
+    assert all(backend.contains(key) for key in keys)
+    backend.close()
+
+
+def test_xds_backend_windowed_read_short_io_releases_all_slots(
+    direct_config,
+    direct_metadata,
+):
+    client = FakeXDSClient()
+    backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
+    keys = _five_keys()[:2]
+    _store_keys_sequentially(backend, direct_metadata, keys)
+    client.next_completion = SimpleNamespace(
+        request_id=None,
+        status=0,
+        error_code=0,
+        completed_bytes=2048,
+    )
+    connector = FakeStreamingGPUConnector(backend)
+
+    result = backend.batched_get_to_gpu_blocking(
+        keys, [0, 4], [4, 8], connector, slot_mapping=object()
+    )
+
+    assert result is not None
+    assert result.completed == (False, True)
+    assert result.short_io_chunks == 1
+    assert backend.get_memory_allocator().num_active_allocations == 0
+    backend.close()
+
+
+def test_xds_backend_windowed_read_scatter_failure_releases_all_slots(
+    direct_config,
+    direct_metadata,
+):
+    client = FakeXDSClient()
+    backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
+    keys = _five_keys()[:2]
+    _store_keys_sequentially(backend, direct_metadata, keys)
+    connector = FakeStreamingGPUConnector(backend, fail_scatter=True)
+
+    with pytest.raises(RuntimeError, match="scatter failed"):
+        backend.batched_get_to_gpu_blocking(
+            keys, [0, 4], [4, 8], connector, slot_mapping=object()
+        )
+
+    assert backend.get_memory_allocator().num_active_allocations == 0
+    backend.close()
+
+
+def test_xds_backend_windowed_write_short_io_does_not_publish_blob(
+    direct_config,
+    direct_metadata,
+):
+    client = FakeXDSClient()
+    client.next_completion = SimpleNamespace(
+        request_id=None,
+        status=0,
+        error_code=0,
+        completed_bytes=2048,
+    )
+    backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
+    connector = FakeStreamingGPUConnector(backend)
+    keys = _five_keys()[:2]
+
+    result = backend.batched_put_from_gpu_blocking(
+        keys, [0, 4], [4, 8], connector, slot_mapping=object()
+    )
+
+    assert result is not None
+    assert result.completed == (False, True)
+    assert result.short_io_chunks == 1
+    assert not backend.contains(keys[0])
+    assert backend.contains(keys[1])
+    assert backend.get_memory_allocator().num_active_allocations == 0
+    backend.close()
+
+
+def test_xds_backend_windowed_write_gather_failure_releases_all_slots(
+    direct_config,
+    direct_metadata,
+):
+    client = FakeXDSClient()
+    backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
+    connector = FakeStreamingGPUConnector(backend, fail_gather=True)
+    keys = _five_keys()[:2]
+
+    with pytest.raises(RuntimeError, match="gather failed"):
+        backend.batched_put_from_gpu_blocking(
+            keys, [0, 4], [4, 8], connector, slot_mapping=object()
+        )
+
+    assert backend.get_memory_allocator().num_active_allocations == 0
+    assert not any(backend.contains(key) for key in keys)
+    backend.close()
+
+
+def test_xds_backend_windowed_pool_reserves_read_and_write_slots(
+    direct_config,
+    direct_metadata,
+):
+    direct_config.xds_read_slot_count = 2
+    direct_config.xds_write_slot_count = 2
+    client = FakeXDSClient()
+    client.metadata.gpu_buffer_size_bytes = 3 * 4096
+
+    with pytest.raises(ValueError, match="read_slots=2, write_slots=2"):
+        XDSBackend(direct_config, direct_metadata, client, "cpu")

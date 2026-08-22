@@ -6,6 +6,7 @@ from collections import OrderedDict
 from concurrent.futures import Future
 from typing import Any, Callable, Optional, Sequence
 import threading
+import time
 
 # Third Party
 import torch
@@ -18,6 +19,7 @@ from lmcache.v1.memory_management import MemoryObj, TensorMemoryAllocator
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
 from lmcache.v1.storage_backend.cascadekv_backend import CascadeKVBackend
+from lmcache.v1.storage_backend.transfer_result import BackendTransferResult
 from lmcache.v1.storage_backend.xds_read_ring import XDSReadRingPump
 from lmcache.v1.storage_backend.xds_write_scheduler import (
     LeaseState,
@@ -64,6 +66,17 @@ class XDSBackend(CascadeKVBackend):
                 "xDS registered GPU pool must hold at least one blob: "
                 f"pool={self.registered_size}, blob={self.blob_size}"
             )
+        if config.xds_windowed_io:
+            required_size = (
+                config.xds_read_slot_count + config.xds_write_slot_count
+            ) * self.blob_size
+            if self.registered_size < required_size:
+                raise ValueError(
+                    f"xDS windowed I/O requires {required_size} bytes: "
+                    f"pool={self.registered_size}, blob={self.blob_size}, "
+                    f"read_slots={config.xds_read_slot_count}, "
+                    f"write_slots={config.xds_write_slot_count}"
+                )
         if self.registered_size % self.io_unit_size != 0:
             raise ValueError(
                 "xDS registered GPU pool must be I/O-unit aligned: "
@@ -108,6 +121,480 @@ class XDSBackend(CascadeKVBackend):
 
     def calculate_chunk_budget(self) -> int:
         return self.registered_size // self.blob_size
+
+    def _make_transfer_result(
+        self,
+        completed: Sequence[bool],
+        *,
+        requested_bytes: int,
+        completed_bytes: int,
+        window_size: int,
+        window_count: int,
+        peak_staging_bytes: int,
+        storage_seconds: float,
+        gpu_seconds: float,
+        slot_wait_seconds: float,
+        short_io_chunks: int,
+        peak_inflight_io: int,
+    ) -> BackendTransferResult:
+        return BackendTransferResult(
+            completed=tuple(completed),
+            requested_bytes=requested_bytes,
+            completed_bytes=completed_bytes,
+            device=self.dst_device,
+            window_size=window_size,
+            window_count=window_count,
+            peak_staging_bytes=peak_staging_bytes,
+            storage_seconds=storage_seconds,
+            gpu_seconds=gpu_seconds,
+            overlap_seconds=0.0,
+            bank_wait_seconds=slot_wait_seconds,
+            short_io_chunks=short_io_chunks,
+            timeout_chunks=0,
+            logical_chunk_count=len(completed),
+            read_slot_count=self.config.xds_read_slot_count,
+            write_slot_count=self.config.xds_write_slot_count,
+            io_queue_depth=self.config.xds_io_queue_depth,
+            peak_inflight_io=peak_inflight_io,
+            slot_wait_seconds=slot_wait_seconds,
+        )
+
+    def _write_window(
+        self,
+        task_infos: Sequence[dict[str, Any]],
+        objects: Sequence[MemoryObj],
+    ) -> tuple[list[bool], int, int]:
+        """Persist one slot-sized window with bounded xDS queue depth."""
+        if len(task_infos) != len(objects):
+            raise ValueError("xDS write window inputs must have equal lengths")
+        if not task_infos:
+            return [], 0, 0
+
+        items: list[dict[str, Any]] = []
+        released_handles: set[int] = set()
+        committed_handles: set[int] = set()
+        try:
+            for index, (info, memory_obj) in enumerate(
+                zip(task_infos, objects, strict=True)
+            ):
+                blob_handle = int(self.client.get_blob(timeout=5.0))
+                if blob_handle <= 0:
+                    raise RuntimeError(
+                        f"xDS returned an invalid blob handle {blob_handle}"
+                    )
+                try:
+                    offset, size = self._buffer_descriptor(memory_obj)
+                except BaseException:
+                    self.client.release_blob(blob_handle)
+                    released_handles.add(blob_handle)
+                    raise
+                items.append(
+                    {
+                        "index": index,
+                        "info": info,
+                        "memory_obj": memory_obj,
+                        "blob_handle": blob_handle,
+                        "offset": offset,
+                        "size": size,
+                    }
+                )
+
+            pump = XDSReadRingPump(
+                queue_depth=self.config.xds_io_queue_depth,
+                submit=lambda item: int(
+                    self.client.submit_write(
+                        item["blob_handle"],
+                        self.buffer_ref,
+                        item["offset"],
+                        0,
+                        item["size"],
+                    )
+                ),
+                wait_any=self.client.wait_any_result,
+                timeout=30.0,
+            )
+            for item in items:
+                pump.put(item)
+            pump.close_input()
+            with self._io_lock:
+                pump.run()
+
+            outcomes = [False] * len(items)
+            completed_bytes = 0
+            short_io_chunks = 0
+            first_error: Optional[BaseException] = None
+            for _ in items:
+                ring_completion = pump.get_completion()
+                if ring_completion.error is not None:
+                    if first_error is None:
+                        first_error = ring_completion.error
+                    continue
+                item = ring_completion.item
+                completion = ring_completion.completion
+                status = int(completion.status)
+                completed_size = int(completion.completed_bytes)
+                if status == 0 and completed_size == item["size"]:
+                    metadata = XDSBlobMetadata(
+                        blob_handle=item["blob_handle"],
+                        size=item["size"],
+                        shapes=item["memory_obj"].get_shapes(),
+                        dtypes=item["memory_obj"].get_dtypes(),
+                        fmt=item["memory_obj"].get_memory_format(),
+                    )
+                    with self._entries_lock:
+                        self._entries[item["info"]["key"]] = metadata
+                    committed_handles.add(item["blob_handle"])
+                    outcomes[item["index"]] = True
+                    completed_bytes += item["size"]
+                else:
+                    self.client.release_blob(item["blob_handle"])
+                    released_handles.add(item["blob_handle"])
+                    if status == 0:
+                        short_io_chunks += 1
+
+            if first_error is None and pump.error is not None:
+                first_error = pump.error
+            if first_error is not None:
+                raise first_error
+            return outcomes, completed_bytes, short_io_chunks
+        except BaseException:
+            for item in items:
+                blob_handle = item["blob_handle"]
+                if (
+                    blob_handle not in committed_handles
+                    and blob_handle not in released_handles
+                ):
+                    self.client.release_blob(blob_handle)
+                    released_handles.add(blob_handle)
+            raise
+
+    def batched_get_to_gpu_blocking(
+        self,
+        keys: list[CacheEngineKey],
+        starts: list[int],
+        ends: list[int],
+        gpu_connector: Any,
+        **kwargs: Any,
+    ) -> Optional[BackendTransferResult]:
+        """Read a logical batch through a bounded registered-GPU slot ring."""
+        if not self.config.xds_windowed_io:
+            return None
+        if not (len(keys) == len(starts) == len(ends)):
+            raise ValueError("xDS streaming read inputs must have equal lengths")
+
+        completed = [False] * len(keys)
+        task_infos: list[dict[str, Any]] = []
+        for index, (key, start, end) in enumerate(
+            zip(keys, starts, ends, strict=True)
+        ):
+            with self._entries_lock:
+                blob_metadata = self._entries.get(key)
+                if blob_metadata is None:
+                    continue
+                blob_metadata.pin()
+                self._entries.move_to_end(key)
+            task_infos.append(
+                {
+                    "index": index,
+                    "metadata": blob_metadata,
+                    "start": start,
+                    "end": end,
+                }
+            )
+
+        requested_bytes = sum(info["metadata"].size for info in task_infos)
+        if not task_infos:
+            return self._make_transfer_result(
+                completed,
+                requested_bytes=0,
+                completed_bytes=0,
+                window_size=self.config.xds_read_window_size,
+                window_count=0,
+                peak_staging_bytes=0,
+                storage_seconds=0.0,
+                gpu_seconds=0.0,
+                slot_wait_seconds=0.0,
+                short_io_chunks=0,
+                peak_inflight_io=0,
+            )
+
+        pump = XDSReadRingPump(
+            queue_depth=self.config.xds_io_queue_depth,
+            submit=lambda entry: int(
+                self.client.submit_read(
+                    entry["metadata"].blob_handle,
+                    self.buffer_ref,
+                    entry["offset"],
+                    0,
+                    entry["size"],
+                )
+            ),
+            wait_any=self.client.wait_any_result,
+            timeout=30.0,
+        )
+
+        def run_pump() -> None:
+            with self._io_lock:
+                pump.run()
+
+        pump_thread = threading.Thread(target=run_pump, name="xds-read-ring")
+        live_entries: dict[int, dict[str, Any]] = {}
+        next_task = 0
+        input_closed = False
+        peak_staging_bytes = 0
+        submitted_count = 0
+        completed_bytes = 0
+        short_io_chunks = 0
+        storage_seconds = 0.0
+        gpu_seconds = 0.0
+        slot_wait_seconds = 0.0
+
+        def release_entry(entry: dict[str, Any]) -> None:
+            entry["memory_obj"].ref_count_down()
+            with self._entries_lock:
+                entry["metadata"].unpin()
+
+        def fill_free_slots() -> None:
+            nonlocal next_task, input_closed, peak_staging_bytes, submitted_count
+            while (
+                len(live_entries) < self.config.xds_read_slot_count
+                and next_task < len(task_infos)
+            ):
+                info = task_infos[next_task]
+                next_task += 1
+                memory_obj = self.allocate(
+                    info["metadata"].shapes,
+                    info["metadata"].dtypes,
+                    info["metadata"].fmt,
+                    busy_loop=False,
+                )
+                if memory_obj is None:
+                    with self._entries_lock:
+                        info["metadata"].unpin()
+                    continue
+                try:
+                    offset, size = self._buffer_descriptor(memory_obj)
+                    if size != info["metadata"].size:
+                        raise RuntimeError(
+                            "xDS allocation size does not match stored blob: "
+                            f"allocated={size}, stored={info['metadata'].size}"
+                        )
+                    entry = {
+                        **info,
+                        "memory_obj": memory_obj,
+                        "offset": offset,
+                        "size": size,
+                    }
+                    pump.put(entry)
+                except BaseException:
+                    memory_obj.ref_count_down()
+                    with self._entries_lock:
+                        info["metadata"].unpin()
+                    raise
+                live_entries[id(entry)] = entry
+                submitted_count += 1
+                peak_staging_bytes = max(
+                    peak_staging_bytes,
+                    sum(item["size"] for item in live_entries.values()),
+                )
+            if next_task == len(task_infos) and not input_closed:
+                pump.close_input()
+                input_closed = True
+
+        pump_thread.start()
+        try:
+            fill_free_slots()
+            while live_entries:
+                storage_start = time.perf_counter()
+                ring_completion = pump.get_completion()
+                storage_seconds += time.perf_counter() - storage_start
+                if ring_completion.error is not None:
+                    raise ring_completion.error
+                entry = ring_completion.item
+                live_entries.pop(id(entry))
+                try:
+                    completion = ring_completion.completion
+                    if (
+                        int(completion.status) == 0
+                        and int(completion.completed_bytes) == entry["size"]
+                    ):
+                        gpu_start = time.perf_counter()
+                        gpu_connector.to_gpu(
+                            entry["memory_obj"],
+                            entry["start"],
+                            entry["end"],
+                            **kwargs,
+                        )
+                        event = gpu_connector.record_transfer_event("load")
+                        wait_start = time.perf_counter()
+                        event.synchronize()
+                        slot_wait_seconds += time.perf_counter() - wait_start
+                        gpu_seconds += time.perf_counter() - gpu_start
+                        completed[entry["index"]] = True
+                        completed_bytes += entry["size"]
+                    elif int(completion.status) == 0:
+                        short_io_chunks += 1
+                finally:
+                    release_entry(entry)
+                fill_free_slots()
+        finally:
+            if not input_closed:
+                pump.close_input()
+            pump_thread.join(timeout=30.0)
+            for entry in live_entries.values():
+                release_entry(entry)
+            for info in task_infos[next_task:]:
+                with self._entries_lock:
+                    info["metadata"].unpin()
+        if pump_thread.is_alive():
+            raise TimeoutError("timed out stopping xDS read ring")
+        if pump.error is not None:
+            raise pump.error
+
+        window_count = (
+            len(task_infos) + self.config.xds_read_window_size - 1
+        ) // self.config.xds_read_window_size
+        return self._make_transfer_result(
+            completed,
+            requested_bytes=requested_bytes,
+            completed_bytes=completed_bytes,
+            window_size=self.config.xds_read_window_size,
+            window_count=window_count,
+            peak_staging_bytes=peak_staging_bytes,
+            storage_seconds=storage_seconds,
+            gpu_seconds=gpu_seconds,
+            slot_wait_seconds=slot_wait_seconds,
+            short_io_chunks=short_io_chunks,
+            peak_inflight_io=min(
+                self.config.xds_io_queue_depth, submitted_count
+            ),
+        )
+
+    def batched_put_from_gpu_blocking(
+        self,
+        keys: Sequence[CacheEngineKey],
+        starts: list[int],
+        ends: list[int],
+        gpu_connector: Any,
+        **kwargs: Any,
+    ) -> Optional[BackendTransferResult]:
+        """Gather and persist a logical batch through bounded GPU slots."""
+        if not self.config.xds_windowed_io:
+            return None
+        if not (len(keys) == len(starts) == len(ends)):
+            raise ValueError("xDS streaming write inputs must have equal lengths")
+        if self._write_scheduler is not None:
+            return self._batched_put_from_gpu_async(
+                keys, starts, ends, gpu_connector, **kwargs
+            )
+
+        completed = [False] * len(keys)
+        task_infos = []
+        with self._put_tasks_lock, self._entries_lock:
+            for index, (key, start, end) in enumerate(
+                zip(keys, starts, ends, strict=True)
+            ):
+                if key in self._put_tasks or key in self._entries:
+                    continue
+                self._put_tasks.add(key)
+                task_infos.append(
+                    {
+                        "index": index,
+                        "key": key,
+                        "start": start,
+                        "end": end,
+                    }
+                )
+
+        requested_bytes = 0
+        completed_bytes = 0
+        peak_staging_bytes = 0
+        short_io_chunks = 0
+        gpu_seconds = 0.0
+        storage_seconds = 0.0
+        slot_wait_seconds = 0.0
+        wall_start = time.perf_counter()
+        try:
+            for window_start in range(
+                0, len(task_infos), self.config.xds_write_slot_count
+            ):
+                window_infos = task_infos[
+                    window_start : window_start + self.config.xds_write_slot_count
+                ]
+                objects: list[MemoryObj] = []
+                try:
+                    for info in window_infos:
+                        memory_obj = self.allocate(
+                            self.metadata.get_shapes(info["end"] - info["start"]),
+                            self.metadata.get_dtypes(),
+                            busy_loop=False,
+                        )
+                        if memory_obj is None:
+                            raise MemoryError("xDS write slot allocation failed")
+                        objects.append(memory_obj)
+                    sizes = [obj.get_physical_size() for obj in objects]
+                    requested_bytes += sum(sizes)
+                    peak_staging_bytes = max(peak_staging_bytes, sum(sizes))
+
+                    gpu_start = time.perf_counter()
+                    gpu_connector.batched_from_gpu(
+                        objects,
+                        [info["start"] for info in window_infos],
+                        [info["end"] for info in window_infos],
+                        **kwargs,
+                    )
+                    event = gpu_connector.record_transfer_event("store")
+                    wait_start = time.perf_counter()
+                    event.synchronize()
+                    slot_wait_seconds += time.perf_counter() - wait_start
+                    gpu_seconds += time.perf_counter() - gpu_start
+
+                    storage_start = time.perf_counter()
+                    outcomes, window_bytes, window_short = self._write_window(
+                        window_infos, objects
+                    )
+                    storage_seconds += time.perf_counter() - storage_start
+                    completed_bytes += window_bytes
+                    short_io_chunks += window_short
+                    for info, outcome in zip(window_infos, outcomes, strict=True):
+                        completed[info["index"]] = outcome
+                finally:
+                    for memory_obj in objects:
+                        memory_obj.ref_count_down()
+                    with self._put_tasks_lock:
+                        for info in window_infos:
+                            self._put_tasks.discard(info["key"])
+        finally:
+            with self._put_tasks_lock:
+                for info in task_infos:
+                    self._put_tasks.discard(info["key"])
+
+        window_count = (
+            len(task_infos) + self.config.xds_write_window_size - 1
+        ) // self.config.xds_write_window_size
+        result = self._make_transfer_result(
+            completed,
+            requested_bytes=requested_bytes,
+            completed_bytes=completed_bytes,
+            window_size=self.config.xds_write_window_size,
+            window_count=window_count,
+            peak_staging_bytes=peak_staging_bytes,
+            storage_seconds=storage_seconds,
+            gpu_seconds=gpu_seconds,
+            slot_wait_seconds=slot_wait_seconds,
+            short_io_chunks=short_io_chunks,
+            peak_inflight_io=min(
+                self.config.xds_io_queue_depth, len(task_infos)
+            ),
+        )
+        logger.info(
+            "[xDS Window] direction=write chunks=%d slots=%d bytes=%d wall_ms=%.3f",
+            len(task_infos),
+            self.config.xds_write_slot_count,
+            completed_bytes,
+            (time.perf_counter() - wall_start) * 1000,
+        )
+        return result
 
     def _validate_registered_range(self, offset: int, size: int) -> None:
         if offset < 0 or size <= 0 or offset + size > self.registered_size:

@@ -101,6 +101,8 @@ class XDSReadRingPump:
                     if first_error is None:
                         first_error = error
                         self._failed.set()
+                    failed_items.extend(pending.values())
+                    pending.clear()
                     continue
                 item = pending.pop(int(completion.request_id), None)
                 if item is None:
