@@ -19,10 +19,14 @@ from lmcache.v1.memory_management import MemoryObj, TensorMemoryAllocator
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
 from lmcache.v1.storage_backend.cascadekv_backend import CascadeKVBackend
-from lmcache.v1.storage_backend.transfer_result import BackendTransferResult
+from lmcache.v1.storage_backend.transfer_result import (
+    BackendTransferResult,
+    BackendWriteSubmissionResult,
+)
 from lmcache.v1.storage_backend.xds_read_ring import XDSReadRingPump
 from lmcache.v1.storage_backend.xds_write_scheduler import (
     LeaseState,
+    SchedulerSnapshot,
     StagingLease,
     XDSAsyncWriteScheduler,
 )
@@ -50,7 +54,9 @@ class XDSBackend(CascadeKVBackend):
         self._entries: OrderedDict[CacheEngineKey, XDSBlobMetadata] = OrderedDict()
         self._entries_lock = threading.RLock()
         self._put_tasks: set[CacheEngineKey] = set()
+        self._pending_objects: dict[CacheEngineKey, MemoryObj] = {}
         self._put_tasks_lock = threading.RLock()
+        self._async_admission_lock = threading.Lock()
         self._io_lock = threading.Lock()
         self._keys_in_request: list[CacheEngineKey] = []
 
@@ -283,10 +289,32 @@ class XDSBackend(CascadeKVBackend):
             raise ValueError("xDS streaming read inputs must have equal lengths")
 
         completed = [False] * len(keys)
+        pending_infos: list[dict[str, Any]] = []
+        pending_indexes: set[int] = set()
+        with self._put_tasks_lock:
+            for index, (key, start, end) in enumerate(
+                zip(keys, starts, ends, strict=True)
+            ):
+                memory_obj = self._pending_objects.get(key)
+                if memory_obj is None:
+                    continue
+                memory_obj.ref_count_up()
+                pending_indexes.add(index)
+                pending_infos.append(
+                    {
+                        "index": index,
+                        "memory_obj": memory_obj,
+                        "start": start,
+                        "end": end,
+                        "size": memory_obj.get_physical_size(),
+                    }
+                )
         task_infos: list[dict[str, Any]] = []
         for index, (key, start, end) in enumerate(
             zip(keys, starts, ends, strict=True)
         ):
+            if index in pending_indexes:
+                continue
             with self._entries_lock:
                 blob_metadata = self._entries.get(key)
                 if blob_metadata is None:
@@ -302,18 +330,48 @@ class XDSBackend(CascadeKVBackend):
                 }
             )
 
-        requested_bytes = sum(info["metadata"].size for info in task_infos)
+        requested_bytes = sum(info["size"] for info in pending_infos) + sum(
+            info["metadata"].size for info in task_infos
+        )
+        pending_completed_bytes = 0
+        pending_gpu_seconds = 0.0
+        pending_wait_seconds = 0.0
+        try:
+            for info in pending_infos:
+                gpu_start = time.perf_counter()
+                gpu_connector.to_gpu(
+                    info["memory_obj"],
+                    info["start"],
+                    info["end"],
+                    **kwargs,
+                )
+                event = gpu_connector.record_transfer_event("load")
+                wait_start = time.perf_counter()
+                event.synchronize()
+                pending_wait_seconds += time.perf_counter() - wait_start
+                pending_gpu_seconds += time.perf_counter() - gpu_start
+                completed[info["index"]] = True
+                pending_completed_bytes += info["size"]
+        except BaseException:
+            for info in task_infos:
+                with self._entries_lock:
+                    info["metadata"].unpin()
+            raise
+        finally:
+            for info in pending_infos:
+                info["memory_obj"].ref_count_down()
+
         if not task_infos:
             return self._make_transfer_result(
                 completed,
-                requested_bytes=0,
-                completed_bytes=0,
+                requested_bytes=requested_bytes,
+                completed_bytes=pending_completed_bytes,
                 window_size=self.config.xds_read_window_size,
                 window_count=0,
                 peak_staging_bytes=0,
                 storage_seconds=0.0,
-                gpu_seconds=0.0,
-                slot_wait_seconds=0.0,
+                gpu_seconds=pending_gpu_seconds,
+                slot_wait_seconds=pending_wait_seconds,
                 short_io_chunks=0,
                 peak_inflight_io=0,
             )
@@ -343,11 +401,11 @@ class XDSBackend(CascadeKVBackend):
         input_closed = False
         peak_staging_bytes = 0
         submitted_count = 0
-        completed_bytes = 0
+        completed_bytes = pending_completed_bytes
         short_io_chunks = 0
         storage_seconds = 0.0
-        gpu_seconds = 0.0
-        slot_wait_seconds = 0.0
+        gpu_seconds = pending_gpu_seconds
+        slot_wait_seconds = pending_wait_seconds
 
         def release_entry(entry: dict[str, Any]) -> None:
             entry["memory_obj"].ref_count_down()
@@ -477,7 +535,7 @@ class XDSBackend(CascadeKVBackend):
         ends: list[int],
         gpu_connector: Any,
         **kwargs: Any,
-    ) -> Optional[BackendTransferResult]:
+    ) -> Optional[BackendTransferResult | BackendWriteSubmissionResult]:
         """Gather and persist a logical batch through bounded GPU slots."""
         if not self.config.xds_windowed_io:
             return None
@@ -596,6 +654,135 @@ class XDSBackend(CascadeKVBackend):
         )
         return result
 
+    def _batched_put_from_gpu_async(
+        self,
+        keys: Sequence[CacheEngineKey],
+        starts: list[int],
+        ends: list[int],
+        gpu_connector: Any,
+        **kwargs: Any,
+    ) -> BackendWriteSubmissionResult:
+        scheduler = self._write_scheduler
+        assert scheduler is not None
+        scheduler.check_healthy()
+        accepted = [False] * len(keys)
+        accepted_bytes = 0
+        staging_seconds = 0.0
+        backpressure_seconds = 0.0
+
+        with self._async_admission_lock:
+            task_infos: list[dict[str, Any]] = []
+            seen: set[CacheEngineKey] = set()
+            with self._put_tasks_lock, self._entries_lock:
+                for index, (key, start, end) in enumerate(
+                    zip(keys, starts, ends, strict=True)
+                ):
+                    if key in seen or key in self._put_tasks or key in self._entries:
+                        continue
+                    seen.add(key)
+                    task_infos.append(
+                        {
+                            "index": index,
+                            "key": key,
+                            "start": start,
+                            "end": end,
+                        }
+                    )
+
+            for lease_start in range(
+                0, len(task_infos), self.config.xds_write_slot_count
+            ):
+                lease_infos = task_infos[
+                    lease_start : lease_start + self.config.xds_write_slot_count
+                ]
+                reserved_bytes = len(lease_infos) * self.blob_size
+                backpressure_seconds += scheduler.acquire_credits(
+                    reserved_bytes,
+                    timeout=float(self.config.blocking_timeout_secs),
+                )
+                objects: list[MemoryObj] = []
+                pending_installed = False
+                enqueued = False
+                staging_start = time.perf_counter()
+                try:
+                    for info in lease_infos:
+                        memory_obj = self.allocate(
+                            self.metadata.get_shapes(
+                                info["end"] - info["start"]
+                            ),
+                            self.metadata.get_dtypes(),
+                            busy_loop=False,
+                        )
+                        if memory_obj is None:
+                            raise MemoryError("xDS async write slot allocation failed")
+                        objects.append(memory_obj)
+                    sizes = [obj.get_physical_size() for obj in objects]
+                    gpu_connector.batched_from_gpu(
+                        objects,
+                        [info["start"] for info in lease_infos],
+                        [info["end"] for info in lease_infos],
+                        **kwargs,
+                    )
+                    event = gpu_connector.record_transfer_event("store")
+                    event.synchronize()
+                    lease = StagingLease(
+                        keys=tuple(info["key"] for info in lease_infos),
+                        indexes=tuple(info["index"] for info in lease_infos),
+                        objects=tuple(objects),
+                        sizes=tuple(sizes),
+                        credited_bytes=sum(sizes),
+                        reserved_bytes=reserved_bytes,
+                    )
+                    lease.direct_from_gpu = True
+                    lease.resources_released = False
+                    lease.io_outcome = None
+                    lease.transition(LeaseState.PENDING)
+                    with self._put_tasks_lock:
+                        self._put_tasks.update(lease.keys)
+                        for key, memory_obj in zip(
+                            lease.keys, lease.objects, strict=True
+                        ):
+                            self._pending_objects[key] = memory_obj
+                    pending_installed = True
+                    scheduler.enqueue(lease)
+                    enqueued = True
+                    for index in lease.indexes:
+                        accepted[index] = True
+                    accepted_bytes += sum(sizes)
+                    staging_seconds += time.perf_counter() - staging_start
+                except BaseException:
+                    if pending_installed:
+                        with self._put_tasks_lock:
+                            for info in lease_infos:
+                                self._put_tasks.discard(info["key"])
+                                self._pending_objects.pop(info["key"], None)
+                    if not enqueued:
+                        for memory_obj in objects:
+                            memory_obj.ref_count_down()
+                        scheduler.release_credits(reserved_bytes)
+                    raise
+
+        snapshot = scheduler.snapshot()
+        logger.info(
+            "[xDS Async Submit] accepted=%d bytes=%d staging_ms=%.3f "
+            "backpressure_ms=%.3f queue=%d outstanding_mib=%.1f",
+            sum(accepted),
+            accepted_bytes,
+            staging_seconds * 1000,
+            backpressure_seconds * 1000,
+            snapshot.queued_leases,
+            snapshot.outstanding_bytes / (1024**2),
+        )
+        return BackendWriteSubmissionResult(
+            accepted=tuple(accepted),
+            accepted_bytes=accepted_bytes,
+            durable=False,
+            staging_seconds=staging_seconds,
+            backpressure_seconds=backpressure_seconds,
+            queue_depth=snapshot.queued_leases,
+            outstanding_bytes=snapshot.outstanding_bytes,
+        )
+
     def _validate_registered_range(self, offset: int, size: int) -> None:
         if offset < 0 or size <= 0 or offset + size > self.registered_size:
             raise ValueError(
@@ -618,7 +805,100 @@ class XDSBackend(CascadeKVBackend):
             )
         return offset, size
 
-    def _submit_async_lease(self, lease: StagingLease) -> bool:
+    def _write_direct_async_lease(
+        self,
+        lease: StagingLease,
+    ) -> tuple[int, ...]:
+        items: list[dict[str, Any]] = []
+        blob_handles: list[int] = []
+        try:
+            for memory_obj, expected_size in zip(
+                lease.objects, lease.sizes, strict=True
+            ):
+                blob_handle = int(self.client.get_blob(timeout=5.0))
+                if blob_handle <= 0:
+                    raise RuntimeError(
+                        f"xDS returned an invalid blob handle {blob_handle}"
+                    )
+                blob_handles.append(blob_handle)
+                offset, size = self._buffer_descriptor(memory_obj)
+                if size != expected_size:
+                    raise RuntimeError(
+                        "xDS async staging size changed after admission"
+                    )
+                items.append(
+                    {
+                        "blob_handle": blob_handle,
+                        "offset": offset,
+                        "size": size,
+                    }
+                )
+
+            pump = XDSReadRingPump(
+                queue_depth=self.config.xds_io_queue_depth,
+                submit=lambda item: int(
+                    self.client.submit_write(
+                        item["blob_handle"],
+                        self.buffer_ref,
+                        item["offset"],
+                        0,
+                        item["size"],
+                    )
+                ),
+                wait_any=self.client.wait_any_result,
+                timeout=30.0,
+            )
+            for item in items:
+                pump.put(item)
+            pump.close_input()
+            with self._io_lock:
+                pump.run()
+
+            failures: list[str] = []
+            first_error: Optional[BaseException] = None
+            for _ in items:
+                ring_completion = pump.get_completion()
+                if ring_completion.error is not None:
+                    if first_error is None:
+                        first_error = ring_completion.error
+                    continue
+                completion = ring_completion.completion
+                item = ring_completion.item
+                if (
+                    int(completion.status) != 0
+                    or int(completion.completed_bytes) != item["size"]
+                ):
+                    failures.append(
+                        f"request {completion.request_id} "
+                        f"status={completion.status} "
+                        f"completed={completion.completed_bytes} "
+                        f"expected={item['size']}"
+                    )
+            if first_error is None and pump.error is not None:
+                first_error = pump.error
+            if first_error is not None:
+                raise first_error
+            if failures:
+                raise RuntimeError("xDS async write failed: " + "; ".join(failures))
+            outcome = tuple(blob_handles)
+            lease.io_outcome = outcome
+            return outcome
+        except BaseException:
+            for blob_handle in blob_handles:
+                self.client.release_blob(blob_handle)
+            raise
+
+    @staticmethod
+    def _release_direct_lease_objects(lease: StagingLease) -> None:
+        if getattr(lease, "resources_released", False):
+            return
+        for memory_obj in lease.objects:
+            memory_obj.ref_count_down()
+        lease.resources_released = True
+
+    def _submit_async_lease(self, lease: StagingLease) -> Any:
+        if getattr(lease, "direct_from_gpu", False):
+            return self._write_direct_async_lease(lease)
         key = lease.keys[0]
         memory_obj = lease.objects[0]
         assert isinstance(key, CacheEngineKey)
@@ -654,6 +934,31 @@ class XDSBackend(CascadeKVBackend):
                 self._put_tasks.discard(key)
 
     def _commit_async_lease(self, lease: StagingLease, outcome: Any) -> None:
+        if getattr(lease, "direct_from_gpu", False):
+            blob_handles = tuple(outcome)
+            if len(blob_handles) != len(lease.keys):
+                raise RuntimeError("xDS async outcome has the wrong handle count")
+            with self._entries_lock:
+                for key, memory_obj, size, blob_handle in zip(
+                    lease.keys,
+                    lease.objects,
+                    lease.sizes,
+                    blob_handles,
+                    strict=True,
+                ):
+                    self._entries[key] = XDSBlobMetadata(
+                        blob_handle=blob_handle,
+                        size=size,
+                        shapes=memory_obj.get_shapes(),
+                        dtypes=memory_obj.get_dtypes(),
+                        fmt=memory_obj.get_memory_format(),
+                    )
+            with self._put_tasks_lock:
+                for key in lease.keys:
+                    self._put_tasks.discard(key)
+                    self._pending_objects.pop(key, None)
+            self._release_direct_lease_objects(lease)
+            return
         self._finish_async_lease(lease, outcome=bool(outcome))
 
     def _rollback_async_lease(
@@ -661,7 +966,42 @@ class XDSBackend(CascadeKVBackend):
         lease: StagingLease,
         error: BaseException,
     ) -> None:
+        if getattr(lease, "direct_from_gpu", False):
+            blob_handles = tuple(getattr(lease, "io_outcome", ()) or ())
+            with self._entries_lock:
+                for key, blob_handle in zip(
+                    lease.keys, blob_handles, strict=False
+                ):
+                    metadata = self._entries.get(key)
+                    if (
+                        metadata is not None
+                        and metadata.blob_handle == blob_handle
+                    ):
+                        self._entries.pop(key)
+            for blob_handle in blob_handles:
+                self.client.release_blob(blob_handle)
+            with self._put_tasks_lock:
+                for key in lease.keys:
+                    self._put_tasks.discard(key)
+                    self._pending_objects.pop(key, None)
+            self._release_direct_lease_objects(lease)
+            logger.error(
+                "[xDS Async Rollback] chunks=%d bytes=%d error=%s",
+                len(lease.keys),
+                lease.credited_bytes,
+                error,
+            )
+            return
         self._finish_async_lease(lease, error=error)
+
+    def flush_async_writes(
+        self,
+        timeout: Optional[float] = None,
+    ) -> SchedulerSnapshot:
+        """Wait until all admitted asynchronous xDS writes are durable."""
+        if self._write_scheduler is None:
+            raise RuntimeError("xDS asynchronous writes are not enabled")
+        return self._write_scheduler.drain(timeout)
 
     def batched_submit_put_task(
         self,
@@ -818,22 +1158,47 @@ class XDSBackend(CascadeKVBackend):
     def close(self) -> None:
         if self._closed:
             return
+        first_error: Optional[BaseException] = None
         if self._write_scheduler is not None:
-            self._write_scheduler.close(timeout=30.0)
+            try:
+                self._write_scheduler.close(timeout=30.0)
+            except BaseException as error:
+                first_error = error
         active_allocations = self.memory_allocator.num_active_allocations
         if active_allocations:
-            raise RuntimeError(
+            active_error = RuntimeError(
                 "cannot close XDSBackend with active registered allocations: "
                 f"{active_allocations}"
             )
+            if first_error is not None:
+                raise first_error from active_error
+            raise active_error
         with self._entries_lock:
             blob_handles = [metadata.blob_handle for metadata in self._entries.values()]
             self._entries.clear()
         for blob_handle in blob_handles:
-            self.client.release_blob(blob_handle)
-        self.memory_allocator.close()
-        self.client.unregister_buffer(self.buffer_ref)
+            try:
+                self.client.release_blob(blob_handle)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        try:
+            self.memory_allocator.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        try:
+            self.client.unregister_buffer(self.buffer_ref)
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
         client_close = getattr(self.client, "close", None)
         if callable(client_close):
-            client_close()
+            try:
+                client_close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
         self._closed = True
+        if first_error is not None:
+            raise first_error

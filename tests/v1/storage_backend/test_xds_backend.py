@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from types import SimpleNamespace
+from threading import Event
 
 # Third Party
 import pytest
@@ -83,6 +84,19 @@ class FakeXDSClient:
 
     def close(self):
         self.calls.append("close")
+
+
+class BlockingWriteClient(FakeXDSClient):
+    def __init__(self):
+        super().__init__()
+        self.write_wait_started = Event()
+        self.release_write = Event()
+
+    def wait_any_result(self, timeout=5.0):
+        self.write_wait_started.set()
+        if not self.release_write.wait(timeout):
+            raise TimeoutError("test write remained blocked")
+        return super().wait_any_result(timeout)
 
 
 class FakeTransferEvent:
@@ -482,3 +496,99 @@ def test_xds_backend_windowed_pool_reserves_read_and_write_slots(
 
     with pytest.raises(ValueError, match="read_slots=2, write_slots=2"):
         XDSBackend(direct_config, direct_metadata, client, "cpu")
+
+
+def test_xds_backend_async_direct_write_uses_bounded_leases(
+    direct_config,
+    direct_metadata,
+):
+    direct_config.xds_async_write = True
+    direct_config.xds_read_slot_count = 2
+    direct_config.xds_write_slot_count = 2
+    client = FakeXDSClient()
+    client.metadata.gpu_buffer_size_bytes = 4 * 4096
+    backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
+    connector = FakeStreamingGPUConnector(backend)
+    keys = _five_keys()
+    starts = [index * 4 for index in range(5)]
+    ends = [start + 4 for start in starts]
+
+    result = backend.batched_put_from_gpu_blocking(
+        keys, starts, ends, connector, slot_mapping=object()
+    )
+
+    assert result is not None
+    assert result.accepted == (True, True, True, True, True)
+    assert result.accepted_bytes == 5 * 4096
+    assert result.durable is False
+    assert [entry[0] for entry in connector.gather_ranges] == [2, 2, 1]
+    assert connector.peak_active <= 2
+    snapshot = backend.flush_async_writes(timeout=1.0)
+    assert snapshot.outstanding_bytes == 0
+    assert all(backend.contains(key) for key in keys)
+    assert backend.get_memory_allocator().num_active_allocations == 0
+    backend.close()
+
+
+def test_xds_backend_async_pending_lease_is_immediately_readable(
+    direct_config,
+    direct_metadata,
+):
+    direct_config.xds_async_write = True
+    client = BlockingWriteClient()
+    backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
+    store_connector = FakeStreamingGPUConnector(backend)
+    load_connector = FakeStreamingGPUConnector(backend)
+    key = _five_keys()[0]
+
+    submission = backend.batched_put_from_gpu_blocking(
+        [key], [0], [4], store_connector, slot_mapping=object()
+    )
+    assert submission is not None
+    assert submission.accepted == (True,)
+    assert client.write_wait_started.wait(timeout=1.0)
+
+    result = backend.batched_get_to_gpu_blocking(
+        [key], [0], [4], load_connector, slot_mapping=object()
+    )
+
+    assert result is not None
+    assert result.completed == (True,)
+    assert load_connector.scatter_ranges == [(0, 4)]
+    assert "submit_read" not in client.calls
+    client.release_write.set()
+    backend.flush_async_writes(timeout=1.0)
+    backend.close()
+
+
+def test_xds_backend_async_failure_rolls_back_and_close_cleans_resources(
+    direct_config,
+    direct_metadata,
+):
+    direct_config.xds_async_write = True
+    client = FakeXDSClient()
+    client.next_completion = SimpleNamespace(
+        request_id=None,
+        status=0,
+        error_code=0,
+        completed_bytes=2048,
+    )
+    backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
+    connector = FakeStreamingGPUConnector(backend)
+    key = _five_keys()[0]
+
+    submission = backend.batched_put_from_gpu_blocking(
+        [key], [0], [4], connector, slot_mapping=object()
+    )
+
+    assert submission is not None
+    assert submission.accepted == (True,)
+    with pytest.raises(RuntimeError, match="xDS async write failed"):
+        backend.flush_async_writes(timeout=1.0)
+    assert not backend.contains(key)
+    assert backend.get_memory_allocator().num_active_allocations == 0
+    assert client.released_blob_handles == [700]
+    with pytest.raises(RuntimeError, match="xDS async write failed"):
+        backend.close()
+    assert client.unregistered == [77]
+    assert "close" in client.calls
