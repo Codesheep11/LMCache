@@ -55,6 +55,10 @@ from lmcache.v1.memory_management import (  # noqa: E501
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.storage_backend.storage_manager import StorageManager
+from lmcache.v1.storage_backend.transfer_result import (
+    BackendTransferResult,
+    BackendWriteSubmissionResult,
+)
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
 from lmcache.v1.token_database import (
     ChunkedTokenDatabase,
@@ -446,7 +450,6 @@ class LMCacheEngine:
         starts: List[int] = []
         ends: List[int] = []
         keys: List[CacheEngineKey] = []
-        memory_objs: List[MemoryObj] = []
 
         tot_kv_size = 0
         tot_token_num = 0
@@ -465,35 +468,10 @@ class LMCacheEngine:
                 request_configs=request_configs,
             ):
                 assert isinstance(key, CacheEngineKey)
-                # Allocate the memory object
                 num_tokens = end - start
-                kv_shapes = self.metadata.get_shapes(num_tokens)
-                kv_dtypes = self.metadata.get_dtypes()
-
-                # TODO (Jiayi): should be batched in the future
-                memory_obj = self.storage_manager.allocate(
-                    kv_shapes,
-                    kv_dtypes,
-                    busy_loop=self.config.get_extra_config_value(
-                        "force_store_wait", False
-                    ),
-                    fmt=self.fmt,
-                )
-                if memory_obj is None:
-                    logger.warning(
-                        "Local cpu memory under pressure so"
-                        " choosing to store only "
-                        f" {len(memory_objs)}"
-                        " total chunks of KV cache."
-                    )
-                    break
-
                 starts.append(start)
                 ends.append(end)
                 keys.append(key)
-                memory_objs.append(memory_obj)
-                tot_kv_size += memory_obj.get_size()
-                tot_token_num += num_tokens
 
                 # Create KV event
                 if self.kv_events_enabled:
@@ -525,9 +503,88 @@ class LMCacheEngine:
                     self.kv_events.append(stored_event)
                     prev_key = key.chunk_hash
 
-        # memory_objs might be empty, directly return to avoid sending tokens
+        if not keys:
+            return
+
+        with store_stats.profile_from_gpu():
+            direct_transfer = self.storage_manager.batched_put_from_gpu(
+                keys=keys,
+                starts=starts,
+                ends=ends,
+                gpu_connector=self.gpu_connector,
+                location=self.store_location,
+                **kwargs,
+            )
+        if isinstance(direct_transfer, BackendTransferResult):
+            if len(direct_transfer.completed) != len(keys):
+                raise RuntimeError(
+                    "backend transfer result length does not match key count"
+                )
+            tot_token_num = sum(
+                end - start
+                for completed, start, end in zip(
+                    direct_transfer.completed, starts, ends, strict=True
+                )
+                if completed
+            )
+            tot_kv_size = direct_transfer.completed_bytes
+        elif isinstance(direct_transfer, BackendWriteSubmissionResult):
+            if len(direct_transfer.accepted) != len(keys):
+                raise RuntimeError(
+                    "backend write submission length does not match key count"
+                )
+            tot_token_num = sum(
+                end - start
+                for accepted, start, end in zip(
+                    direct_transfer.accepted, starts, ends, strict=True
+                )
+                if accepted
+            )
+            tot_kv_size = direct_transfer.accepted_bytes
+        else:
+            direct_transfer = None
+
+        if direct_transfer is not None:
+            self.stats_monitor.on_store_finished(store_stats, tot_token_num)
+            tot_time = store_stats.time_to_store()
+            logger.info(
+                "[req_id=%s] Stored %d out of total %d tokens through direct "
+                "backend. size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s",
+                req_id,
+                tot_token_num,
+                num_to_store_tokens,
+                tot_kv_size / 1024**3,
+                tot_time * 1000,
+                tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
+            )
+            return
+
+        memory_objs: List[MemoryObj] = []
+        for start, end in zip(starts, ends, strict=True):
+            num_tokens = end - start
+            memory_obj = self.storage_manager.allocate(
+                self.metadata.get_shapes(num_tokens),
+                self.metadata.get_dtypes(),
+                busy_loop=self.config.get_extra_config_value("force_store_wait", False),
+                fmt=self.fmt,
+            )
+            if memory_obj is None:
+                logger.warning(
+                    "Local cpu memory under pressure so choosing to store only "
+                    "%d total chunks of KV cache.",
+                    len(memory_objs),
+                )
+                break
+            memory_objs.append(memory_obj)
+            tot_kv_size += memory_obj.get_size()
+            tot_token_num += num_tokens
+
         if not memory_objs:
             return
+        if len(memory_objs) != len(keys):
+            keys = keys[: len(memory_objs)]
+            starts = starts[: len(memory_objs)]
+            ends = ends[: len(memory_objs)]
 
         with store_stats.profile_from_gpu():
             self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
@@ -1653,6 +1710,33 @@ class LMCacheEngine:
         last_failed_block_start = None
         for location, blocks in block_mapping.items():
             keys = [key for key, _, _ in blocks]
+            assert self.gpu_connector is not None
+            direct_transfer = self.storage_manager.batched_get_to_gpu(
+                keys=keys,
+                starts=[start for _, start, _ in blocks],
+                ends=[end for _, _, end in blocks],
+                gpu_connector=self.gpu_connector,
+                location=location,
+                **kwargs,
+            )
+            if isinstance(direct_transfer, BackendTransferResult):
+                if len(direct_transfer.completed) != len(blocks):
+                    raise RuntimeError(
+                        "backend transfer result length does not match block count"
+                    )
+                tot_kv_size += direct_transfer.completed_bytes
+                for (_, start, end), completed in zip(
+                    blocks, direct_transfer.completed, strict=True
+                ):
+                    if completed:
+                        ret_mask[start:end] = True
+                    elif (
+                        last_failed_block_start is None
+                        or last_failed_block_start < start
+                    ):
+                        last_failed_block_start = start
+                continue
+
             memory_objs = self.storage_manager.batched_get(
                 keys=keys,
                 location=location,

@@ -43,6 +43,10 @@ from lmcache.v1.storage_backend.abstract_backend import (
     StorageBackendInterface,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.transfer_result import (
+    BackendTransferResult,
+    BackendWriteSubmissionResult,
+)
 
 if TYPE_CHECKING:
     # First Party
@@ -436,6 +440,32 @@ class StorageManager:
             for memory_obj in objs:
                 memory_obj.ref_count_down()
 
+    def batched_put_from_gpu(
+        self,
+        keys: Sequence[CacheEngineKey],
+        starts: list[int],
+        ends: list[int],
+        gpu_connector: Any,
+        location: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Optional[Union[BackendTransferResult, BackendWriteSubmissionResult]]:
+        """Let one selected backend stream KV chunks directly from GPU.
+
+        The optional fast path is accepted only when backend filtering resolves
+        to the direct ``XDSBackend`` alone. Returning ``None`` means the caller
+        must preserve LMCache's regular allocate-and-put behavior.
+        """
+        active_backends = list(self.get_active_storage_backends(location=location))
+        if len(active_backends) != 1:
+            return None
+        backend_name, backend = active_backends[0]
+        if backend_name != "XDSBackend":
+            return None
+        method = getattr(backend, "batched_put_from_gpu_blocking", None)
+        if method is None:
+            return None
+        return method(keys, starts, ends, gpu_connector, **kwargs)
+
     def get(
         self,
         key: CacheEngineKey,
@@ -521,6 +551,31 @@ class StorageManager:
                     local_cpu_backend.batched_submit_put_task(keys, memory_objs_no_none)
                 return memory_objs
         return [None] * len(keys)
+
+    def batched_get_to_gpu(
+        self,
+        keys: list[CacheEngineKey],
+        starts: list[int],
+        ends: list[int],
+        gpu_connector: Any,
+        location: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Optional[BackendTransferResult]:
+        """Stream selected backend objects directly into final GPU KV cache.
+
+        Returns ``None`` when the selected backend does not implement the
+        optional direct-transfer hook, allowing the caller to use ``batched_get``.
+        """
+        active_backends = list(self.get_active_storage_backends(location=location))
+        if len(active_backends) != 1:
+            return None
+        backend_name, backend = active_backends[0]
+        if backend_name != "XDSBackend":
+            return None
+        method = getattr(backend, "batched_get_to_gpu_blocking", None)
+        if method is None:
+            return None
+        return method(keys, starts, ends, gpu_connector, **kwargs)
 
     def layerwise_batched_get(
         self,
