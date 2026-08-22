@@ -45,6 +45,24 @@ class FakeXDSClient:
         self.closed = True
 
 
+class FakeCUDART:
+    def cudaHostRegister(self, _ptr, _size, _flags):
+        return 0
+
+    def cudaHostUnregister(self, _ptr):
+        return 0
+
+    def cudaGetErrorString(self, status):
+        return f"fake CUDA error {status}"
+
+
+@pytest.fixture(autouse=True)
+def fake_cudart(monkeypatch):
+    runtime = FakeCUDART()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: runtime)
+    return runtime
+
+
 @pytest.fixture
 def metadata():
     return LMCacheMetadata(

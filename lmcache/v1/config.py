@@ -703,8 +703,7 @@ def _validate_config(self):
             self.cascadekv_write_slot_count,
         ):
             raise ValueError(
-                "cascadekv_io_queue_depth cannot exceed the read or write "
-                "slot count"
+                "cascadekv_io_queue_depth cannot exceed the read or write slot count"
             )
     return self
 
