@@ -310,9 +310,7 @@ class XDSBackend(CascadeKVBackend):
                     }
                 )
         task_infos: list[dict[str, Any]] = []
-        for index, (key, start, end) in enumerate(
-            zip(keys, starts, ends, strict=True)
-        ):
+        for index, (key, start, end) in enumerate(zip(keys, starts, ends, strict=True)):
             if index in pending_indexes:
                 continue
             with self._entries_lock:
@@ -414,10 +412,9 @@ class XDSBackend(CascadeKVBackend):
 
         def fill_free_slots() -> None:
             nonlocal next_task, input_closed, peak_staging_bytes, submitted_count
-            while (
-                len(live_entries) < self.config.xds_read_slot_count
-                and next_task < len(task_infos)
-            ):
+            while len(
+                live_entries
+            ) < self.config.xds_read_slot_count and next_task < len(task_infos):
                 info = task_infos[next_task]
                 next_task += 1
                 memory_obj = self.allocate(
@@ -523,9 +520,7 @@ class XDSBackend(CascadeKVBackend):
             gpu_seconds=gpu_seconds,
             slot_wait_seconds=slot_wait_seconds,
             short_io_chunks=short_io_chunks,
-            peak_inflight_io=min(
-                self.config.xds_io_queue_depth, submitted_count
-            ),
+            peak_inflight_io=min(self.config.xds_io_queue_depth, submitted_count),
         )
 
     def batched_put_from_gpu_blocking(
@@ -641,9 +636,7 @@ class XDSBackend(CascadeKVBackend):
             gpu_seconds=gpu_seconds,
             slot_wait_seconds=slot_wait_seconds,
             short_io_chunks=short_io_chunks,
-            peak_inflight_io=min(
-                self.config.xds_io_queue_depth, len(task_infos)
-            ),
+            peak_inflight_io=min(self.config.xds_io_queue_depth, len(task_infos)),
         )
         logger.info(
             "[xDS Window] direction=write chunks=%d slots=%d bytes=%d wall_ms=%.3f",
@@ -707,9 +700,7 @@ class XDSBackend(CascadeKVBackend):
                 try:
                     for info in lease_infos:
                         memory_obj = self.allocate(
-                            self.metadata.get_shapes(
-                                info["end"] - info["start"]
-                            ),
+                            self.metadata.get_shapes(info["end"] - info["start"]),
                             self.metadata.get_dtypes(),
                             busy_loop=False,
                         )
@@ -823,9 +814,7 @@ class XDSBackend(CascadeKVBackend):
                 blob_handles.append(blob_handle)
                 offset, size = self._buffer_descriptor(memory_obj)
                 if size != expected_size:
-                    raise RuntimeError(
-                        "xDS async staging size changed after admission"
-                    )
+                    raise RuntimeError("xDS async staging size changed after admission")
                 items.append(
                     {
                         "blob_handle": blob_handle,
@@ -969,14 +958,9 @@ class XDSBackend(CascadeKVBackend):
         if getattr(lease, "direct_from_gpu", False):
             blob_handles = tuple(getattr(lease, "io_outcome", ()) or ())
             with self._entries_lock:
-                for key, blob_handle in zip(
-                    lease.keys, blob_handles, strict=False
-                ):
+                for key, blob_handle in zip(lease.keys, blob_handles, strict=False):
                     metadata = self._entries.get(key)
-                    if (
-                        metadata is not None
-                        and metadata.blob_handle == blob_handle
-                    ):
+                    if metadata is not None and metadata.blob_handle == blob_handle:
                         self._entries.pop(key)
             for blob_handle in blob_handles:
                 self.client.release_blob(blob_handle)

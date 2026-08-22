@@ -36,10 +36,20 @@ cluster；本机服务的 blob/cluster 都是 6 MiB。在 `use_layerwise: true` 
 blobstore cluster 大小。
 
 direct 后端还把 xDS 服务配置的 `xds_gpu_buffer_size_bytes` 作为注册 GPU
-allocator。它必须足以容纳一次 store 阶段同时收集的 KV；容量不足时 LMCache
-会记录 `no enough memory`，并只保存能容纳的前缀。例如本机 64 MiB 配置配合
-Qwen3-0.6B 可完整验证约 500 token 的短请求；若要缓存 4K prompt，应在启动
-xDS 服务前把该注册池调大到覆盖对应 KV 总字节数。
+allocator。启用 `xds_windowed_io` 后，注册池只需至少容纳
+`(xds_read_slot_count + xds_write_slot_count) × 对齐后的 xDS blob_size`，不再按
+prompt 的总 chunk 数预分配 staging 显存。例如读槽位为 2、写槽位为 8 时，
+注册池至少需要 10 个 blob；4K 或更长 prompt 会循环复用这些槽位。服务侧 SSD
+blob pool 仍需有足够的持久化容量。
+
+`xds_read_window_size` 和 `xds_write_window_size` 只用于逻辑窗口统计，实际同时
+驻留的 staging 对象数量由 read/write slot count 限制，xDS 同时在途请求数由
+`xds_io_queue_depth` 限制。`xds_async_write: true` 时，每个异步 lease 同样不超过
+写槽位预算，并在下一批 GPU gather 前施加反压。
+
+当前有界 direct hook 由非 layerwise 的 `store()` / `retrieve()` 路径调用。
+`use_layerwise: true` 的 SGLang 路径继续使用原有逐层接口，不应把本节的长
+prompt 有界 staging 结论直接套用到逐层模式。
 
 ## 启动外部 xDS 服务
 

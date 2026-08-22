@@ -25,7 +25,7 @@ class FakeXDSClient:
             io_unit_size=4096,
             blob_size_bytes=4096,
             capacity_bytes=4096 * 16,
-            gpu_buffer_size_bytes=4096 * 2,
+            gpu_buffer_size_bytes=4096 * 10,
         )
         self.closed = False
 
