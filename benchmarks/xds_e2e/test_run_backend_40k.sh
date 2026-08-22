@@ -8,6 +8,8 @@ CASCADE_CONFIG=$ROOT/benchmarks/xds_e2e/cascadekv_40k.yaml
 
 disk=$(BACKEND=disk BENCHMARK_LOG=/tmp/disk.log BENCHMARK_DRY_RUN=1 bash "$RUNNER")
 cascade=$(BACKEND=cascadekv BENCHMARK_LOG=/tmp/cascade.log BENCHMARK_DRY_RUN=1 bash "$RUNNER")
+smoke=$(BACKEND=cascadekv BENCHMARK_LOG=/tmp/cascade-smoke.log \
+  BENCHMARK_DRY_RUN=1 NUM_PROMPTS=1 REPEAT_COUNT=2 bash "$RUNNER")
 
 [[ "$disk" == *disk_40k.yaml* ]]
 [[ "$cascade" == *cascadekv_40k.yaml* ]]
@@ -24,6 +26,8 @@ for output in "$disk" "$cascade"; do
   [[ "$output" == *"--no-enable-prefix-caching"* ]]
   [[ "$output" != *"--enable-prefix-caching"* ]]
 done
+[[ "$smoke" == *"--num-prompts 1"* ]]
+[[ "$smoke" == *"--repeat-count 2"* ]]
 
 rg -q '^max_local_cpu_size: 2$' "$CASCADE_CONFIG"
 rg -q '^xds_max_size: 500$' "$CASCADE_CONFIG"

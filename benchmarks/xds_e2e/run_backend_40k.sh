@@ -10,6 +10,8 @@ MODEL=/mnt/adminserver-nfsrdma/Model/Qwen3-30B-A3B
 BACKEND=${BACKEND:-}
 BENCHMARK_LOG=${BENCHMARK_LOG:-}
 BENCHMARK_DRY_RUN=${BENCHMARK_DRY_RUN:-0}
+NUM_PROMPTS=${NUM_PROMPTS:-5}
+REPEAT_COUNT=${REPEAT_COUNT:-20}
 
 case "$BACKEND" in
   disk)
@@ -48,8 +50,8 @@ cmd=(
   --prefix-len 0
   --tensor-parallel-size 4
   --input-length-range 40000:40000
-  --num-prompts 5
-  --repeat-count 20
+  --num-prompts "$NUM_PROMPTS"
+  --repeat-count "$REPEAT_COUNT"
   --output-len 1
   --max-num-seqs 1
   --no-enable-prefix-caching
