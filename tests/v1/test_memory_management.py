@@ -21,6 +21,7 @@ from lmcache.v1.memory_management import (
     PinMemoryAllocator,
     TensorMemoryAllocator,
     TensorMemoryObj,
+    XDSServiceMemoryAllocator,
 )
 from lmcache.v1.pin_monitor import PinMonitor
 
@@ -885,3 +886,76 @@ class TestLazyMemoryAllocator:
 
         assert allocator.memcheck()
         allocator.close()
+
+
+class FakeXDSServiceAllocatorClient:
+    def __init__(self, lifecycle):
+        self.lifecycle = lifecycle
+        self.storage = None
+        self.freed = []
+
+    def alloc_buffer(self, size):
+        self.lifecycle.append(("alloc_buffer", size))
+        self.storage = bytearray(size)
+        return memoryview(self.storage), 73
+
+    def free_buffer(self, buffer_ref):
+        self.lifecycle.append(("free_buffer", buffer_ref))
+        self.freed.append(buffer_ref)
+
+
+class FakeXDSServiceAllocatorCUDART:
+    def __init__(self, lifecycle, register_status=0):
+        self.lifecycle = lifecycle
+        self.register_status = register_status
+
+    def cudaHostRegister(self, ptr, size, flags):
+        self.lifecycle.append(("register", ptr, size, flags))
+        return self.register_status
+
+    def cudaHostUnregister(self, ptr):
+        self.lifecycle.append(("unregister", ptr))
+        return 0
+
+    def cudaGetErrorString(self, status):
+        return f"fake CUDA error {status}"
+
+
+def test_xds_service_allocator_wraps_one_registered_buffer(monkeypatch):
+    lifecycle = []
+    client = FakeXDSServiceAllocatorClient(lifecycle)
+    runtime = FakeXDSServiceAllocatorCUDART(lifecycle)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: runtime)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    allocator = XDSServiceMemoryAllocator(client, 16384, 4096)
+    first = allocator.allocate(torch.Size([4096]), torch.uint8)
+    second = allocator.allocate(torch.Size([4096]), torch.uint8)
+
+    assert first is not None
+    assert second is not None
+    assert allocator.buffer_ref == 73
+    assert allocator.get_buffer_offset(first) == 0
+    assert allocator.get_buffer_offset(second) == 4096
+    assert first.raw_data.data_ptr() == allocator.base_ptr
+    assert second.raw_data.data_ptr() == allocator.base_ptr + 4096
+
+    first.ref_count_down()
+    second.ref_count_down()
+    allocator.close()
+    assert lifecycle[-2:] == [
+        ("unregister", allocator.base_ptr),
+        ("free_buffer", 73),
+    ]
+
+
+def test_xds_service_allocator_registration_failure_frees_buffer(monkeypatch):
+    lifecycle = []
+    client = FakeXDSServiceAllocatorClient(lifecycle)
+    runtime = FakeXDSServiceAllocatorCUDART(lifecycle, register_status=17)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: runtime)
+
+    with pytest.raises(RuntimeError, match="cudaHostRegister"):
+        XDSServiceMemoryAllocator(client, 16384, 4096)
+
+    assert client.freed == [73]

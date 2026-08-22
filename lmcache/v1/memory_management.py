@@ -1536,6 +1536,90 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         return "TensorMemoryAllocator"
 
 
+class XDSServiceMemoryAllocator(TensorMemoryAllocator):
+    """Allocate LMCache objects from one xDS service-owned CPU DMA buffer."""
+
+    def __init__(self, client: Any, size: int, align_bytes: int):
+        """Allocate, pin, and wrap an xDS service CPU buffer.
+
+        Args:
+            client: Connected rank-local xDS service client.
+            size: Total allocator capacity in bytes.
+            align_bytes: Required xDS I/O alignment in bytes.
+
+        Raises:
+            RuntimeError: If the service buffer cannot be CUDA host registered.
+        """
+        self.client = client
+        self.size = size
+        self.align_bytes = align_bytes
+        self.buffer_ref: Optional[int] = None
+        self._view: Optional[memoryview] = None
+        self._cudart: Any = None
+        self._host_registered = False
+        self._closed = False
+
+        view, buffer_ref = client.alloc_buffer(size)
+        self._view = view
+        self.buffer_ref = int(buffer_ref)
+        tensor = torch.frombuffer(view, dtype=torch.uint8).flatten()
+        if tensor.numel() != size:
+            client.free_buffer(self.buffer_ref)
+            self.buffer_ref = None
+            raise RuntimeError(
+                "xDS service returned an unexpected CPU buffer size: "
+                f"{tensor.numel()} != {size}"
+            )
+        self.base_ptr = tensor.data_ptr()
+        self._cudart = torch.cuda.cudart()
+        register_status = int(
+            self._cudart.cudaHostRegister(self.base_ptr, self.size, 0)
+        )
+        if register_status != 0:
+            error_string = self._cudart.cudaGetErrorString(register_status)
+            client.free_buffer(self.buffer_ref)
+            self.buffer_ref = None
+            raise RuntimeError(
+                "xDS service cudaHostRegister failed: "
+                f"status={register_status}, error={error_string}"
+            )
+        self._host_registered = True
+        super().__init__(tensor, align_bytes=align_bytes)
+
+    def get_buffer_offset(self, memory_obj: MemoryObj) -> int:
+        """Return the service-buffer byte offset for a tensor memory object."""
+        if not isinstance(memory_obj, TensorMemoryObj):
+            raise TypeError("xDS service allocator requires TensorMemoryObj")
+        offset = memory_obj.raw_data.data_ptr() - self.base_ptr
+        end = offset + memory_obj.get_physical_size()
+        if offset < 0 or end > self.size:
+            raise ValueError("memory object is outside the xDS service buffer")
+        if offset % self.align_bytes != 0:
+            raise ValueError(
+                "memory object offset is not xDS I/O aligned: "
+                f"offset={offset}, align={self.align_bytes}"
+            )
+        return offset
+
+    def close(self) -> None:
+        """Unregister and release the service-owned CPU DMA buffer."""
+        if self._closed:
+            return
+        if self._host_registered:
+            torch.cuda.synchronize()
+            unregister_status = int(self._cudart.cudaHostUnregister(self.base_ptr))
+            if unregister_status != 0:
+                raise RuntimeError(
+                    "xDS service cudaHostUnregister failed: "
+                    f"status={unregister_status}"
+                )
+            self._host_registered = False
+        if self.buffer_ref is not None:
+            self.client.free_buffer(self.buffer_ref)
+            self.buffer_ref = None
+        self._closed = True
+
+
 class PagedAddressManager:
     """
     A lightweight address manager for PagedTensorMemoryAllocator.
