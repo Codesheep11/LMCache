@@ -40,7 +40,7 @@ cmd=(
   LMCACHE_LOG_LEVEL=INFO
   "LMCACHE_CONFIG_FILE=$config"
   "$PYTHON"
-  "$VLLM_ROOT/benchmarks/benchmark_prefix_caching.py"
+  "$LMCACHE_ROOT/benchmarks/xds_e2e/benchmark_prefix_caching_metrics.py"
   --model "$MODEL"
   --enforce-eager
   --max-model-len 40960

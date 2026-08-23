@@ -13,6 +13,7 @@ smoke=$(BACKEND=cascadekv BENCHMARK_LOG=/tmp/cascade-smoke.log \
 
 [[ "$disk" == *disk_40k.yaml* ]]
 [[ "$cascade" == *cascadekv_40k.yaml* ]]
+[[ "$cascade" == *benchmark_prefix_caching_metrics.py* ]]
 for output in "$disk" "$cascade"; do
   [[ "$output" == *"/home/yangxc/miniconda3/envs/xds043/bin/python"* ]]
   [[ "$output" == *"/home/yangxc/workspace/vllm-v0180/benchmarks/benchmark_prefix_caching.py"* ]]
