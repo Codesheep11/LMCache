@@ -84,6 +84,27 @@ def test_wait_next_times_out_without_cancelling_request() -> None:
     pump.close()
 
 
+def test_pending_count_tracks_unconsumed_completions() -> None:
+    client = FakePollClient()
+    pump = CascadeKVCompletionPump(client)
+    group = pump.create_group()
+
+    pump.submit(group, "first", lambda: 51)
+    pump.submit(group, "second", lambda: 52)
+    client.publish(FakeCompletion(51), FakeCompletion(52))
+
+    assert len(group.wait_all(1.0)) == 2
+
+    # Both requests completed before the caller began consuming them.  They
+    # must still count as pending work for a wait_next()-driven overlap loop.
+    assert group.pending_count == 2
+    assert group.wait_next(1.0).context == "first"
+    assert group.pending_count == 1
+    assert group.wait_next(1.0).context == "second"
+    assert group.pending_count == 0
+    pump.close()
+
+
 def test_completion_module_does_not_use_futures() -> None:
     source = Path(
         "/home/yangxc/workspace/LMCache-v043-xds/"

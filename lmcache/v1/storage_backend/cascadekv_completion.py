@@ -30,12 +30,13 @@ class CascadeKVRequestGroup(Generic[ContextT]):
         self._registration_order: list[int] = []
         self._completion_order: deque[int] = deque()
         self._results: dict[int, CascadeKVCompletedRequest[ContextT]] = {}
+        self._consumed_count = 0
 
     @property
     def pending_count(self) -> int:
-        """Return the number of registered requests not yet completed."""
+        """Return the number of registered requests not yet consumed."""
         with self._condition:
-            return len(self._registration_order) - len(self._results)
+            return len(self._registration_order) - self._consumed_count
 
     def add(self, request_id: int, context: ContextT) -> None:
         """Register a submitted request and its caller context."""
@@ -71,6 +72,7 @@ class CascadeKVRequestGroup(Generic[ContextT]):
                     raise TimeoutError("timed out waiting for xDS completion")
                 self._condition.wait(remaining)
             request_id = self._completion_order.popleft()
+            self._consumed_count += 1
             return self._results[request_id]
 
     def wait_all(

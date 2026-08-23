@@ -28,6 +28,7 @@ from lmcache.v1.memory_management import (
 from lmcache.v1.xds_utils import align_to_io_unit
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.transfer_result import BackendTransferResult
 from lmcache.v1.storage_backend.cascadekv_completion import (
     CascadeKVCompletionPump,
     CascadeKVRequestGroup,
@@ -975,7 +976,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
         ends: List[int],
         gpu_connector: Any,
         **kwargs,
-    ) -> Optional[List[Optional[MemoryObj]]]:
+    ) -> Optional[BackendTransferResult]:
         if not self.enable_chunked_gpu_overlap or len(keys) <= 1:
             return None
 
@@ -986,6 +987,14 @@ class CascadeKVBackend(AllocatorBackendInterface):
             )
 
         results: List[Optional[MemoryObj]] = [None] * len(keys)
+        completed = [False] * len(keys)
+        requested_bytes = 0
+        completed_bytes = 0
+        peak_staging_bytes = 0
+        storage_seconds = 0.0
+        gpu_seconds = 0.0
+        peak_inflight_io = 0
+        transfer_records: list[tuple[Any, MemoryObj, Optional[CacheEngineKey]]] = []
         remaining_indexes = list(range(len(keys)))
 
         indexes_after_put_tasks_check = []
@@ -996,12 +1005,17 @@ class CascadeKVBackend(AllocatorBackendInterface):
                     memory_obj = self.put_tasks[key]
                     memory_obj.ref_count_up()
                     results[idx] = memory_obj
+                    size = memory_obj.get_physical_size()
+                    requested_bytes += size
+                    gpu_start = time.perf_counter()
                     gpu_connector.to_gpu(memory_obj, starts[idx], ends[idx], **kwargs)
+                    event = gpu_connector.record_transfer_event("load")
+                    gpu_seconds += time.perf_counter() - gpu_start
+                    transfer_records.append((event, memory_obj, None))
+                    completed[idx] = True
+                    completed_bytes += size
                 else:
                     indexes_after_put_tasks_check.append(idx)
-
-        if not indexes_after_put_tasks_check:
-            return results
 
         indexes_after_prefetch_check = []
         prefetch_futures_to_wait: List[Tuple[int, Future]] = []
@@ -1020,9 +1034,17 @@ class CascadeKVBackend(AllocatorBackendInterface):
                 if memory_obj:
                     if self.local_cpu_backend.contains(key, pin=True):
                         results[idx] = memory_obj
+                        size = memory_obj.get_physical_size()
+                        requested_bytes += size
+                        gpu_start = time.perf_counter()
                         gpu_connector.to_gpu(
                             memory_obj, starts[idx], ends[idx], **kwargs
                         )
+                        event = gpu_connector.record_transfer_event("load")
+                        gpu_seconds += time.perf_counter() - gpu_start
+                        transfer_records.append((event, memory_obj, key))
+                        completed[idx] = True
+                        completed_bytes += size
                     else:
                         logger.warning(
                             f"Prefetched obj {key} was evicted from CPU. Re-reading."
@@ -1040,9 +1062,6 @@ class CascadeKVBackend(AllocatorBackendInterface):
                     exc_info=True,
                 )
                 indexes_after_prefetch_check.append(idx)
-
-        if not indexes_after_prefetch_check:
-            return results
 
         xds_tasks_info = []
         with self.dict_lock:
@@ -1066,32 +1085,72 @@ class CascadeKVBackend(AllocatorBackendInterface):
                     }
                 )
 
-        if not xds_tasks_info:
-            return results
-
-        start_time = time.time()
-        total_read_bytes = self._perform_batched_connector_overlap_xds_read(
-            xds_tasks_info,
-            results,
-            gpu_connector,
-            **kwargs,
-        )
-        read_time = time.time() - start_time
-        if total_read_bytes > 0:
-            with self.stats_lock:
-                self.cumulative_read_bytes += total_read_bytes
-                self.cumulative_read_time += read_time
-                logger.info(
-                    "current average read bandwidth: "
-                    f"{(self.cumulative_read_bytes / self.cumulative_read_time) / (1024 * 1024):.2f} MB/s"
+        requested_bytes += sum(task_info["storage_size"] for task_info in xds_tasks_info)
+        peak_staging_bytes = requested_bytes
+        peak_inflight_io = len(xds_tasks_info)
+        try:
+            if xds_tasks_info:
+                start_time = time.perf_counter()
+                xds_completed_bytes = (
+                    self._perform_batched_connector_overlap_xds_read(
+                        xds_tasks_info,
+                        results,
+                        completed,
+                        transfer_records,
+                        gpu_connector,
+                        **kwargs,
+                    )
                 )
+                storage_seconds = time.perf_counter() - start_time
+                completed_bytes += xds_completed_bytes
+                if xds_completed_bytes > 0:
+                    with self.stats_lock:
+                        self.cumulative_read_bytes += xds_completed_bytes
+                        self.cumulative_read_time += storage_seconds
+                        logger.info(
+                            "current average read bandwidth: "
+                            f"{(self.cumulative_read_bytes / self.cumulative_read_time) / (1024 * 1024):.2f} MB/s"
+                        )
+        finally:
+            wait_start = time.perf_counter()
+            try:
+                for event, _, _ in transfer_records:
+                    event.synchronize()
+            finally:
+                gpu_seconds += time.perf_counter() - wait_start
+                for _, memory_obj, local_cpu_key in transfer_records:
+                    memory_obj.ref_count_down()
+                    if local_cpu_key is not None:
+                        self.local_cpu_backend.unpin(local_cpu_key)
 
-        return results
+        return BackendTransferResult(
+            completed=tuple(completed),
+            requested_bytes=requested_bytes,
+            completed_bytes=completed_bytes,
+            device=self.dst_device,
+            window_size=max(1, len(keys)),
+            window_count=1 if requested_bytes else 0,
+            peak_staging_bytes=peak_staging_bytes,
+            storage_seconds=storage_seconds,
+            gpu_seconds=gpu_seconds,
+            overlap_seconds=0.0,
+            bank_wait_seconds=0.0,
+            short_io_chunks=0,
+            timeout_chunks=0,
+            logical_chunk_count=len(keys),
+            read_slot_count=0,
+            write_slot_count=0,
+            io_queue_depth=0,
+            peak_inflight_io=peak_inflight_io,
+            slot_wait_seconds=0.0,
+        )
 
     def _perform_batched_connector_overlap_xds_read(
         self,
         xds_tasks_info: List[Dict[str, Any]],
         results: List[Optional[MemoryObj]],
+        completed_flags: List[bool],
+        transfer_records: list[tuple[Any, MemoryObj, Optional[CacheEngineKey]]],
         gpu_connector: Any,
         **kwargs,
     ) -> int:
@@ -1100,7 +1159,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
 
         group = self.completion_pump.create_group()
         io_sizes: List[int] = []
-        total_request_bytes = 0
+        completed_bytes = 0
         completed_indexes = set()
         io_start = time.perf_counter()
 
@@ -1121,7 +1180,6 @@ class CascadeKVBackend(AllocatorBackendInterface):
 
                 results[task_info["index"]] = memory_obj
                 io_sizes.append(storage_size)
-                total_request_bytes += storage_size
                 self._submit_read(
                     group,
                     task_info,
@@ -1153,6 +1211,11 @@ class CascadeKVBackend(AllocatorBackendInterface):
                     completion["end"],
                     **kwargs,
                 )
+                event = gpu_connector.record_transfer_event("load")
+                transfer_records.append((event, memory_obj, None))
+                results[completion["index"]] = None
+                completed_flags[completion["index"]] = True
+                completed_bytes += completion["storage_size"]
                 completed_indexes.add(completion["index"])
 
             self._log_io_trace(
@@ -1161,7 +1224,7 @@ class CascadeKVBackend(AllocatorBackendInterface):
                 time.perf_counter() - io_start,
                 True,
             )
-            return total_request_bytes
+            return completed_bytes
         except Exception as e:
             self._log_io_trace(
                 "read_batch_connector_overlap",
@@ -1659,29 +1722,14 @@ class CascadeKVBackend(AllocatorBackendInterface):
         location: Optional[str] = None,
     ) -> Optional["Future"]:
         del location
+        # LMCache 0.4.3 invokes this per-key lookahead before its direct batch
+        # transfer.  In overlap mode the batch completion pump already owns the
+        # SSD-to-CPU-to-GPU pipeline; launching another Future here would issue
+        # duplicate xDS reads and race the same DMA allocator/completion queue.
         if self.enable_chunked_gpu_overlap:
-            with self.dict_lock:
-                if key not in self.dict:
-                    return None
+            return None
 
-                metadata = self.dict[key]
-                if self._should_use_chunked_gpu_overlap(metadata.size):
-                    self.evictor.update_on_get(key, self.dict)
-                    metadata.pin()
-                    future = asyncio.run_coroutine_threadsafe(
-                        self.async_load_bytes_from_xds_to_device(
-                            blob_handle=metadata.blob_handle,
-                            storage_size=metadata.size,
-                            dtype=metadata.dtypes,
-                            shape=metadata.shapes,
-                            fmt=metadata.fmt,
-                        ),
-                        self.loop,
-                    )
-                    future.add_done_callback(
-                        lambda f: self._finish_async_device_read(key, f)
-                    )
-                    return future
+        # Preserve the legacy CPU prefetch path when direct overlap is disabled.
         return self.submit_prefetch_task(key)
 
     def _remove_prefetch_task(self, key: CacheEngineKey, future: Future):

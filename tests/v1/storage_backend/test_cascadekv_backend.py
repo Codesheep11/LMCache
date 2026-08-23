@@ -19,6 +19,7 @@ from lmcache.v1.memory_management import XDSServiceMemoryAllocator
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.cascadekv_backend import CascadeKVBackend
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.transfer_result import BackendTransferResult
 
 
 class FakeCUDART:
@@ -30,6 +31,29 @@ class FakeCUDART:
 
     def cudaGetErrorString(self, status):
         return f"fake CUDA error {status}"
+
+
+class FakeTransferEvent:
+    def __init__(self):
+        self.synchronized = False
+
+    def synchronize(self):
+        self.synchronized = True
+
+
+class FakeGPUConnector:
+    def __init__(self):
+        self.ranges = []
+        self.events = []
+
+    def to_gpu(self, _memory_obj, start, end, **_kwargs):
+        self.ranges.append((start, end))
+
+    def record_transfer_event(self, direction):
+        assert direction == "load"
+        event = FakeTransferEvent()
+        self.events.append(event)
+        return event
 
 
 class FakeXDSClient:
@@ -218,6 +242,56 @@ def test_cascadekv_batch_read_submits_all_requests_and_routes_out_of_order(
     for result in results:
         assert result is not None
         result.ref_count_down()
+
+
+def test_cascadekv_overlap_returns_transfer_result_and_releases_staging(
+    cascade_stack,
+):
+    backend, _local_cpu_backend, client = cascade_stack
+    backend.enable_chunked_gpu_overlap = True
+    keys = make_keys(4)
+    chunks = allocate_chunks(backend, 4)
+    backend.batched_submit_put_task(keys, chunks)
+    wait_until(lambda: len(backend.dict) == 4)
+    for chunk in chunks:
+        chunk.ref_count_down()
+    client.submit_descriptors.clear()
+    connector = FakeGPUConnector()
+
+    result = backend.batched_get_to_gpu_blocking(
+        keys,
+        [0, 4, 8, 12],
+        [4, 8, 12, 16],
+        connector,
+    )
+
+    assert isinstance(result, BackendTransferResult)
+    assert result.completed == (True, True, True, True)
+    assert result.completed_bytes == 4 * 4096
+    assert sorted(connector.ranges) == [(0, 4), (4, 8), (8, 12), (12, 16)]
+    assert all(event.synchronized for event in connector.events)
+    assert backend.get_memory_allocator().num_active_allocations == 0
+
+
+def test_cascadekv_overlap_nonblocking_prefetch_defers_to_direct_batch(
+    cascade_stack,
+    monkeypatch,
+):
+    backend, _local_cpu_backend, _client = cascade_stack
+    backend.enable_chunked_gpu_overlap = True
+    key = make_keys(1)[0]
+    chunk = allocate_chunks(backend, 1)[0]
+    backend.batched_submit_put_task([key], [chunk])
+    wait_until(lambda: key in backend.dict)
+    chunk.ref_count_down()
+
+    def fail_prefetch(*_args, **_kwargs):
+        pytest.fail("direct overlap must not launch a duplicate Future prefetch")
+
+    monkeypatch.setattr(backend, "submit_prefetch_task", fail_prefetch)
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", fail_prefetch)
+
+    assert backend.get_non_blocking(key) is None
 
 
 def test_cascadekv_pipeline_is_not_bounded_by_deprecated_slot_config(
