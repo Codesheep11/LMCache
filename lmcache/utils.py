@@ -398,33 +398,14 @@ class CacheEngineKey:
 
     def split_layers(self, num_layers: int) -> List["LayerCacheEngineKey"]:
         """Split the key into multiple keys for each layer"""
-        keys = []
-        for layer_id in range(num_layers):
-            keys.append(
-                LayerCacheEngineKey(
-                    model_name=self.model_name,
-                    world_size=self.world_size,
-                    worker_id=self.worker_id,
-                    chunk_hash=self.chunk_hash,
-                    dtype=self.dtype,
-                    request_configs=self.request_configs,
-                    layer_id=layer_id,
-                )
-            )
-        return keys
+        return [
+            LayerCacheEngineKey.from_parent(self, layer_id)
+            for layer_id in range(num_layers)
+        ]
 
     def get_first_layer(self) -> "LayerCacheEngineKey":
         """Return the key for the first layer"""
-        key = LayerCacheEngineKey(
-            model_name=self.model_name,
-            world_size=self.world_size,
-            worker_id=self.worker_id,
-            chunk_hash=self.chunk_hash,
-            dtype=self.dtype,
-            request_configs=self.request_configs,
-            layer_id=0,
-        )
-        return key
+        return LayerCacheEngineKey.from_parent(self, 0)
 
     @staticmethod
     def from_string(s):
@@ -507,6 +488,23 @@ class LayerCacheEngineKey(CacheEngineKey):
 
     layer_id: int = 0
 
+    @classmethod
+    def from_parent(
+        cls, parent: CacheEngineKey, layer_id: int
+    ) -> "LayerCacheEngineKey":
+        """Clone an initialized chunk key without repeating tag/dtype parsing."""
+        key = object.__new__(cls)
+        key.model_name = parent.model_name
+        key.world_size = parent.world_size
+        key.worker_id = parent.worker_id
+        key.chunk_hash = parent.chunk_hash
+        key.dtype = parent.dtype
+        key.request_configs = parent.request_configs
+        key.tags = parent.tags
+        key._dtype_str = parent._dtype_str
+        key.layer_id = layer_id
+        return key
+
     def __hash__(self):
         return hash(
             (
@@ -538,20 +536,7 @@ class LayerCacheEngineKey(CacheEngineKey):
 
     def split_layers(self, num_layers: int) -> List["LayerCacheEngineKey"]:
         """Split the key into multiple keys for each layer"""
-        keys = []
-        for layer_id in range(num_layers):
-            keys.append(
-                LayerCacheEngineKey(
-                    model_name=self.model_name,
-                    world_size=self.world_size,
-                    worker_id=self.worker_id,
-                    chunk_hash=self.chunk_hash,
-                    dtype=self.dtype,
-                    request_configs=self.request_configs,
-                    layer_id=layer_id,
-                )
-            )
-        return keys
+        return [self.from_parent(self, layer_id) for layer_id in range(num_layers)]
 
     @staticmethod
     def from_string(s):

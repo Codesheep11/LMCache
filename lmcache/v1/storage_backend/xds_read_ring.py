@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 import queue
 import threading
+import time
 
 
 @dataclass(frozen=True)
@@ -27,11 +28,15 @@ class XDSReadRingPump:
         submit: Callable[[Any], int],
         wait_any: Callable[[float], Any],
         timeout: float,
+        submit_batch: Optional[Callable[[list[Any]], list[int | BaseException]]] = None,
+        wait_burst: Optional[Callable[[int, float], list[Any]]] = None,
     ) -> None:
         if queue_depth <= 0:
             raise ValueError("queue_depth must be positive")
         self._queue_depth = queue_depth
         self._submit = submit
+        self._submit_batch = submit_batch
+        self._wait_burst = wait_burst
         self._wait_any = wait_any
         self._timeout = timeout
         self._submissions: queue.Queue[Any] = queue.Queue()
@@ -76,6 +81,16 @@ class XDSReadRingPump:
             return self._unsafe_request_ids.get(id(item))
 
     def run(self) -> None:
+        """Run the rolling single path, or bounded groups for a batch submitter.
+
+        Batch callbacks return one ID or exception per item. Accepted IDs are
+        drained before failed items are returned. An unexpected batch exception
+        retains every potentially submitted target as unsafe. A group completes
+        before the next is submitted; callers choose a suitable queue depth.
+        """
+        if self._submit_batch is not None:
+            self._run_batch()
+            return
         pending: dict[int, Any] = {}
         input_drained = False
         first_error: Optional[BaseException] = None
@@ -147,6 +162,157 @@ class XDSReadRingPump:
                 self._completions.put(
                     ReadRingCompletion(item=item, completion=completion)
                 )
+                continue
+
+            if first_error is not None:
+                while True:
+                    try:
+                        item = self._submissions.get_nowait()
+                    except queue.Empty:
+                        break
+                    if item is not self._SENTINEL:
+                        failed_items.append((item, True))
+                self._terminal_error = first_error
+                if not failed_items:
+                    self._completions.put(
+                        ReadRingCompletion(item=None, error=first_error)
+                    )
+                else:
+                    for item, safe_to_reuse in failed_items:
+                        self._completions.put(
+                            ReadRingCompletion(
+                                item=item,
+                                error=first_error,
+                                safe_to_reuse=safe_to_reuse,
+                            )
+                        )
+                return
+            if input_drained:
+                return
+
+    def _wait_batch_results(self, count: int) -> list[Any]:
+        results = []
+        deadline = time.monotonic() + self._timeout
+        while len(results) < count:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("xDS batch completion timed out")
+            part = (
+                self._wait_burst(count - len(results), remaining)
+                if self._wait_burst is not None
+                else [self._wait_any(remaining)]
+            )
+            if not part:
+                raise TimeoutError("xDS batch completion timed out")
+            results.extend(part)
+        return results
+
+    def _run_batch(self) -> None:
+        pending: dict[int, Any] = {}
+        input_drained = False
+        first_error: Optional[BaseException] = None
+        failed_items: list[tuple[Any, bool]] = []
+
+        while True:
+            if first_error is None and not input_drained:
+                batch = []
+                capacity = min(64, self._queue_depth) - len(pending)
+                if self._submit_batch is None:
+                    capacity = min(capacity, 1)
+                while len(batch) < capacity:
+                    try:
+                        item = self._submissions.get(block=not pending and not batch)
+                    except queue.Empty:
+                        break
+                    if item is self._SENTINEL:
+                        input_drained = True
+                        break
+                    batch.append(item)
+                try:
+                    if self._submit_batch is not None and batch:
+                        outcomes = self._submit_batch(batch)
+                        if len(outcomes) != len(batch):
+                            raise RuntimeError("batch result count differs from inputs")
+                    elif batch:
+                        outcomes = [int(self._submit(batch[0]))]
+                    else:
+                        outcomes = []
+                except BaseException as error:
+                    first_error = error
+                    # A batch callback that raises may have already submitted
+                    # part of the batch without returning IDs. Retain targets.
+                    safe = self._submit_batch is None
+                    failed_items.extend((item, safe) for item in batch)
+                    if not safe:
+                        with self._state_lock:
+                            self._unsafe_item_ids.update(map(id, batch))
+                    self._failed.set()
+                    outcomes = []
+                for item, outcome in zip(batch, outcomes, strict=False):
+                    if isinstance(outcome, BaseException):
+                        first_error = first_error or outcome
+                        failed_items.append((item, True))
+                        self._failed.set()
+                        continue
+                    request_id = int(outcome)
+                    if request_id in pending:
+                        existing_item = pending.pop(request_id)
+                        first_error = RuntimeError(
+                            f"xDS reused pending request ID {request_id}"
+                        )
+                        failed_items.extend(((existing_item, False), (item, False)))
+                        with self._state_lock:
+                            self._unsafe_item_ids.update((id(existing_item), id(item)))
+                            self._unsafe_request_ids.update(
+                                {
+                                    id(existing_item): request_id,
+                                    id(item): request_id,
+                                }
+                            )
+                        self._failed.set()
+                        continue
+                    pending[request_id] = item
+
+            if (
+                first_error is None
+                and not input_drained
+                and len(pending) < min(64, self._queue_depth)
+            ):
+                if not self._submissions.empty():
+                    continue
+
+            if pending:
+                try:
+                    completions = self._wait_batch_results(len(pending))
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+                        self._failed.set()
+                    unsafe_items = tuple(pending.values())
+                    failed_items.extend((item, False) for item in unsafe_items)
+                    with self._state_lock:
+                        self._unsafe_item_ids.update(id(item) for item in unsafe_items)
+                        self._unsafe_request_ids.update(
+                            {
+                                id(item): request_id
+                                for request_id, item in pending.items()
+                            }
+                        )
+                    pending.clear()
+                    continue
+                for completion in completions:
+                    item = pending.pop(int(completion.request_id), None)
+                    if item is None:
+                        if first_error is None:
+                            first_error = RuntimeError(
+                                "xDS returned unknown completion request "
+                                f"{completion.request_id}"
+                            )
+                            self._failed.set()
+                        continue
+                    self._completions.put(
+                        ReadRingCompletion(item=item, completion=completion)
+                    )
                 continue
 
             if first_error is not None:

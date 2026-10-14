@@ -143,6 +143,31 @@ class TestAddressManagerAllocation:
 class TestAddressManagerBatchedAllocation:
     """Test batched_allocate functionality."""
 
+    def test_allocate_at_most_contiguous_returns_largest_available_run(self):
+        """A partial adjacent batch is returned instead of all-or-nothing."""
+        manager = AddressManager(4096 * 6, align_bytes=4096)
+        first = manager.allocate(4096)
+        middle = manager.allocate(4096 * 2)
+        manager.allocate(4096)
+        manager.free(*middle)
+
+        results = manager.allocate_at_most_contiguous(4096, 4)
+
+        assert results == [(4096, 4096), (8192, 4096)]
+        assert manager.get_free_size() == 4096 * 2
+        manager.free(*first)
+        for allocation in results:
+            manager.free(*allocation)
+
+    def test_allocate_at_most_contiguous_returns_empty_without_full_unit(self):
+        """No allocator state changes when one unit cannot fit."""
+        manager = AddressManager(4096, align_bytes=4096)
+        allocation = manager.allocate(4096)
+
+        assert manager.allocate_at_most_contiguous(4096, 4) == []
+        assert manager.get_free_size() == 0
+        manager.free(*allocation)
+
     def test_single_batch(self):
         """Test batched_allocate with batch_size=1 behaves like allocate."""
         size = 4096 * 10

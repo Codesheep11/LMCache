@@ -1,0 +1,38 @@
+chunk_size: 256
+local_cpu: false
+max_local_cpu_size: 2
+use_layerwise: true
+save_unfull_chunk: true
+py_enable_gc: false
+xds_service_name: xds0
+xds_backend: false
+cascadekv_backend: true
+cascadekv_async_write: false
+xds_require_direct: false
+xds_max_size: 8
+xds_enable_chunked_overlap: true
+xds_chunked_size_kb: 4096
+xds_write_window_size: 64
+xds_idle_flush_time: 0.5
+xds_max_flush_delay: 1.0
+extra_config:
+  benchmark_transfer_metrics: true
+  cascadekv_block_blob_layout: true
+  cascadekv_full_cpu_staging: true
+  cascadekv_full_cpu_staging_max_blocks: 160
+  cascadekv_native_read_queue_depth: 64
+  cascadekv_reuse_layerwise_staging: true
+  cascadekv_adopt_write_staging: true
+  cascadekv_use_preferred_layerwise_staging: false
+  cascadekv_layer_major_store_allocation: true
+  cascadekv_layerwise_staging_max_gb: 1.0
+  cascadekv_layerwise_read_ahead: 48
+  cascadekv_layerwise_gpu_producer: true
+  cascadekv_layerwise_h2d_scatter_overlap: true
+  cascadekv_h2d_stream_priority: -1
+  cascadekv_h2d_max_submitted_ahead_layers: 40
+  cascadekv_layerwise_touch_lru: false
+  cascadekv_layerwise_compact_metadata_index: true
+  cascadekv_layerwise_io_batch_layers: 1
+  cascadekv_layerwise_streaming_window: true
+  cascadekv_layerwise_stream_progress_layers: 1

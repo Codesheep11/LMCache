@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 import asyncio
+import json
 import os
 import shutil
 import tempfile
@@ -12,6 +13,7 @@ import torch
 # First Party
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
@@ -137,6 +139,46 @@ class TestLocalDiskBackend:
 
         local_cpu_backend.memory_allocator.close()
 
+    def test_batched_read_metrics_are_structured(
+        self, local_disk_backend, monkeypatch
+    ):
+        messages = []
+        local_disk_backend.benchmark_transfer_metrics = True
+        local_disk_backend.worker_id = 3
+        monkeypatch.setattr(
+            "lmcache.v1.storage_backend.local_disk_backend.logger.info",
+            lambda message, *args: messages.append(message % args),
+        )
+
+        class FakeMemoryObj:
+            byte_array = bytearray(4096)
+            metadata = type("Metadata", (), {"cached_positions": None})()
+
+        key = create_test_key()
+        local_disk_backend.dict[key] = type(
+            "DiskMetadata",
+            (),
+            {"cached_positions": None, "unpin": lambda self: None},
+        )()
+        monkeypatch.setattr(local_disk_backend, "read_file", lambda *_args: None)
+
+        result = local_disk_backend.batched_async_load_bytes_from_disk(
+            ["unused"], [key], [FakeMemoryObj()]
+        )
+
+        assert len(result) == 1
+        metric_line = next(
+            message
+            for message in messages
+            if message.startswith("[LOCAL_DISK_READ_METRICS]")
+        )
+        metrics = json.loads(metric_line.split(" ", 1)[1])
+        assert metrics["bytes"] == 4096
+        assert metrics["file_count"] == 1
+        assert metrics["worker_id"] == 3
+        assert metrics["end_ns"] >= metrics["start_ns"]
+        assert metrics["use_odirect"] is False
+
     def test_init_with_lookup_server_and_worker(
         self, temp_disk_path, async_loop, local_cpu_backend
     ):
@@ -185,5 +227,37 @@ class TestLocalDiskBackend:
         result = local_disk_backend.get_blocking(key)
 
         assert result is None
+
+        local_disk_backend.local_cpu_backend.memory_allocator.close()
+
+    def test_blocking_load_fails_open_when_staging_is_exhausted(
+        self, local_disk_backend, monkeypatch
+    ):
+        """A saturated staging pool must not busy-loop on the engine thread."""
+        allocation_kwargs = []
+
+        def fail_allocate(*_args, **kwargs):
+            allocation_kwargs.append(kwargs)
+            return None
+
+        monkeypatch.setattr(
+            local_disk_backend.local_cpu_backend, "allocate", fail_allocate
+        )
+        monkeypatch.setattr(
+            local_disk_backend,
+            "read_file",
+            lambda *_args: pytest.fail("disk read must not start without staging"),
+        )
+
+        result = local_disk_backend.load_bytes_from_disk(
+            create_test_key(3),
+            "unused",
+            torch.bfloat16,
+            torch.Size([1]),
+            MemoryFormat.KV_2LTD,
+        )
+
+        assert result is None
+        assert allocation_kwargs == [{"busy_loop": False}]
 
         local_disk_backend.local_cpu_backend.memory_allocator.close()

@@ -10,6 +10,7 @@ import torch
 # First Party
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.xds_backend import XDSBackend
 
@@ -24,6 +25,11 @@ class FakeXDSClient:
         self.registered = []
         self.unregistered = []
         self.released_blob_handles = []
+        self.read_descriptors = []
+        self.read_window_calls = []
+        self.layer_stream_calls = []
+        self.released_layer_stream_slots = []
+        self.write_descriptors = []
         self.calls = []
         self._next_request_id = 1
         self._last_request_id = 0
@@ -48,13 +54,126 @@ class FakeXDSClient:
     def release_blob(self, blob_handle):
         self.released_blob_handles.append(blob_handle)
 
-    def submit_read(self, *_descriptor):
+    def submit_read(self, *descriptor):
         self.calls.append("submit_read")
+        self.read_descriptors.append(descriptor)
         return self._new_request()
 
-    def submit_write(self, *_descriptor):
+    def submit_write(self, *descriptor):
         self.calls.append("submit_write")
+        self.write_descriptors.append(descriptor)
         return self._new_request()
+
+    def read_window(
+        self,
+        requests,
+        queue_depth=4,
+        timeout=5.0,
+        progress_interval=0,
+        progress_callback=None,
+        validate_only=False,
+    ):
+        del timeout
+        descriptors = list(requests)
+        self.calls.append("read_window")
+        self.read_descriptors.extend(descriptors)
+        self.read_window_calls.append((len(descriptors), queue_depth, validate_only))
+        if progress_callback is not None:
+            for completed_count in range(
+                progress_interval, len(descriptors) + 1, progress_interval
+            ):
+                progress_callback(completed_count)
+        return []
+
+    def read_window_block_layers(
+        self,
+        blob_handles,
+        descriptor_templates,
+        num_layers,
+        blob_layer_stride,
+        queue_depth=4,
+        timeout=5.0,
+        progress_interval=0,
+        progress_callback=None,
+        validate_only=False,
+    ):
+        templates = list(descriptor_templates)
+        block_count = len(blob_handles)
+        requests = []
+        for io_index in range(block_count * num_layers):
+            template_index = io_index * 3
+            requests.append(
+                (
+                    blob_handles[io_index % block_count],
+                    templates[template_index],
+                    templates[template_index + 1],
+                    (io_index // block_count) * blob_layer_stride,
+                    templates[template_index + 2],
+                )
+            )
+        return self.read_window(
+            requests,
+            queue_depth=queue_depth,
+            timeout=timeout,
+            progress_interval=progress_interval,
+            progress_callback=progress_callback,
+            validate_only=validate_only,
+        )
+
+    def create_layer_read_stream(
+        self,
+        blob_handles,
+        slot_descriptors,
+        slot_count,
+        num_layers,
+        blob_layer_stride,
+        queue_depth=4,
+        timeout=5.0,
+        progress_callback=None,
+    ):
+        del timeout
+        client = self
+        handles = list(blob_handles)
+        descriptors = list(slot_descriptors)
+        client.layer_stream_calls.append(
+            (
+                len(handles),
+                slot_count,
+                num_layers,
+                queue_depth,
+            )
+        )
+
+        class FakeLayerReadStream:
+            def run(self):
+                block_count = len(handles)
+                for layer_id in range(num_layers):
+                    slot_id = layer_id % slot_count
+                    for block_id, blob_handle in enumerate(handles):
+                        buffer_ref, buffer_offset, size = descriptors[
+                            slot_id * block_count + block_id
+                        ]
+                        client.read_descriptors.append(
+                            (
+                                blob_handle,
+                                buffer_ref,
+                                buffer_offset,
+                                layer_id * blob_layer_stride,
+                                size,
+                            )
+                        )
+                    assert progress_callback is not None
+                    progress_callback(layer_id)
+                return {
+                    "configured_qd": queue_depth,
+                    "peak_qd": queue_depth,
+                    "average_qd": float(queue_depth),
+                }
+
+            def release_slot(self, layer_id):
+                client.released_layer_stream_slots.append(layer_id)
+
+        return FakeLayerReadStream()
 
     def _new_request(self):
         request_id = self._next_request_id
@@ -312,6 +431,114 @@ def test_xds_backend_batched_read_uses_bounded_ring(
     for result in results:
         assert result is not None
         result.ref_count_down()
+    backend.close()
+
+
+def test_xds_layerwise_block_blob_reuses_handle_and_reads_layer_offsets():
+    config = LMCacheEngineConfig.from_defaults()
+    config.xds_service_name = "xds0"
+    config.xds_backend = True
+    config.xds_require_direct = True
+    config.xds_windowed_io = True
+    config.xds_io_queue_depth = 2
+    config.xds_read_slot_count = 1
+    config.xds_write_slot_count = 1
+    config.use_layerwise = True
+    config.extra_config = {"xds_layerwise_block_blob": True}
+    metadata = LMCacheMetadata(
+        model_name="test-model",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.float16,
+        kv_shape=(2, 2, 4, 1, 256),
+        chunk_size=4,
+    )
+    client = FakeXDSClient()
+    client.metadata.blob_size_bytes = 8192
+    client.metadata.gpu_buffer_size_bytes = 32768
+    backend = XDSBackend(config, metadata, client, "cpu")
+    keys = [
+        CacheEngineKey("test-model", 1, 0, chunk_hash, torch.float16)
+        for chunk_hash in (301, 302, 303)
+    ]
+    objects_by_layer = []
+    layer_shape = torch.Size([4, 2, 256])
+    for _ in range(2):
+        layer_objects = backend.batched_allocate(
+            layer_shape,
+            torch.float16,
+            batch_size=3,
+            fmt=MemoryFormat.KV_T2D,
+        )
+        assert layer_objects is not None
+        objects_by_layer.append(layer_objects)
+
+    class CompletionEvent:
+        synchronized = False
+        fail = True
+
+        def synchronize(self) -> None:
+            assert client.write_descriptors == []
+            assert not any(backend.contains(key) for key in keys)
+            if self.fail:
+                raise RuntimeError("GPU production failed")
+            self.synchronized = True
+
+    completion_event = CompletionEvent()
+    with pytest.raises(RuntimeError, match="GPU production failed"):
+        backend.blockwise_batched_submit_put_task(
+            keys, objects_by_layer, completion_event=completion_event
+        )
+    assert client.write_descriptors == []
+    assert not any(backend.contains(key) for key in keys)
+    completion_event.fail = False
+    backend.blockwise_batched_submit_put_task(
+        keys, objects_by_layer, completion_event=completion_event
+    )
+    assert completion_event.synchronized
+
+    assert all(backend.contains(key) for key in keys)
+    assert len({descriptor[0] for descriptor in client.write_descriptors}) == 3
+    assert [descriptor[3] for descriptor in client.write_descriptors] == [
+        0,
+        0,
+        0,
+        4096,
+        4096,
+        4096,
+    ]
+    for layer_objects in objects_by_layer:
+        for memory_obj in layer_objects:
+            memory_obj.ref_count_down()
+
+    published = []
+
+    def publish(completed_count, layer_views):
+        published.append((completed_count, layer_views))
+
+    result = backend.blockwise_batched_get_blocking(keys, publish)
+
+    assert result == []
+    assert [completed for completed, _ in published] == [3, 6]
+    assert [views[0].chunk_count for _, views in published] == [3, 3]
+    assert [views[0].get_shape()[0] for _, views in published] == [12, 12]
+    assert [descriptor[3] for descriptor in client.read_descriptors] == [
+        0,
+        0,
+        0,
+        4096,
+        4096,
+        4096,
+    ]
+    assert client.layer_stream_calls == [(3, 2, 2, 2)]
+    assert client.read_window_calls == []
+    for _, views in published:
+        retained = backend.release_layerwise_staging(views)
+        if id(views[0]) not in retained:
+            views[0].ref_count_down()
+    assert backend.get_memory_allocator().num_active_allocations == 0
     backend.close()
 
 
@@ -592,3 +819,348 @@ def test_xds_backend_async_failure_rolls_back_and_close_cleans_resources(
         backend.close()
     assert client.unregistered == [77]
     assert "close" in client.calls
+
+
+@pytest.mark.parametrize(
+    "failure", ["none", "short", "timeout", "partial_timeout", "descriptor_error"]
+)
+@pytest.mark.parametrize("native", [False, True])
+def test_direct_readv_skips_scatter_and_releases_pins(
+    direct_config, direct_metadata, cache_key, monkeypatch, failure, native
+):
+    from lmcache.v1.gpu_connector.gpu_connectors import VLLMPagedMemGPUConnectorV2
+
+    class ReadvClient(FakeXDSClient):
+        def __init__(self):
+            super().__init__()
+            self.metadata.blob_size_bytes = 32768
+            self.metadata.gpu_buffer_size_bytes = 65536
+            self.readv_calls = []
+            self.sizes = {}
+
+        def register_gpu_buffer(self, ptr, size):
+            super().register_gpu_buffer(ptr, size)
+            return len(self.registered)
+
+        def submit_write(self, *descriptor):
+            rid = super().submit_write(*descriptor)
+            self.sizes[rid] = descriptor[-1]
+            return rid
+
+        def submit_readv(self, blob, offset, slices):
+            self.readv_calls.append((blob, offset, slices))
+            rid = self._new_request()
+            self.sizes[rid] = sum(s[2] for s in slices) - (
+                4096 if failure == "short" else 0
+            )
+            return rid
+
+        def wait_any_result(self, timeout=5.0):
+            if self.readv_calls and (
+                failure == "timeout"
+                or (
+                    failure == "partial_timeout" and len(self._pending_request_ids) == 1
+                )
+            ):
+                raise TimeoutError("injected direct KV timeout")
+            result = super().wait_any_result(timeout)
+            result.completed_bytes = self.sizes[result.request_id]
+            return result
+
+    direct_config.extra_config = {"xds_readv_direct": True}
+    direct_config.xds_windowed_io = False
+    client = ReadvClient()
+    if native:
+        import xds
+
+        prepared = 0
+
+        def prepare(ids, groups, size):
+            nonlocal prepared
+            prepared += 1
+            if failure == "descriptor_error" and prepared == 2:
+                raise MemoryError("injected descriptor allocation failure")
+            return xds.prepare_indexed_readv(ids, groups, size, 4096)
+
+        client.prepare_indexed_readv = prepare
+        client.submit_readv_plan = lambda blob, offset, plan: client.submit_readv(
+            blob, offset, plan.to_slices()
+        )
+    backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
+    shape = torch.Size([2, 1, 32, 256])
+    obj = backend.allocate([shape], [torch.float16])
+    assert backend.batched_submit_put_task([cache_key], [obj])[0].result()
+    obj.ref_count_down()
+    connector = VLLMPagedMemGPUConnectorV2(256, 1, layout_hints={"kv_layout": "NHD"})
+    target = torch.empty((2, 8, 16, 2, 128), dtype=torch.float16, device="cuda")
+
+    def reject_scatter(*args, **kwargs):
+        raise AssertionError("direct readv must not call scatter")
+
+    monkeypatch.setattr(connector, "to_gpu", reject_scatter)
+    kwargs = dict(kvcaches=[target], slot_mapping=torch.arange(32))
+    if failure == "descriptor_error":
+        from lmcache.v1.gpu_connector.xds_readv import XDSReadvPlan
+
+        original_bind = XDSReadvPlan.bind_slices
+        calls = 0
+
+        def fail_second_bind(
+            plan: XDSReadvPlan, refs: list[int]
+        ) -> list[tuple[int, int, int]]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise MemoryError("injected descriptor allocation failure")
+            return original_bind(plan, refs)
+
+        monkeypatch.setattr(XDSReadvPlan, "bind_slices", fail_second_bind)
+        with pytest.raises(MemoryError, match="descriptor allocation"):
+            backend.batched_get_to_gpu_blocking(
+                [cache_key, cache_key],
+                [0, 32],
+                [32, 64],
+                connector,
+                kvcaches=[target],
+                slot_mapping=torch.arange(64),
+            )
+        assert len(client.readv_calls) == 1
+        # The already submitted sibling is drained and both pins are released.
+        assert backend.remove(cache_key, force=False)
+        backend.close()
+        return
+    if failure == "partial_timeout":
+        with pytest.raises(TimeoutError):
+            backend.batched_get_to_gpu_blocking(
+                [cache_key, cache_key],
+                [0, 32],
+                [32, 64],
+                connector,
+                kvcaches=[target],
+                slot_mapping=torch.arange(64),
+            )
+        assert not backend.remove(cache_key, force=False)
+        failure = "none"
+        client.wait_any_result()
+        assert backend.unpin(cache_key)
+        assert not backend.unpin(cache_key)  # Successful sibling kept no extra pin.
+        backend.close()
+        return
+    if failure == "timeout":
+        with pytest.raises(TimeoutError):
+            backend.batched_get_to_gpu_blocking(
+                [cache_key], [0], [32], connector, **kwargs
+            )
+        assert not backend.remove(cache_key, force=False)
+        with pytest.raises(RuntimeError, match="unresolved DMA"):
+            backend.batched_get_to_gpu_blocking(
+                [cache_key], [0], [32], connector, **kwargs
+            )
+        # Explicitly finish the fake DMA before releasing the retained pin.
+        failure = "none"
+        client.wait_any_result()
+        assert backend.unpin(cache_key)
+        backend.close()
+        return
+    if failure == "short":
+        with pytest.raises(RuntimeError, match="short"):
+            backend.batched_get_to_gpu_blocking(
+                [cache_key], [0], [32], connector, **kwargs
+            )
+    else:
+        result = backend.batched_get_to_gpu_blocking(
+            [cache_key], [0], [32], connector, **kwargs
+        )
+        assert result.completed == (True,) and result.completed_bytes == 32768
+        assert result.peak_staging_bytes == 0
+        backend.batched_get_to_gpu_blocking([cache_key], [0], [32], connector, **kwargs)
+        assert len(client.registered) == 2  # Pool + reused final target.
+        batch_kwargs = dict(kvcaches=[target], slot_mapping=torch.arange(64))
+        result = backend.batched_get_to_gpu_blocking(
+            [cache_key, cache_key], [0, 32], [32, 64], connector, **batch_kwargs
+        )
+        assert result.completed == (True, True) and result.completed_bytes == 65536
+        before = len(client.readv_calls)
+        batch_kwargs["slot_mapping"] = torch.arange(32).repeat(2)
+        assert (
+            backend.batched_get_to_gpu_blocking(
+                [cache_key, cache_key], [0, 32], [32, 64], connector, **batch_kwargs
+            )
+            is None
+        )
+        assert len(client.readv_calls) == before
+    slices = client.readv_calls[0][2]
+    assert len(slices) == 4
+    assert sum(length for _, _, length in slices) == 32768
+    # Unsupported partial block falls back before publishing another readv.
+    count = len(client.readv_calls)
+    assert (
+        backend.batched_get_to_gpu_blocking([cache_key], [0], [31], connector, **kwargs)
+        is None
+    )
+    assert len(client.readv_calls) == count
+    backend.close()
+    assert len(client.released_blob_handles) == 1
+    assert len(client.unregistered) == 2
+
+
+@pytest.mark.parametrize("failure", ["none", "overlap", "cancel", "timeout", "short"])
+def test_layerwise_readv_offsets_readiness_and_lifetime(failure):
+    from lmcache.v1.gpu_connector.xds_layerwise import XDSReadvLayerwiseGPUConnector
+
+    class LayerClient(FakeXDSClient):
+        def __init__(self):
+            super().__init__()
+            self.metadata.blob_size_bytes = 65536
+            self.metadata.gpu_buffer_size_bytes = 262144
+            self.sizes = {}
+            self.readv_calls = []
+
+        def register_gpu_buffer(self, ptr, size):
+            super().register_gpu_buffer(ptr, size)
+            return len(self.registered)
+
+        def submit_write(self, *args):
+            rid = super().submit_write(*args)
+            self.sizes[rid] = args[-1]
+            return rid
+
+        def submit_readv(self, blob, offset, slices):
+            rid = self._new_request()
+            self.readv_calls.append((blob, offset, slices))
+            self.sizes[rid] = sum(x[2] for x in slices)
+            return rid
+
+        def wait_any_result(self, timeout=5.0):
+            if self.readv_calls and failure == "timeout":
+                raise TimeoutError("layer DMA pending")
+            result = super().wait_any_result(timeout)
+            result.completed_bytes = self.sizes[result.request_id]
+            if self.readv_calls and failure == "short":
+                result.completed_bytes -= 4096
+            return result
+
+    config = LMCacheEngineConfig.from_defaults()
+    config.xds_backend = True
+    config.use_layerwise = True
+    config.xds_windowed_io = False
+    config.xds_io_queue_depth = 2
+    config.extra_config = {
+        "xds_layerwise_block_blob": True,
+        "xds_layerwise_readv": True,
+    }
+    metadata = LMCacheMetadata(
+        model_name="layer-readv",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.float16,
+        kv_shape=(2, 2, 32, 2, 128),
+        chunk_size=32,
+    )
+    client = LayerClient()
+    backend = XDSBackend(config, metadata, client, "cpu")
+    keys = [CacheEngineKey("layer-readv", 1, 0, i, torch.float16) for i in [901, 902]]
+    objects = [
+        backend.batched_allocate(
+            torch.Size([2, 32, 256]), torch.float16, 2, fmt=MemoryFormat.KV_2TD
+        )
+        for _ in range(2)
+    ]
+    backend.blockwise_batched_submit_put_task(keys, objects)
+    for layer in objects:
+        for obj in layer:
+            obj.ref_count_down()
+    connector = XDSReadvLayerwiseGPUConnector.from_metadata(
+        metadata, False, torch.device("cuda"), layout_hints={"kv_layout": "NHD"}
+    )
+    targets = [
+        torch.empty((2, 8, 16, 2, 128), device="cuda", dtype=torch.float16)
+        for _ in range(2)
+    ]
+    slots = torch.arange(64)
+    if failure == "overlap":
+        slots[32:] = slots[:32]
+    iterator = backend.prepare_layerwise_readv(
+        keys, [0, 32], [32, 64], connector, kvcaches=targets, slot_mapping=slots
+    )
+    if failure == "overlap":
+        assert iterator is None and client.readv_calls == []
+    elif failure in ["short", "timeout"]:
+        with pytest.raises((RuntimeError, TimeoutError)):
+            next(iterator)
+        if failure == "timeout":
+            assert not backend.remove(keys[0], force=False)
+            failure = "none"
+            client.wait_any_result()
+            client.wait_any_result()
+            for key in keys:
+                assert backend.unpin(key)
+    else:
+        result = next(iterator)
+        assert result.completed_bytes == 65536 and result.completed == (True, True)
+        assert [c[1] for c in client.readv_calls[:2]] == [0, 0]
+        assert not backend.remove(keys[0], force=False)
+        if failure == "cancel":
+            iterator.close()
+        else:
+            assert next(iterator).completed_bytes == 65536
+            with pytest.raises(StopIteration):
+                next(iterator)
+            assert [c[1] for c in client.readv_calls] == [0, 0, 32768, 32768]
+    for key in keys:
+        assert backend.remove(key, force=False)
+    backend.close()
+
+
+def test_layerwise_kv_major_fallback_keeps_chunk_layout() -> None:
+    config = LMCacheEngineConfig.from_defaults()
+    config.xds_backend = True
+    config.use_layerwise = True
+    config.xds_windowed_io = False
+    config.xds_io_queue_depth = 2
+    config.extra_config = {"xds_layerwise_block_blob": True}
+    metadata = LMCacheMetadata(
+        model_name="fallback",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.float16,
+        kv_shape=(2, 2, 4, 1, 256),
+        chunk_size=4,
+    )
+    client = FakeXDSClient()
+    client.metadata.blob_size_bytes = 8192
+    client.metadata.gpu_buffer_size_bytes = 65536
+    backend = XDSBackend(config, metadata, client, "cpu")
+    keys = [CacheEngineKey("fallback", 1, 0, i, torch.float16) for i in [1001, 1002]]
+    objects = [
+        backend.batched_allocate(
+            torch.Size([2, 4, 256]),
+            torch.float16,
+            batch_size=2,
+            fmt=MemoryFormat.KV_2TD,
+        )
+        for _ in range(2)
+    ]
+    backend.blockwise_batched_submit_put_task(keys, objects)
+    for layer in objects:
+        for obj in layer:
+            obj.ref_count_down()
+    published = []
+
+    def publish(count: int, objects: list) -> None:
+        assert len(objects) == 2
+        assert all(obj.get_memory_format() == MemoryFormat.KV_2TD for obj in objects)
+        assert all(obj.tensor.shape == (2, 4, 256) for obj in objects)
+        published.append(count)
+        for obj in objects:
+            obj.ref_count_down()
+
+    assert backend.blockwise_batched_get_blocking(keys, publish) == []
+    assert published == [2, 4]
+    for key in keys:
+        assert backend.remove(key, force=False)
+    backend.close()

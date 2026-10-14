@@ -380,7 +380,7 @@ def test_vllm_paged_connector_v3_with_gpu_and_mla(use_gpu, num_groups, gpu_kv_fo
     allocator.close()
 
 
-@pytest.mark.parametrize("use_gpu", [True])
+@pytest.mark.parametrize("use_gpu", [True, False])
 @pytest.mark.parametrize(
     "gpu_kv_format",
     [
@@ -492,7 +492,8 @@ def test_layerwise_vllm_paged_connector_with_gpu(use_gpu, gpu_kv_format):
 
     assert allocator.memcheck()
 
-    assert connector.gpu_buffer_allocator.memcheck()
+    if connector.gpu_buffer_allocator is not None:
+        assert connector.gpu_buffer_allocator.memcheck()
 
     check_paged_kv_cache_equal(
         gpu_kv_src, gpu_kv_dst, slot_mapping, num_heads, head_size, gpu_kv_format

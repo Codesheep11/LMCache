@@ -18,6 +18,7 @@ from typing import (
 import asyncio
 import functools
 import threading
+import time
 
 # Third Party
 import torch
@@ -322,6 +323,14 @@ class StorageManager:
             allocator_backend = self.storage_backends["XDSBackend"]
         elif config.cascadekv_backend:
             allocator_backend = self.storage_backends["CascadeKVBackend"]
+        elif (
+            "GdsBackend" in self.storage_backends
+            and "LocalCPUBackend" not in self.storage_backends
+        ):
+            # A pure GDS configuration owns its GPU staging allocator.  When
+            # local CPU storage is also configured, preserve the existing CPU
+            # allocator so tiered configurations keep their current behavior.
+            allocator_backend = self.storage_backends["GdsBackend"]
         elif "MaruBackend" in self.storage_backends:
             if "LocalCPUBackend" in self.storage_backends:
                 allocator_backend = self.storage_backends["LocalCPUBackend"]
@@ -440,6 +449,62 @@ class StorageManager:
             for memory_obj in objs:
                 memory_obj.ref_count_down()
 
+    def layerwise_batched_put(
+        self,
+        keys_by_layer: Sequence[Sequence[CacheEngineKey]],
+        memory_objs_by_layer: Sequence[Sequence[MemoryObj]],
+        location: Optional[str] = None,
+    ) -> None:
+        """Submit a complete layer-major request to block-aware backends."""
+        active_backends = list(self.get_active_storage_backends(location=location))
+        handled = False
+        for _backend_name, backend in active_backends:
+            method = getattr(backend, "layerwise_batched_submit_put_task", None)
+            if callable(method) and bool(getattr(backend, "block_blob_layout", False)):
+                method(keys_by_layer, memory_objs_by_layer)
+                handled = True
+            else:
+                for keys, memory_objs in zip(
+                    keys_by_layer, memory_objs_by_layer, strict=True
+                ):
+                    backend.batched_submit_put_task(keys, list(memory_objs))
+                handled = True
+        if not handled:
+            raise RuntimeError("No active backend accepted the layerwise put")
+        for memory_objs in memory_objs_by_layer:
+            for memory_obj in memory_objs:
+                memory_obj.ref_count_down()
+
+    def blockwise_batched_put(
+        self,
+        block_keys: Sequence[CacheEngineKey],
+        memory_objs_by_layer: Sequence[Sequence[MemoryObj]],
+        location: Optional[str] = None,
+        completion_event: Any = None,
+    ) -> None:
+        """Submit block-owned payloads after their optional D2H completion event."""
+        active_backends = list(self.get_active_storage_backends(location=location))
+        handled = False
+        for _backend_name, backend in active_backends:
+            method = getattr(backend, "blockwise_batched_submit_put_task", None)
+            if not callable(method):
+                # LocalCPUBackend may still be present as the pinned allocator
+                # owner even when local_cpu is disabled.  A block-owned blob is
+                # a CascadeKV storage format, so do not route it through the
+                # allocator backend's ordinary per-key put API.
+                continue
+            method(
+                block_keys,
+                memory_objs_by_layer,
+                completion_event=completion_event,
+            )
+            handled = True
+        if not handled:
+            raise RuntimeError("No active backend accepted the blockwise put")
+        for memory_objs in memory_objs_by_layer:
+            for memory_obj in memory_objs:
+                memory_obj.ref_count_down()
+
     def batched_put_from_gpu(
         self,
         keys: Sequence[CacheEngineKey],
@@ -455,7 +520,14 @@ class StorageManager:
         to one supported streaming backend. Returning ``None`` means the caller
         must preserve LMCache's regular allocate-and-put behavior.
         """
-        active_backends = list(self.get_active_storage_backends(location=location))
+        storage_names = getattr(
+            self, "non_allocator_backends", self.storage_backends.keys()
+        )
+        active_backends = [
+            (name, backend)
+            for name, backend in self.get_active_storage_backends(location=location)
+            if name in storage_names
+        ]
         if len(active_backends) != 1:
             return None
         backend_name, backend = active_backends[0]
@@ -566,7 +638,14 @@ class StorageManager:
         Returns ``None`` when the selected backend does not implement the
         optional direct-transfer hook, allowing the caller to use ``batched_get``.
         """
-        active_backends = list(self.get_active_storage_backends(location=location))
+        storage_names = getattr(
+            self, "non_allocator_backends", self.storage_backends.keys()
+        )
+        active_backends = [
+            (name, backend)
+            for name, backend in self.get_active_storage_backends(location=location)
+            if name in storage_names
+        ]
         if len(active_backends) != 1:
             return None
         backend_name, backend = active_backends[0]
@@ -577,10 +656,33 @@ class StorageManager:
             return None
         return method(keys, starts, ends, gpu_connector, **kwargs)
 
+    def prepare_layerwise_readv(
+        self,
+        keys: list[CacheEngineKey],
+        starts: list[int],
+        ends: list[int],
+        gpu_connector: Any,
+        location: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Return an optional GPU-ready layer iterator from the selected backend.
+
+        None preserves the existing staging pipeline. The caller closes a
+        returned iterator on cancellation and must not fall back after iteration.
+        """
+        backends = list(self.get_active_storage_backends(location=location))
+        if len(backends) != 1 or backends[0][0] != "XDSBackend":
+            return None
+        method = getattr(backends[0][1], "prepare_layerwise_readv", None)
+        if not callable(method):
+            return None
+        return method(keys, starts, ends, gpu_connector, **kwargs)
+
     def layerwise_batched_get(
         self,
         keys: List[List[CacheEngineKey]],
         location: Optional[str] = None,
+        trace_context: Optional[dict[str, Any]] = None,
     ) -> Generator[Future, None, None]:
         """
         Non-blocking function to get the memory objects into the storages
@@ -592,17 +694,306 @@ class StorageManager:
             dimension corresponds to the number of layers, and the second
             dimension corresponds to the number of chunks.
 
-        :return: A generator that yields a future for each layer.
+        The ``cascadekv_layerwise_read_ahead`` extra configuration value controls
+        how many layers may be buffered at once. The optional
+        ``cascadekv_layerwise_io_batch_layers`` value combines adjacent layers
+        into one backend request, allowing xDS to keep one rolling I/O window
+        alive across layer boundaries. Both default to one so other deployments
+        retain the original behavior.
+
+        Args:
+            keys: Cache keys in layer-major order.
+            location: Backend location selected for the read.
+            trace_context: Optional mutable request trace populated with producer
+                and per-layer readiness timestamps. It is intended only for
+                explicit profiling runs.
+
+        Returns:
+            A generator that yields a future for each layer.
         """
         if location is None:
             location = "LocalCPUBackend"
-        for keys_multi_chunk in keys:
-            # Retrieve all chunks for one layer
-            backend = self.storage_backends[location]
-            # TODO(Jiayi): need to make async loading and layerwise compatible
-            coro = backend.batched_get_non_blocking("fake_lookup_id", keys_multi_chunk)
-            task = asyncio.run_coroutine_threadsafe(coro, self.loop)
-            yield task
+        backend = self.storage_backends[location]
+        read_ahead = max(
+            1,
+            int(
+                self.config.get_extra_config_value("cascadekv_layerwise_read_ahead", 1)
+            ),
+        )
+        io_batch_layers = max(
+            1,
+            min(
+                read_ahead,
+                int(
+                    self.config.get_extra_config_value(
+                        "cascadekv_layerwise_io_batch_layers", 1
+                    )
+                ),
+            ),
+        )
+        stream_progress_layers = max(
+            1,
+            int(
+                self.config.get_extra_config_value(
+                    "cascadekv_layerwise_stream_progress_layers", 1
+                )
+            ),
+        )
+        enable_streaming_window = bool(
+            self.config.get_extra_config_value(
+                "cascadekv_layerwise_streaming_window", False
+            )
+        )
+        result_futures = [Future() for _ in keys]
+        blocking_backend_get = getattr(backend, "batched_get_blocking", None)
+        streaming_backend_get = getattr(backend, "layerwise_batched_get_blocking", None)
+        use_streaming_producer = (
+            enable_streaming_window
+            and read_ahead >= len(keys)
+            and callable(streaming_backend_get)
+            and bool(keys)
+            and all(len(layer_keys) == len(keys[0]) for layer_keys in keys)
+        )
+        use_blocking_producer = use_streaming_producer or (
+            io_batch_layers > 1 and callable(blocking_backend_get)
+        )
+        buffer_slots = (
+            threading.Semaphore(read_ahead)
+            if use_blocking_producer
+            else asyncio.Semaphore(read_ahead)
+        )
+
+        def publish_batch(
+            batch_start: int,
+            layer_batch: List[List[CacheEngineKey]],
+            flat_result: list[MemoryObj],
+        ) -> bool:
+            layer_lengths = [len(layer_keys) for layer_keys in layer_batch]
+            expected_count = sum(layer_lengths)
+            if len(flat_result) != expected_count:
+                error = RuntimeError(
+                    "layerwise backend returned a different number of objects: "
+                    f"expected={expected_count}, actual={len(flat_result)}"
+                )
+                for pending_future in result_futures[batch_start:]:
+                    if not pending_future.done():
+                        pending_future.set_exception(error)
+                return False
+            result_index = 0
+            for layer_offset, layer_length in enumerate(layer_lengths):
+                next_result_index = result_index + layer_length
+                if trace_context is not None:
+                    trace_layers = trace_context["layers"]
+                    layer_trace = trace_layers[batch_start + layer_offset]
+                    layer_trace["ssd_ready_ns"] = time.monotonic_ns()
+                result_futures[batch_start + layer_offset].set_result(
+                    flat_result[result_index:next_result_index]
+                )
+                if trace_context is not None:
+                    layer_trace["future_publish_complete_ns"] = time.monotonic_ns()
+                result_index = next_result_index
+            return True
+
+        def produce_layers_blocking() -> None:
+            assert isinstance(buffer_slots, threading.Semaphore)
+            if trace_context is not None:
+                trace_context["producer_start_ns"] = time.monotonic_ns()
+            if use_streaming_producer:
+                assert callable(streaming_backend_get)
+                for _ in keys:
+                    buffer_slots.acquire()
+                layer_width = len(keys[0])
+                flat_keys = [key for layer_keys in keys for key in layer_keys]
+                published_layers = 0
+
+                def publish_progress(
+                    completed_count: int, flat_result: list[MemoryObj]
+                ) -> None:
+                    nonlocal published_layers
+                    completed_layers = min(len(keys), completed_count // layer_width)
+                    if completed_layers <= published_layers:
+                        return
+                    publish_batch(
+                        published_layers,
+                        keys[published_layers:completed_layers],
+                        flat_result,
+                    )
+                    published_layers = completed_layers
+
+                try:
+                    if trace_context is None:
+                        flat_result = streaming_backend_get(
+                            flat_keys,
+                            stream_progress_layers * layer_width,
+                            publish_progress,
+                        )
+                    else:
+                        flat_result = streaming_backend_get(
+                            flat_keys,
+                            stream_progress_layers * layer_width,
+                            publish_progress,
+                            trace_context=trace_context,
+                        )
+                except Exception as error:
+                    for pending_future in result_futures[published_layers:]:
+                        if not pending_future.done():
+                            pending_future.set_exception(error)
+                    return
+                if published_layers < len(keys):
+                    publish_progress(len(flat_result), flat_result)
+                if trace_context is not None:
+                    trace_context["producer_end_ns"] = time.monotonic_ns()
+                return
+
+            assert callable(blocking_backend_get)
+            for batch_start in range(0, len(keys), io_batch_layers):
+                layer_batch = keys[batch_start : batch_start + io_batch_layers]
+                for _ in layer_batch:
+                    buffer_slots.acquire()
+                flat_keys = [key for layer_keys in layer_batch for key in layer_keys]
+                try:
+                    flat_result = blocking_backend_get(flat_keys)
+                except Exception as error:
+                    for pending_future in result_futures[batch_start:]:
+                        if not pending_future.done():
+                            pending_future.set_exception(error)
+                    return
+                if not publish_batch(batch_start, layer_batch, flat_result):
+                    return
+
+        async def produce_layers() -> None:
+            assert isinstance(buffer_slots, asyncio.Semaphore)
+            for batch_start in range(0, len(keys), io_batch_layers):
+                layer_batch = keys[batch_start : batch_start + io_batch_layers]
+                for _ in layer_batch:
+                    await buffer_slots.acquire()
+                flat_keys = [key for layer_keys in layer_batch for key in layer_keys]
+                try:
+                    flat_result = await backend.batched_get_non_blocking(
+                        "fake_lookup_id", flat_keys
+                    )
+                except Exception as error:
+                    for pending_future in result_futures[batch_start:]:
+                        if not pending_future.done():
+                            pending_future.set_exception(error)
+                    return
+                if not publish_batch(batch_start, layer_batch, flat_result):
+                    return
+
+        producer_coro = (
+            asyncio.to_thread(produce_layers_blocking)
+            if use_blocking_producer
+            else produce_layers()
+        )
+        producer = asyncio.run_coroutine_threadsafe(producer_coro, self.loop)
+        try:
+            for result_future in result_futures:
+                yield result_future
+                if use_blocking_producer:
+                    buffer_slots.release()
+                else:
+                    self.loop.call_soon_threadsafe(buffer_slots.release)
+        finally:
+            if not producer.done():
+                producer.cancel()
+
+    def blockwise_batched_get(
+        self,
+        block_keys: Sequence[CacheEngineKey],
+        num_layers: int,
+        location: Optional[str] = None,
+        trace_context: Optional[dict[str, Any]] = None,
+    ) -> Generator[Future, None, None]:
+        """Stream block-owned fixed staging data as one Future per layer."""
+        if location is None:
+            location = "LocalCPUBackend"
+        backend = self.storage_backends[location]
+        backend_get = getattr(backend, "blockwise_batched_get_blocking", None)
+        if not callable(backend_get):
+            raise RuntimeError("selected backend does not support blockwise reads")
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+        result_futures = [Future() for _ in range(num_layers)]
+        block_count = len(block_keys)
+
+        def produce_layers_blocking() -> None:
+            published_layers = 0
+            if trace_context is not None:
+                trace_context["producer_start_ns"] = time.monotonic_ns()
+
+            def publish_progress(
+                completed_count: int, layer_views: list[MemoryObj]
+            ) -> None:
+                nonlocal published_layers
+                completed_layers = min(
+                    num_layers,
+                    completed_count // max(block_count, 1),
+                )
+                ready_layers = completed_layers - published_layers
+                if ready_layers != 1:
+                    error = RuntimeError(
+                        "blockwise backend must publish exactly one layer at a time: "
+                        f"ready_layers={ready_layers}"
+                    )
+                    for pending_future in result_futures[published_layers:]:
+                        if not pending_future.done():
+                            pending_future.set_exception(error)
+                    return
+                layer_id = published_layers
+                if trace_context is not None:
+                    layer_trace = trace_context["layers"][layer_id]
+                    layer_trace["ssd_ready_ns"] = time.monotonic_ns()
+                result_futures[layer_id].set_result(list(layer_views))
+                if trace_context is not None:
+                    layer_trace["future_publish_complete_ns"] = time.monotonic_ns()
+                published_layers = completed_layers
+
+            try:
+                flat_result = backend_get(
+                    block_keys,
+                    publish_progress,
+                    trace_context=trace_context,
+                )
+            except Exception as error:
+                for pending_future in result_futures[published_layers:]:
+                    if not pending_future.done():
+                        pending_future.set_exception(error)
+                return
+            if published_layers < num_layers:
+                for layer_id in range(published_layers, num_layers):
+                    publish_progress(
+                        (layer_id + 1) * block_count,
+                        flat_result[layer_id],
+                    )
+            if trace_context is not None:
+                trace_context["producer_end_ns"] = time.monotonic_ns()
+
+        if trace_context is not None:
+            trace_context["storage_submit_start_ns"] = time.monotonic_ns()
+        producer = asyncio.run_coroutine_threadsafe(
+            asyncio.to_thread(produce_layers_blocking), self.loop
+        )
+        if trace_context is not None:
+            trace_context["storage_submit_end_ns"] = time.monotonic_ns()
+        try:
+            yield from result_futures
+        finally:
+            if not producer.done():
+                producer.cancel()
+
+    def release_layerwise_memory_objs(
+        self,
+        memory_objs: Sequence[MemoryObj],
+        location: Optional[str] = None,
+    ) -> set[int]:
+        """Return backend-owned layer buffers after their H2D event completes."""
+        if location is None:
+            location = "LocalCPUBackend"
+        backend = self.storage_backends[location]
+        release_method = getattr(backend, "release_layerwise_staging", None)
+        if release_method is None:
+            return set()
+        return release_method(memory_objs)
 
     def prefetch_single_done_callback(
         self,
@@ -1049,7 +1440,12 @@ class StorageManager:
 
     def touch_cache(self) -> None:
         for backend_name, backend in self.storage_backends.items():
-            if backend_name == "LocalCPUBackend" or backend_name == "LocalDiskBackend":
+            if backend_name in {
+                "LocalCPUBackend",
+                "LocalDiskBackend",
+                "XDSBackend",
+                "CascadeKVBackend",
+            }:
                 backend.touch_cache()
 
     def remove(

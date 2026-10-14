@@ -1,0 +1,16 @@
+# Non-layerwise, full aligned NHD KV blocks can be restored without scatter.
+# Other layouts and partial blocks retain the normal staging path.
+chunk_size: 256
+local_cpu: false
+use_layerwise: false
+use_gpu_connector_v3: false
+xds_backend: true
+xds_service_name: xds0
+xds_require_direct: true
+xds_windowed_io: true
+xds_read_slot_count: 1
+xds_write_slot_count: 1
+xds_io_queue_depth: 32
+xds_async_write: false
+extra_config:
+  xds_readv_direct: true

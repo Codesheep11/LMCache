@@ -37,4 +37,5 @@ class MooncakestoreConnectorAdapter(ConnectorAdapter):
             loop=context.loop,
             local_cpu_backend=context.local_cpu_backend,
             lmcache_config=context.config,
+            worker_id=(context.metadata.worker_id if context.metadata else 0),
         )

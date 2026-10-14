@@ -21,6 +21,8 @@ from lmcache.v1.memory_management import (
     PinMemoryAllocator,
     TensorMemoryAllocator,
     TensorMemoryObj,
+    XDSIORegion,
+    XDSSegmentedServiceMemoryAllocator,
     XDSServiceMemoryAllocator,
 )
 from lmcache.v1.pin_monitor import PinMonitor
@@ -141,6 +143,21 @@ def test_tensor_allocator(use_paging):
         check_allocator(allocator, total_size)
 
     allocator.close()
+
+
+def test_tensor_allocator_allocate_at_most_contiguous_returns_partial_batch():
+    """Dynamic staging obtains the largest adjacent batch that currently fits."""
+    tensor_buffer = torch.zeros(4096 * 3, dtype=torch.uint8, device="cpu")
+    allocator = TensorMemoryAllocator(tensor_buffer, align_bytes=4096)
+
+    objects = allocator.allocate_at_most_contiguous(
+        torch.Size([4096]), torch.uint8, max_batch_size=4
+    )
+
+    assert len(objects) == 3
+    assert [obj.meta.address for obj in objects] == [0, 4096, 8192]
+    allocator.batched_free(objects)
+    assert allocator.memcheck()
 
 
 @pytest.mark.parametrize(
@@ -892,12 +909,14 @@ class FakeXDSServiceAllocatorClient:
     def __init__(self, lifecycle):
         self.lifecycle = lifecycle
         self.storage = None
+        self.storages = []
         self.freed = []
 
     def alloc_buffer(self, size):
         self.lifecycle.append(("alloc_buffer", size))
         self.storage = bytearray(size)
-        return memoryview(self.storage), 73
+        self.storages.append(self.storage)
+        return memoryview(self.storage), 72 + len(self.storages)
 
     def free_buffer(self, buffer_ref):
         self.lifecycle.append(("free_buffer", buffer_ref))
@@ -940,6 +959,9 @@ def test_xds_service_allocator_wraps_one_registered_buffer(monkeypatch):
     assert allocator.buffer_ref == 73
     assert allocator.get_buffer_offset(first) == 0
     assert allocator.get_buffer_offset(second) == 4096
+    assert allocator.get_io_region(second).buffer_ref == 73
+    assert allocator.get_io_region(second).offset == 4096
+    assert allocator.get_io_region(second).size == 4096
     assert first.raw_data.data_ptr() == allocator.base_ptr
     assert second.raw_data.data_ptr() == allocator.base_ptr + 4096
 
@@ -984,3 +1006,36 @@ def test_xds_service_allocator_can_own_client_lifecycle(monkeypatch):
         ("free_buffer", 73),
         ("close_client",),
     ]
+
+
+def test_xds_segmented_service_allocator_routes_each_arena(monkeypatch, caplog):
+    lifecycle = []
+    client = FakeXDSServiceAllocatorClient(lifecycle)
+    runtime = FakeXDSServiceAllocatorCUDART(lifecycle)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: runtime)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    allocator = XDSSegmentedServiceMemoryAllocator(
+        client,
+        size=16384,
+        align_bytes=4096,
+        arena_size_bytes=8192,
+        close_client=True,
+    )
+
+    memory_objs = [
+        allocator.allocate(torch.Size([4096]), torch.uint8) for _ in range(3)
+    ]
+    assert all(memory_obj is not None for memory_obj in memory_objs)
+    first, second, third = memory_objs
+    assert first is not None and second is not None and third is not None
+    assert allocator.get_io_region(first) == XDSIORegion(73, 0, 4096)
+    assert allocator.get_io_region(second) == XDSIORegion(73, 4096, 4096)
+    assert allocator.get_io_region(third) == XDSIORegion(74, 0, 4096)
+    assert "because no memory is available" not in caplog.text
+
+    for memory_obj in memory_objs:
+        assert memory_obj is not None
+        memory_obj.ref_count_down()
+    allocator.close()
+    assert client.freed == [74, 73]
+    assert lifecycle[-1] == ("close_client",)

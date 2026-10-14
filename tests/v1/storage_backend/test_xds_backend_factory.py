@@ -81,7 +81,7 @@ class FakeLegacyCascadeBackend:
         config,
         metadata,
         loop,
-        local_cpu_backend,
+        memory_allocator,
         xds_client,
         dst_device,
         lmcache_worker,
@@ -89,7 +89,7 @@ class FakeLegacyCascadeBackend:
         self.config = config
         self.metadata = metadata
         self.loop = loop
-        self.local_cpu_backend = local_cpu_backend
+        self.memory_allocator = memory_allocator
         self.client = xds_client
         self.dst_device = dst_device
         self.lmcache_worker = lmcache_worker
@@ -147,6 +147,7 @@ def test_factory_constructs_only_selected_xds_backend(
     config.xds_service_name = "xds0"
     config.xds_backend = direct
     config.cascadekv_backend = cascade
+    config.use_layerwise = False
     config.xds_require_direct = direct
     fake_client = FakeXDSClient()
     monkeypatch.setattr(
@@ -165,8 +166,6 @@ def test_factory_constructs_only_selected_xds_backend(
     assert expected in backends
     assert ({"XDSBackend", "CascadeKVBackend"} & backends.keys()) == {expected}
     backends[expected].close()
-    if cascade:
-        backends["LocalCPUBackend"].close()
     assert fake_client.closed is True
 
 
@@ -203,7 +202,7 @@ def test_storage_manager_selects_cascadekv_allocator(metadata, monkeypatch):
     config.max_local_cpu_size = 8192 / 1024**3
     config.xds_service_name = "xds0"
     config.cascadekv_backend = True
-    config.cascadekv_slot_count = 2
+    config.use_layerwise = False
     client = FakeXDSClient()
     monkeypatch.setattr(
         "lmcache.v1.storage_backend.connect_xds_client",
@@ -222,10 +221,9 @@ def test_storage_manager_selects_cascadekv_allocator(metadata, monkeypatch):
 
     assert manager._get_allocator_backend(config) is backends["CascadeKVBackend"]
     backends["CascadeKVBackend"].close()
-    backends["LocalCPUBackend"].close()
 
 
-def test_factory_injects_service_dma_local_cpu_into_cascadekv(
+def test_factory_injects_service_dma_allocator_into_cascadekv(
     metadata, monkeypatch
 ):
     config = LMCacheEngineConfig.from_defaults()
@@ -233,6 +231,7 @@ def test_factory_injects_service_dma_local_cpu_into_cascadekv(
     config.max_local_cpu_size = 8192 / 1024**3
     config.xds_service_name = "xds0"
     config.cascadekv_backend = True
+    config.use_layerwise = False
     client = FakeXDSClient()
     loop = asyncio.new_event_loop()
     FakeServiceAllocator.instances.clear()
@@ -254,15 +253,13 @@ def test_factory_injects_service_dma_local_cpu_into_cascadekv(
 
     backends = CreateStorageBackends(config, metadata, loop, dst_device="cpu")
 
-    assert list(backends)[:2] == ["LocalCPUBackend", "CascadeKVBackend"]
+    assert list(backends) == ["CascadeKVBackend"]
     assert len(FakeServiceAllocator.instances) == 1
     allocator = FakeServiceAllocator.instances[0]
     assert allocator.size == 8192
     assert allocator.align_bytes == 4096
     assert allocator.close_client is True
-    assert FakeLegacyCascadeBackend.instance.local_cpu_backend is backends[
-        "LocalCPUBackend"
-    ]
+    assert FakeLegacyCascadeBackend.instance.memory_allocator is allocator
     assert FakeLegacyCascadeBackend.instance.client is client
 
 
@@ -274,6 +271,7 @@ def test_factory_cleans_service_dma_allocator_when_cascadekv_init_fails(
     config.max_local_cpu_size = 8192 / 1024**3
     config.xds_service_name = "xds0"
     config.cascadekv_backend = True
+    config.use_layerwise = False
     client = FakeXDSClient()
     FakeServiceAllocator.instances.clear()
     monkeypatch.setattr(

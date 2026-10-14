@@ -37,11 +37,12 @@ def test_cascadekv_xds_io_uses_service_completion_groups() -> None:
     assert "_get_io_ptr" not in source
 
 
-def test_cascadekv_uses_lmcache_043_evictor_api() -> None:
+def test_cascadekv_owns_lru_without_lmcache_evictor() -> None:
     source = BACKEND_PATH.read_text()
 
     assert "update_on_hit" not in source
-    assert "update_on_get" in source
+    assert "update_on_get" not in source
+    assert "evict_oldest" in source
 
 
 def test_cascadekv_exposes_lmcache_043_async_batch_api() -> None:

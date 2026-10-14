@@ -60,6 +60,7 @@ def test_connect_xds_client_binds_rank_and_service(lmcache_engine_metadata):
     config = LMCacheEngineConfig.from_defaults()
     config.xds_service_name = "xds0"
     config.cascadekv_backend = True
+    config.use_layerwise = False
     logical_size = _chunk_size_bytes(lmcache_engine_metadata)
     blob_size = align_to_io_unit(logical_size, 4096)
 
@@ -91,6 +92,32 @@ def test_connect_xds_client_binds_rank_and_service(lmcache_engine_metadata):
             False,
         )
     ]
+
+
+def test_non_layerwise_cascadekv_validates_one_full_block(
+    lmcache_engine_metadata,
+):
+    """Non-layerwise metadata already includes every layer exactly once."""
+    config = LMCacheEngineConfig.from_defaults()
+    config.xds_service_name = "xds0"
+    config.cascadekv_backend = True
+    config.use_layerwise = False
+    blob_size = align_to_io_unit(_chunk_size_bytes(lmcache_engine_metadata), 4096)
+
+    def connect(*_args):
+        return SimpleNamespace(
+            metadata=SimpleNamespace(
+                queue_id=0,
+                worker_id=0,
+                io_unit_size=4096,
+                blob_size_bytes=blob_size,
+                capacity_bytes=blob_size * 32,
+                gpu_buffer_size_bytes=0,
+            )
+        )
+
+    client = connect_xds_client(config, lmcache_engine_metadata, connect_fn=connect)
+    assert client.metadata.blob_size_bytes == blob_size
 
 
 def test_connect_xds_client_rejects_undersized_blob(lmcache_engine_metadata):

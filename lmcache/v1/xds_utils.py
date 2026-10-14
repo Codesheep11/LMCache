@@ -24,6 +24,7 @@ class XDSBlobMetadata:
     shapes: list[torch.Size]
     dtypes: list[torch.dtype]
     fmt: MemoryFormat
+    blob_offset: int = 0
     pin_count: int = 0
 
     def pin(self) -> bool:
@@ -90,6 +91,7 @@ def _validate_service_metadata(
     metadata: LMCacheMetadata,
     require_direct: bool,
     use_layerwise: bool = False,
+    block_blob_layout: bool = False,
 ) -> None:
     service_metadata = getattr(client, "metadata", None)
     if service_metadata is None:
@@ -121,6 +123,10 @@ def _validate_service_metadata(
 
     logical_chunk_size = get_chunk_size_bytes(metadata, use_layerwise=use_layerwise)
     required_blob_size = align_to_io_unit(logical_chunk_size, io_unit_size)
+    # Layerwise CascadeKV starts from one-layer size and expands it to the
+    # block blob. Non-layerwise metadata already describes the full block.
+    if block_blob_layout and use_layerwise:
+        required_blob_size *= int(metadata.kv_shape[0])
     if blob_size < required_blob_size:
         raise ValueError(
             "xDS blob is smaller than one LMCache chunk: "
@@ -173,6 +179,7 @@ def connect_xds_client(
             metadata,
             require_direct,
             use_layerwise=config.use_layerwise,
+            block_blob_layout=config.cascadekv_backend,
         )
     except Exception:
         close = getattr(client, "close", None)

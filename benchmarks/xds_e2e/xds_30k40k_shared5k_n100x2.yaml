@@ -1,0 +1,20 @@
+chunk_size: 256
+local_cpu: false
+use_layerwise: false
+save_unfull_chunk: true
+py_enable_gc: false
+xds_service_name: xds0
+xds_backend: true
+cascadekv_backend: false
+xds_require_direct: true
+xds_windowed_io: true
+xds_read_window_size: 64
+xds_write_window_size: 64
+# The native 6 MiB block-blob sweep showed one outstanding request per GPU
+# outperforming QD=2. Two read slots let GPU scatter overlap the next read.
+xds_io_queue_depth: 1
+xds_read_slot_count: 2
+xds_write_slot_count: 8
+xds_async_write: true
+extra_config:
+  benchmark_transfer_metrics: true

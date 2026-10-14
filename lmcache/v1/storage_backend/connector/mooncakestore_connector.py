@@ -5,6 +5,7 @@ from typing import List, Optional, no_type_check
 import asyncio
 import json
 import os
+import time
 
 # Third Party
 import torch
@@ -34,6 +35,11 @@ class MooncakeStoreConfig:
     transfer_timeout: int
     storage_root_dir: str
     prefer_local_alloc: bool = False
+    enable_ssd_offload: bool = False
+    ssd_offload_path: str = ""
+    separate_ssd_path_by_rank: bool = True
+    tenant_id: str = "default"
+    benchmark_transfer_metrics: bool = False
 
     @staticmethod
     def from_file(file_path: str) -> "MooncakeStoreConfig":
@@ -54,6 +60,13 @@ class MooncakeStoreConfig:
             transfer_timeout=config.get("transfer_timeout", 1),
             storage_root_dir=config.get("storage_root_dir", ""),
             prefer_local_alloc=prefer_local_alloc,
+            enable_ssd_offload=config.get("mooncake_enable_ssd_offload", False),
+            ssd_offload_path=config.get("mooncake_ssd_offload_path", ""),
+            separate_ssd_path_by_rank=config.get(
+                "mooncake_separate_ssd_path_by_rank", True
+            ),
+            tenant_id=config.get("mooncake_tenant_id", "default"),
+            benchmark_transfer_metrics=config.get("benchmark_transfer_metrics", False),
         )
 
     @staticmethod
@@ -88,6 +101,15 @@ class MooncakeStoreConfig:
             transfer_timeout=extra_config.get("transfer_timeout", 1),
             storage_root_dir=extra_config.get("storage_root_dir", ""),
             prefer_local_alloc=prefer_local_alloc,
+            enable_ssd_offload=extra_config.get("mooncake_enable_ssd_offload", False),
+            ssd_offload_path=extra_config.get("mooncake_ssd_offload_path", ""),
+            separate_ssd_path_by_rank=extra_config.get(
+                "mooncake_separate_ssd_path_by_rank", True
+            ),
+            tenant_id=extra_config.get("mooncake_tenant_id", "default"),
+            benchmark_transfer_metrics=extra_config.get(
+                "benchmark_transfer_metrics", False
+            ),
         )
 
 
@@ -96,11 +118,12 @@ class MooncakestoreConnector(RemoteConnector):
         self,
         host: str,
         port: int,
-        dev_name,
+        dev_name: str,
         loop: asyncio.AbstractEventLoop,
         local_cpu_backend: LocalCPUBackend,
         lmcache_config: Optional[LMCacheEngineConfig],
-    ):
+        worker_id: int = 0,
+    ) -> None:
         # initialize base class, which includes some common attributes
         super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
 
@@ -155,6 +178,19 @@ class MooncakestoreConnector(RemoteConnector):
             logger.info(f"  device_name: {self.config.device_name}")
             logger.info(f"  master_server_address: {self.config.master_server_address}")
 
+            ssd_offload_path = self.config.ssd_offload_path
+            if self.config.enable_ssd_offload and self.config.separate_ssd_path_by_rank:
+                ssd_offload_path = os.path.join(ssd_offload_path, f"rank-{worker_id}")
+            if self.config.enable_ssd_offload:
+                if not ssd_offload_path:
+                    raise ValueError(
+                        "mooncake_ssd_offload_path is required when "
+                        "mooncake_enable_ssd_offload is true"
+                    )
+                os.makedirs(ssd_offload_path, exist_ok=True)
+            logger.info("  enable_ssd_offload: %s", self.config.enable_ssd_offload)
+            logger.info("  ssd_offload_path: %s", ssd_offload_path)
+
             try:
                 numa_mapping = getattr(
                     local_cpu_backend.memory_allocator, "numa_mapping", None
@@ -194,7 +230,7 @@ class MooncakestoreConnector(RemoteConnector):
                     f"Failed to determine NUMA mapping before Mooncake setup: {e}"
                 )
 
-            self.store.setup(
+            setup_result = self.store.setup(
                 self.config.local_hostname,
                 self.config.metadata_server,
                 self.config.global_segment_size,
@@ -202,7 +238,15 @@ class MooncakestoreConnector(RemoteConnector):
                 self.config.protocol,
                 self.config.device_name,
                 self.config.master_server_address,
+                None,
+                self.config.enable_ssd_offload,
+                ssd_offload_path,
+                self.config.tenant_id,
             )
+            if setup_result != 0:
+                raise RuntimeError(
+                    f"Mooncake store setup failed with error code {setup_result}"
+                )
             logger.info("Mooncake store setup completed successfully")
 
         except ValueError as e:
@@ -214,6 +258,7 @@ class MooncakestoreConnector(RemoteConnector):
 
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
+        self.worker_id = worker_id
         self.registered_buffer_ptr = None
 
         # Initialize ReplicateConfig
@@ -354,25 +399,90 @@ class MooncakestoreConnector(RemoteConnector):
             logger.warning("Batch-get aborted: unable to allocate any buffers.")
             return [None] * len(keys)
 
-        try:
-            # Single RPC call for multiple chunks
-            logger.debug(f"Calling batch_get_into with {len(key_strs)} keys")
-            bytes_read_list = await asyncio.to_thread(
-                self.store.batch_get_into, key_strs, buffer_ptrs, buffer_sizes
+        # Mooncake's io_uring staging arena is a hard cap for one
+        # batch_get_into call.  A long-context scheduler batch can contain
+        # more destination bytes than that arena even though every individual
+        # chunk fits.  Split without changing result ordering so a 1 GiB
+        # fixed-buffer arena can safely serve 50k/100k-token requests.
+        # The arena is also used internally by Mooncake while an io_uring
+        # operation is in flight.  Keep three quarters available for internal
+        # staging, double-buffering, and overlap between TP ranks.  A half-arena
+        # payload survived short tests but eventually returned BUFFER_OVERFLOW
+        # (-10) under a sustained 64-session coding-agent replay.
+        batch_limit = max(1, int(self.config.local_buffer_size) // 4)
+        batches: list[list[int]] = []
+        current_batch: list[int] = []
+        current_bytes = 0
+        for position, size in enumerate(buffer_sizes):
+            if current_batch and current_bytes + size > batch_limit:
+                batches.append(current_batch)
+                current_batch = []
+                current_bytes = 0
+            current_batch.append(position)
+            current_bytes += size
+        if current_batch:
+            batches.append(current_batch)
+        if len(batches) > 1:
+            logger.info(
+                "[MOONCAKE_BATCH_GET_SPLIT] keys=%d batches=%d bytes=%d cap=%d",
+                len(key_strs),
+                len(batches),
+                sum(buffer_sizes),
+                batch_limit,
             )
-            logger.debug(f"batch_get_into returned: {bytes_read_list}")
 
-            # Assemble the final result list
-            results: list[Optional[MemoryObj]] = [None] * len(keys)
+        results: list[Optional[MemoryObj]] = [None] * len(keys)
+        for batch_positions in batches:
+            batch_key_strs = [key_strs[pos] for pos in batch_positions]
+            batch_ptrs = [buffer_ptrs[pos] for pos in batch_positions]
+            batch_sizes = [buffer_sizes[pos] for pos in batch_positions]
+            batch_indices = [valid_idx[pos] for pos in batch_positions]
+            start_ns = time.monotonic_ns()
+            try:
+                logger.debug(
+                    "Calling batch_get_into with %d keys (%d bytes, cap=%d)",
+                    len(batch_key_strs),
+                    sum(batch_sizes),
+                    batch_limit,
+                )
+                bytes_read_list = await asyncio.to_thread(
+                    self.store.batch_get_into,
+                    batch_key_strs,
+                    batch_ptrs,
+                    batch_sizes,
+                )
+                end_ns = time.monotonic_ns()
+                logger.debug(f"batch_get_into returned: {bytes_read_list}")
+            except Exception as exc:
+                logger.error(f"batch_get_into threw exception: {str(exc)}")
+                for i in batch_indices:
+                    memory_objs[i].ref_count_down()  # type: ignore
+                continue
 
-            for i, n_read in zip(valid_idx, bytes_read_list, strict=False):
+            bytes_read = sum(max(0, int(value)) for value in bytes_read_list)
+            if self.config.benchmark_transfer_metrics and bytes_read > 0:
+                logger.info(
+                    "[MOONCAKE_STORE_READ_METRICS] %s",
+                    json.dumps(
+                        {
+                            "worker_id": self.worker_id,
+                            "bytes": bytes_read,
+                            "start_ns": start_ns,
+                            "end_ns": end_ns,
+                            "seconds": (end_ns - start_ns) / 1_000_000_000,
+                            "ssd_offload_enabled": (self.config.enable_ssd_offload),
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+
+            for i, n_read in zip(batch_indices, bytes_read_list, strict=False):
                 if n_read <= 0:
                     logger.warning(
                         f"batch_get_into failed for key {keys[i]} (code={n_read})"
                     )
                     memory_objs[i].ref_count_down()  # type: ignore
                     continue
-
                 try:
                     results[i] = self.reshape_partial_chunk(
                         memory_objs[i],  # type: ignore
@@ -382,14 +492,7 @@ class MooncakestoreConnector(RemoteConnector):
                     logger.error(f"Reshape failed for key {keys[i]}: {exc}")
                     memory_objs[i].ref_count_down()  # type: ignore
 
-            return results
-
-        except Exception as exc:
-            logger.error(f"batch_get_into threw exception: {str(exc)}")
-            # Release any buffers we successfully allocated
-            for i in valid_idx:
-                memory_objs[i].ref_count_down()  # type: ignore
-            return [None] * len(keys)
+        return results
 
     async def _batch_get_buffer(
         self, keys: List[CacheEngineKey]
@@ -518,6 +621,7 @@ class MooncakestoreConnector(RemoteConnector):
             buffer_ptrs.append(obj.data_ptr)
             buffer_sizes.append(obj.get_size())
 
+        start_ns = time.monotonic_ns()
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(
@@ -529,6 +633,22 @@ class MooncakestoreConnector(RemoteConnector):
                 ),
                 timeout=self.config.transfer_timeout,
             )
+            end_ns = time.monotonic_ns()
+            if self.config.benchmark_transfer_metrics:
+                logger.info(
+                    "[MOONCAKE_STORE_WRITE_METRICS] %s",
+                    json.dumps(
+                        {
+                            "worker_id": self.worker_id,
+                            "bytes": sum(buffer_sizes),
+                            "start_ns": start_ns,
+                            "end_ns": end_ns,
+                            "seconds": (end_ns - start_ns) / 1_000_000_000,
+                            "ssd_offload_enabled": (self.config.enable_ssd_offload),
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
         except asyncio.TimeoutError:
             logger.warning(
                 "Timeout during batch_put_from; some decoders may redo prefill."

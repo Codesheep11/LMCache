@@ -1,0 +1,702 @@
+{
+  "parameters": {
+    "disk_dir": "/mnt/lmcache-raid0/single-prompt-vllm-lmcache/lmcache-ssd-eviction-iumbhf3h",
+    "dataset_bytes_per_direction": 4294967296,
+    "chunk_bytes": 1048576,
+    "block_count": 4096,
+    "initial_cache_bytes": 8589934592,
+    "cpu_size_bytes": 1073741824,
+    "concurrency": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "trials": 3,
+    "odirect": true
+  },
+  "results": [
+    {
+      "mode": "ssd_headroom",
+      "concurrency": 1,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 4.51003825,
+      "makespan_sec": 7.5335426,
+      "read_gib_per_sec": 0.8869104380655751,
+      "aggregate_gib_per_sec": 1.0619174039050367,
+      "read_failures": 0,
+      "ssd_evictions": 0,
+      "ssd_eviction_ms_sum": 0.0,
+      "write_admission_ms": 7528.561064,
+      "metadata_ms_sum": 32.930064,
+      "allocate_ms_sum": 177.754097,
+      "read_ms_sum": 3822.606243,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.00250244140625,
+          "read_ms": 4364.0,
+          "write_ms": 2560.0,
+          "average_queue_depth": 0.9190895130798092
+        }
+      },
+      "trial": 0
+    },
+    {
+      "mode": "ssd_full_eviction",
+      "concurrency": 1,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 5.785509652,
+      "makespan_sec": 7.752333442,
+      "read_gib_per_sec": 0.6913824780531194,
+      "aggregate_gib_per_sec": 1.0319473562189947,
+      "read_failures": 0,
+      "ssd_evictions": 4096,
+      "ssd_eviction_ms_sum": 1553.446657,
+      "write_admission_ms": 7749.453573,
+      "metadata_ms_sum": 1153.712848,
+      "allocate_ms_sum": 231.338782,
+      "read_ms_sum": 3863.764877,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.007255554199219,
+          "read_ms": 4080.0,
+          "write_ms": 2664.0,
+          "average_queue_depth": 0.8699316212926126
+        }
+      },
+      "trial": 0
+    },
+    {
+      "mode": "ssd_full_eviction",
+      "concurrency": 1,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 15.789295406,
+      "makespan_sec": 15.789365048,
+      "read_gib_per_sec": 0.2533361937404745,
+      "aggregate_gib_per_sec": 0.5066701527059405,
+      "read_failures": 0,
+      "ssd_evictions": 4096,
+      "ssd_eviction_ms_sum": 681.870556,
+      "write_admission_ms": 11643.908352,
+      "metadata_ms_sum": 815.844827,
+      "allocate_ms_sum": 341.322736,
+      "read_ms_sum": 11875.10566,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.007617950439453,
+          "read_ms": 3864.0,
+          "write_ms": 2868.0,
+          "average_queue_depth": 0.42636293350204896
+        }
+      },
+      "trial": 1
+    },
+    {
+      "mode": "ssd_headroom",
+      "concurrency": 1,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 5.22454467,
+      "makespan_sec": 7.395944833,
+      "read_gib_per_sec": 0.7656169585396616,
+      "aggregate_gib_per_sec": 1.0816738335181684,
+      "read_failures": 0,
+      "ssd_evictions": 0,
+      "ssd_eviction_ms_sum": 0.0,
+      "write_admission_ms": 7391.575461,
+      "metadata_ms_sum": 40.424688,
+      "allocate_ms_sum": 224.550987,
+      "read_ms_sum": 4400.267036,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.002773284912109,
+          "read_ms": 3688.0,
+          "write_ms": 2760.0,
+          "average_queue_depth": 0.8718291098156438
+        }
+      },
+      "trial": 1
+    },
+    {
+      "mode": "ssd_headroom",
+      "concurrency": 1,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 4.370738782,
+      "makespan_sec": 7.181728891,
+      "read_gib_per_sec": 0.9151770900775831,
+      "aggregate_gib_per_sec": 1.1139379001100196,
+      "read_failures": 0,
+      "ssd_evictions": 0,
+      "ssd_eviction_ms_sum": 0.0,
+      "write_admission_ms": 7177.572994,
+      "metadata_ms_sum": 35.315785,
+      "allocate_ms_sum": 172.483298,
+      "read_ms_sum": 3712.259302,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.005302429199219,
+          "read_ms": 4508.0,
+          "write_ms": 3124.0,
+          "average_queue_depth": 1.0626967567049588
+        }
+      },
+      "trial": 2
+    },
+    {
+      "mode": "ssd_full_eviction",
+      "concurrency": 1,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 6.140873007,
+      "makespan_sec": 7.535986821,
+      "read_gib_per_sec": 0.6513731834936805,
+      "aggregate_gib_per_sec": 1.0615729817503088,
+      "read_failures": 0,
+      "ssd_evictions": 4096,
+      "ssd_eviction_ms_sum": 1499.188244,
+      "write_admission_ms": 7529.967505,
+      "metadata_ms_sum": 1195.251704,
+      "allocate_ms_sum": 249.437744,
+      "read_ms_sum": 4042.692366,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.004581451416016,
+          "read_ms": 3384.0,
+          "write_ms": 2496.0,
+          "average_queue_depth": 0.7802561415864769
+        }
+      },
+      "trial": 2
+    },
+    {
+      "mode": "ssd_headroom",
+      "concurrency": 2,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 3.106653229,
+      "makespan_sec": 7.301609796,
+      "read_gib_per_sec": 1.2875592173148849,
+      "aggregate_gib_per_sec": 1.095648798485862,
+      "read_failures": 0,
+      "ssd_evictions": 0,
+      "ssd_eviction_ms_sum": 0.0,
+      "write_admission_ms": 7286.411532,
+      "metadata_ms_sum": 49.159612,
+      "allocate_ms_sum": 263.960623,
+      "read_ms_sum": 5384.949864,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.005603790283203,
+          "read_ms": 5376.0,
+          "write_ms": 2744.0,
+          "average_queue_depth": 1.11208353046315
+        }
+      },
+      "trial": 0
+    },
+    {
+      "mode": "ssd_full_eviction",
+      "concurrency": 2,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 4.21208589,
+      "makespan_sec": 7.880073169,
+      "read_gib_per_sec": 0.949648251356052,
+      "aggregate_gib_per_sec": 1.0152189996752554,
+      "read_failures": 0,
+      "ssd_evictions": 4096,
+      "ssd_eviction_ms_sum": 1602.307507,
+      "write_admission_ms": 7876.202063,
+      "metadata_ms_sum": 2209.342008,
+      "allocate_ms_sum": 319.258899,
+      "read_ms_sum": 5297.811392,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.004791259765625,
+          "read_ms": 4844.0,
+          "write_ms": 2624.0,
+          "average_queue_depth": 0.9477069361968509
+        }
+      },
+      "trial": 0
+    },
+    {
+      "mode": "ssd_full_eviction",
+      "concurrency": 2,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 11.205005434,
+      "makespan_sec": 14.271982211,
+      "read_gib_per_sec": 0.3569833163902417,
+      "aggregate_gib_per_sec": 0.5605388152624009,
+      "read_failures": 0,
+      "ssd_evictions": 4096,
+      "ssd_eviction_ms_sum": 1167.942025,
+      "write_admission_ms": 13647.501521,
+      "metadata_ms_sum": 4228.042974,
+      "allocate_ms_sum": 466.477723,
+      "read_ms_sum": 15678.400478,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.006397247314453,
+          "read_ms": 5100.0,
+          "write_ms": 2900.0,
+          "average_queue_depth": 0.5605388152624009
+        }
+      },
+      "trial": 1
+    },
+    {
+      "mode": "ssd_headroom",
+      "concurrency": 2,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 2.725930076,
+      "makespan_sec": 7.367854655,
+      "read_gib_per_sec": 1.467389070327716,
+      "aggregate_gib_per_sec": 1.085797749087112,
+      "read_failures": 0,
+      "ssd_evictions": 0,
+      "ssd_eviction_ms_sum": 0.0,
+      "write_admission_ms": 7157.959422,
+      "metadata_ms_sum": 41.395064,
+      "allocate_ms_sum": 212.917262,
+      "read_ms_sum": 4795.033017,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.003726959228516,
+          "read_ms": 4900.0,
+          "write_ms": 3180.0,
+          "average_queue_depth": 1.096655726577983
+        }
+      },
+      "trial": 1
+    },
+    {
+      "mode": "ssd_headroom",
+      "concurrency": 2,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 2.721969424,
+      "makespan_sec": 7.332079586,
+      "read_gib_per_sec": 1.469524221959078,
+      "aggregate_gib_per_sec": 1.0910956306687314,
+      "read_failures": 0,
+      "ssd_evictions": 0,
+      "ssd_eviction_ms_sum": 0.0,
+      "write_admission_ms": 7177.006626,
+      "metadata_ms_sum": 45.389654,
+      "allocate_ms_sum": 214.688973,
+      "read_ms_sum": 4769.496176,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.002315521240234,
+          "read_ms": 5040.0,
+          "write_ms": 2268.0,
+          "average_queue_depth": 0.9967158586158861
+        }
+      },
+      "trial": 2
+    },
+    {
+      "mode": "ssd_full_eviction",
+      "concurrency": 2,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 3.951299503,
+      "makespan_sec": 7.754316569,
+      "read_gib_per_sec": 1.0123251849076549,
+      "aggregate_gib_per_sec": 1.031683440934329,
+      "read_failures": 0,
+      "ssd_evictions": 4096,
+      "ssd_eviction_ms_sum": 1521.573126,
+      "write_admission_ms": 7749.806856,
+      "metadata_ms_sum": 2047.166755,
+      "allocate_ms_sum": 302.39949,
+      "read_ms_sum": 4951.938783,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.005683898925781,
+          "read_ms": 5228.0,
+          "write_ms": 2628.0,
+          "average_queue_depth": 1.013113138997511
+        }
+      },
+      "trial": 2
+    },
+    {
+      "mode": "ssd_headroom",
+      "concurrency": 4,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 1.877499132,
+      "makespan_sec": 7.364641645,
+      "read_gib_per_sec": 2.1304936613946728,
+      "aggregate_gib_per_sec": 1.0862714556425643,
+      "read_failures": 0,
+      "ssd_evictions": 0,
+      "ssd_eviction_ms_sum": 0.0,
+      "write_admission_ms": 7354.808528,
+      "metadata_ms_sum": 50.290645,
+      "allocate_ms_sum": 276.42044,
+      "read_ms_sum": 6574.701733,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.0039825439453125,
+          "read_ms": 4184.0,
+          "write_ms": 2644.0,
+          "average_queue_depth": 0.9271326873909288
+        }
+      },
+      "trial": 0
+    },
+    {
+      "mode": "ssd_full_eviction",
+      "concurrency": 4,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 3.595597511,
+      "makespan_sec": 8.554126433,
+      "read_gib_per_sec": 1.1124715677332664,
+      "aggregate_gib_per_sec": 0.9352211546859656,
+      "read_failures": 0,
+      "ssd_evictions": 4096,
+      "ssd_eviction_ms_sum": 1556.487091,
+      "write_admission_ms": 8544.918709,
+      "metadata_ms_sum": 6507.712405,
+      "allocate_ms_sum": 480.641477,
+      "read_ms_sum": 6479.217542,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.0053253173828125,
+          "read_ms": 4520.0,
+          "write_ms": 3032.0,
+          "average_queue_depth": 0.8828487700235513
+        }
+      },
+      "trial": 0
+    },
+    {
+      "mode": "ssd_full_eviction",
+      "concurrency": 4,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 6.437439784,
+      "makespan_sec": 10.425868869,
+      "read_gib_per_sec": 0.621365035513317,
+      "aggregate_gib_per_sec": 0.7673221388566459,
+      "read_failures": 0,
+      "ssd_evictions": 4096,
+      "ssd_eviction_ms_sum": 1411.091337,
+      "write_admission_ms": 10256.809088,
+      "metadata_ms_sum": 11254.293003,
+      "allocate_ms_sum": 567.50431,
+      "read_ms_sum": 12262.449533,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.004222869873047,
+          "read_ms": 4952.0,
+          "write_ms": 2348.0,
+          "average_queue_depth": 0.7001814517066894
+        }
+      },
+      "trial": 1
+    },
+    {
+      "mode": "ssd_headroom",
+      "concurrency": 4,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 1.888145102,
+      "makespan_sec": 5.479614856,
+      "read_gib_per_sec": 2.1184812521892717,
+      "aggregate_gib_per_sec": 1.4599566229075862,
+      "read_failures": 0,
+      "ssd_evictions": 0,
+      "ssd_eviction_ms_sum": 0.0,
+      "write_admission_ms": 5473.334143,
+      "metadata_ms_sum": 50.878649,
+      "allocate_ms_sum": 271.333074,
+      "read_ms_sum": 6635.32899,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.005641937255859,
+          "read_ms": 4824.0,
+          "write_ms": 2568.0,
+          "average_queue_depth": 1.3489999195666098
+        }
+      },
+      "trial": 1
+    },
+    {
+      "mode": "ssd_headroom",
+      "concurrency": 4,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 1.46162307,
+      "makespan_sec": 6.88102963,
+      "read_gib_per_sec": 2.7366836786450013,
+      "aggregate_gib_per_sec": 1.1626167056629868,
+      "read_failures": 0,
+      "ssd_evictions": 0,
+      "ssd_eviction_ms_sum": 0.0,
+      "write_admission_ms": 6851.958656,
+      "metadata_ms_sum": 39.861911,
+      "allocate_ms_sum": 197.041661,
+      "read_ms_sum": 5180.461064,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.002460479736328,
+          "read_ms": 4260.0,
+          "write_ms": 2648.0,
+          "average_queue_depth": 1.003919525339989
+        }
+      },
+      "trial": 2
+    },
+    {
+      "mode": "ssd_full_eviction",
+      "concurrency": 4,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 1.535185289,
+      "makespan_sec": 2.662005505,
+      "read_gib_per_sec": 2.60554867784432,
+      "aggregate_gib_per_sec": 3.005252988761193,
+      "read_failures": 0,
+      "ssd_evictions": 4096,
+      "ssd_eviction_ms_sum": 560.53813,
+      "write_admission_ms": 2653.470642,
+      "metadata_ms_sum": 2075.998242,
+      "allocate_ms_sum": 174.597868,
+      "read_ms_sum": 3622.227834,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.003543853759766,
+          "read_ms": 6904.0,
+          "write_ms": 1648.0,
+          "average_queue_depth": 3.212615444985716
+        }
+      },
+      "trial": 2
+    },
+    {
+      "mode": "ssd_headroom",
+      "concurrency": 8,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 0.961825595,
+      "makespan_sec": 3.929424904,
+      "read_gib_per_sec": 4.158758116641718,
+      "aggregate_gib_per_sec": 2.0359213359329793,
+      "read_failures": 0,
+      "ssd_evictions": 0,
+      "ssd_eviction_ms_sum": 0.0,
+      "write_admission_ms": 3920.754236,
+      "metadata_ms_sum": 34.894556,
+      "allocate_ms_sum": 187.38,
+      "read_ms_sum": 7077.387375,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.001792907714844,
+          "read_ms": 4636.0,
+          "write_ms": 2168.0,
+          "average_queue_depth": 1.731551096210999
+        }
+      },
+      "trial": 0
+    },
+    {
+      "mode": "ssd_full_eviction",
+      "concurrency": 8,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 2.19790823,
+      "makespan_sec": 5.348084591,
+      "read_gib_per_sec": 1.8199121989729299,
+      "aggregate_gib_per_sec": 1.4958626521096476,
+      "read_failures": 0,
+      "ssd_evictions": 4096,
+      "ssd_eviction_ms_sum": 693.662567,
+      "write_admission_ms": 5329.465071,
+      "metadata_ms_sum": 11502.939013,
+      "allocate_ms_sum": 400.898305,
+      "read_ms_sum": 5003.045812,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.004184722900391,
+          "read_ms": 5436.0,
+          "write_ms": 2400.0,
+          "average_queue_depth": 1.4651974677414
+        }
+      },
+      "trial": 0
+    },
+    {
+      "mode": "ssd_full_eviction",
+      "concurrency": 8,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 1.544871425,
+      "makespan_sec": 5.166071593,
+      "read_gib_per_sec": 2.589212238164092,
+      "aggregate_gib_per_sec": 1.548565453649531,
+      "read_failures": 0,
+      "ssd_evictions": 4096,
+      "ssd_eviction_ms_sum": 894.893757,
+      "write_admission_ms": 5055.692967,
+      "metadata_ms_sum": 7460.916808,
+      "allocate_ms_sum": 239.768242,
+      "read_ms_sum": 4260.214281,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.005107879638672,
+          "read_ms": 4852.0,
+          "write_ms": 1960.0,
+          "average_queue_depth": 1.3186034837825757
+        }
+      },
+      "trial": 1
+    },
+    {
+      "mode": "ssd_headroom",
+      "concurrency": 8,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 1.070131467,
+      "makespan_sec": 3.220348688,
+      "read_gib_per_sec": 3.737858499959426,
+      "aggregate_gib_per_sec": 2.4842030398169106,
+      "read_failures": 0,
+      "ssd_evictions": 0,
+      "ssd_eviction_ms_sum": 0.0,
+      "write_admission_ms": 3215.636168,
+      "metadata_ms_sum": 1006.841565,
+      "allocate_ms_sum": 201.669723,
+      "read_ms_sum": 6934.026936,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.0,
+          "read_ms": 5044.0,
+          "write_ms": 1704.0,
+          "average_queue_depth": 2.095425264085564
+        }
+      },
+      "trial": 1
+    },
+    {
+      "mode": "ssd_headroom",
+      "concurrency": 8,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 0.781392436,
+      "makespan_sec": 4.530340465,
+      "read_gib_per_sec": 5.119066701587575,
+      "aggregate_gib_per_sec": 1.7658716959145806,
+      "read_failures": 0,
+      "ssd_evictions": 0,
+      "ssd_eviction_ms_sum": 0.0,
+      "write_admission_ms": 4468.419487,
+      "metadata_ms_sum": 30.053943,
+      "allocate_ms_sum": 156.602443,
+      "read_ms_sum": 5802.992706,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.004055023193359,
+          "read_ms": 5804.0,
+          "write_ms": 2324.0,
+          "average_queue_depth": 1.7941256430492138
+        }
+      },
+      "trial": 2
+    },
+    {
+      "mode": "ssd_full_eviction",
+      "concurrency": 8,
+      "read_bytes": 4294967296,
+      "write_bytes": 4294967296,
+      "read_elapsed_sec": 1.813623555,
+      "makespan_sec": 6.382825232,
+      "read_gib_per_sec": 2.205529360804977,
+      "aggregate_gib_per_sec": 1.2533634729480558,
+      "read_failures": 0,
+      "ssd_evictions": 4096,
+      "ssd_eviction_ms_sum": 1220.511307,
+      "write_admission_ms": 6368.990141,
+      "metadata_ms_sum": 9378.588469,
+      "allocate_ms_sum": 334.204636,
+      "read_ms_sum": 4289.858138,
+      "devices": {
+        "md127": {
+          "read_gib": 4.0,
+          "write_gib": 4.002834320068359,
+          "read_ms": 4620.0,
+          "write_ms": 2668.0,
+          "average_queue_depth": 1.1418141238556787
+        }
+      },
+      "trial": 2
+    }
+  ],
+  "summary": [
+    {
+      "concurrency": 1,
+      "ssd_headroom_median_read_gib_per_sec": 0.8869104380655751,
+      "ssd_full_eviction_median_read_gib_per_sec": 0.6513731834936805,
+      "bandwidth_loss_percent": 26.55705068548081,
+      "ssd_full_median_eviction_ms_sum": 1499.188244,
+      "ssd_full_median_write_admission_ms": 7749.453573
+    },
+    {
+      "concurrency": 2,
+      "ssd_headroom_median_read_gib_per_sec": 1.467389070327716,
+      "ssd_full_eviction_median_read_gib_per_sec": 0.949648251356052,
+      "bandwidth_loss_percent": 35.283131750193256,
+      "ssd_full_median_eviction_ms_sum": 1521.573126,
+      "ssd_full_median_write_admission_ms": 7876.202063
+    },
+    {
+      "concurrency": 4,
+      "ssd_headroom_median_read_gib_per_sec": 2.1304936613946728,
+      "ssd_full_eviction_median_read_gib_per_sec": 1.1124715677332664,
+      "bandwidth_loss_percent": 47.78338993015283,
+      "ssd_full_median_eviction_ms_sum": 1411.091337,
+      "ssd_full_median_write_admission_ms": 8544.918709
+    },
+    {
+      "concurrency": 8,
+      "ssd_headroom_median_read_gib_per_sec": 4.158758116641718,
+      "ssd_full_eviction_median_read_gib_per_sec": 2.205529360804977,
+      "bandwidth_loss_percent": 46.96663525634459,
+      "ssd_full_median_eviction_ms_sum": 894.893757,
+      "ssd_full_median_write_admission_ms": 5329.465071
+    }
+  ]
+}

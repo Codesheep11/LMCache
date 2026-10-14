@@ -763,17 +763,12 @@ def test_xds_backend_config_accepts_each_service_path(monkeypatch):
     cascade = LMCacheEngineConfig.from_defaults()
     cascade.xds_service_name = "xds0"
     cascade.cascadekv_backend = True
-    cascade.cascadekv_slot_count = 4
+    cascade.use_layerwise = False
     cascade.local_cpu = False
-    cascade.max_local_cpu_size = 0
+    cascade.max_local_cpu_size = 1
     cascade.validate()
 
-    assert cascade.cascadekv_overlap is True
-    assert cascade.cascadekv_async_write is True
-    assert cascade.cascadekv_read_slot_count == 8
-    assert cascade.cascadekv_write_slot_count == 64
-    assert cascade.cascadekv_io_queue_depth == 4
-    assert cascade.cascadekv_write_window_size == 64
+    assert cascade.use_layerwise is False
 
     monkeypatch.setenv("LMCACHE_CASCADEKV_BACKEND", "true")
     monkeypatch.setenv("LMCACHE_XDS_SERVICE_NAME", "xds-env")
@@ -804,17 +799,15 @@ def test_cascadekv_parses_legacy_pipeline_configuration():
     assert config.xds_max_flush_delay == 1.0
 
 
-def test_cascadekv_ignores_bounded_pipeline_configuration():
+def test_cascadekv_rejects_layerwise_configuration():
     config = LMCacheEngineConfig.from_dict(
         {
             "cascadekv_backend": True,
             "xds_service_name": "xds0",
-            "cascadekv_slot_count": 0,
-            "cascadekv_read_slot_count": 0,
-            "cascadekv_write_slot_count": 0,
-            "cascadekv_io_queue_depth": 0,
-            "cascadekv_write_window_size": 0,
+            "use_layerwise": True,
+            "max_local_cpu_size": 1,
         }
     )
 
-    config.validate()
+    with pytest.raises(ValueError, match="use_layerwise=false"):
+        config.validate()

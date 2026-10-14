@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections.abc import Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
@@ -514,6 +515,7 @@ class LMCacheConnectorV1Impl:
             str, Generator[Optional[torch.Tensor], None, None]
         ] = {}
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
+        self._retrieve_executor: Optional[ThreadPoolExecutor] = None
 
         # Role-specific initialization
         if role == KVConnectorRole.SCHEDULER:
@@ -521,6 +523,16 @@ class LMCacheConnectorV1Impl:
         else:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
+
+            if config.cascadekv_backend and not self.use_layerwise:
+                # The scheduler can place several cache-hit requests in one
+                # forward batch. Let them build independent block chains; the
+                # backend still has one owner thread for the xDS SPSC ring.
+                max_workers = max(1, int(vllm_config.scheduler_config.max_num_seqs))
+                self._retrieve_executor = ThreadPoolExecutor(
+                    max_workers=max_workers,
+                    thread_name_prefix="CascadeKV-Retrieve",
+                )
 
             if self.enable_blending:
                 assert self.lmcache_engine is not None
@@ -773,6 +785,9 @@ class LMCacheConnectorV1Impl:
         assert self.lmcache_engine is not None
 
         self.layerwise_retrievers = []
+        pending_retrieves: list[
+            tuple[ReqMeta, torch.Tensor, int, Future[torch.Tensor]]
+        ] = []
 
         for idx, request in enumerate(metadata.requests):
             if request.load_spec is None or not request.load_spec.can_load:
@@ -835,43 +850,96 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
             else:
-                ret_token_mask = self.lmcache_engine.retrieve(
+                retrieve_args = (
+                    request,
                     tokens[:lmcache_cached_tokens],
                     token_mask[:lmcache_cached_tokens],
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                    vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                    request_configs=request.request_configs,
-                    req_id=request.req_id,
+                    kvcaches,
+                    slot_mapping[:lmcache_cached_tokens],
+                )
+                if self._retrieve_executor is not None:
+                    future = self._retrieve_executor.submit(
+                        self._retrieve_one_request, *retrieve_args
+                    )
+                    pending_retrieves.append(
+                        (
+                            request,
+                            token_mask[:lmcache_cached_tokens],
+                            lmcache_cached_tokens,
+                            future,
+                        )
+                    )
+                    continue
+                ret_token_mask = self._retrieve_one_request(*retrieve_args)
+                self._check_retrieve_result(
+                    request,
+                    token_mask[:lmcache_cached_tokens],
+                    slot_mapping[:lmcache_cached_tokens],
+                    lmcache_cached_tokens,
+                    ret_token_mask,
                 )
 
-                # Check the result
-                num_retrieved_tokens = ret_token_mask.sum().item()
-                num_expected_tokens = (
-                    lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
-                )
-                if num_retrieved_tokens < num_expected_tokens:
-                    logger.error(
-                        "Request %s"
-                        "The number of retrieved tokens is less than the "
-                        "expected number of tokens! This should not happen!",
-                        request.req_id,
-                    )
-                    logger.error(
-                        "Num retrieved tokens: %d, num expected tokens: %d",
-                        num_retrieved_tokens,
-                        num_expected_tokens,
-                    )
-                    """
-                    Report failed block IDs in case of partial failure.
-                    """
-                    missing_blocks = self.record_failed_blocks(
-                        request.req_id,
-                        token_mask[:lmcache_cached_tokens],
-                        ret_token_mask,
-                        slot_mapping[:lmcache_cached_tokens],
-                    )
-                    self._invalid_block_ids.update(missing_blocks)
+        for request, token_mask, cached_tokens, future in pending_retrieves:
+            ret_token_mask = future.result()
+            self._check_retrieve_result(
+                request,
+                token_mask,
+                request.slot_mapping[:cached_tokens],
+                cached_tokens,
+                ret_token_mask,
+            )
+
+    def _retrieve_one_request(
+        self,
+        request: ReqMeta,
+        tokens: list[int],
+        token_mask: torch.Tensor,
+        kvcaches: list[torch.Tensor],
+        slot_mapping: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one request chain on a rank-local worker thread."""
+        assert self.lmcache_engine is not None
+        assert request.load_spec is not None
+        with torch.cuda.device(self.device):
+            return self.lmcache_engine.retrieve(
+                tokens,
+                token_mask,
+                kvcaches=kvcaches,
+                slot_mapping=slot_mapping,
+                vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                request_configs=request.request_configs,
+                req_id=request.req_id,
+            )
+
+    def _check_retrieve_result(
+        self,
+        request: ReqMeta,
+        token_mask: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        lmcache_cached_tokens: int,
+        ret_token_mask: torch.Tensor,
+    ) -> None:
+        """Validate one completed retrieve and record partial-load failures."""
+        assert request.load_spec is not None
+        num_retrieved_tokens = ret_token_mask.sum().item()
+        num_expected_tokens = (
+            lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
+        )
+        if num_retrieved_tokens >= num_expected_tokens:
+            return
+        logger.error(
+            "Request %s retrieved %d tokens, expected %d",
+            request.req_id,
+            num_retrieved_tokens,
+            num_expected_tokens,
+        )
+        missing_blocks = self.record_failed_blocks(
+            request.req_id,
+            token_mask,
+            ret_token_mask,
+            slot_mapping,
+        )
+        self._invalid_block_ids.update(missing_blocks)
 
     def record_failed_blocks(
         self,
@@ -1206,6 +1274,9 @@ class LMCacheConnectorV1Impl:
     def shutdown(self):
         """Shutdown the connector by delegating to LMCacheManager."""
         logger.info("Starting LMCacheConnector shutdown...")
+        if self._retrieve_executor is not None:
+            self._retrieve_executor.shutdown(wait=True, cancel_futures=True)
+            self._retrieve_executor = None
         self._manager.stop_services()
 
     ###################

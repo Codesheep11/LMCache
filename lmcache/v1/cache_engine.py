@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterable
 from typing import (
     TYPE_CHECKING,
@@ -21,7 +21,9 @@ if TYPE_CHECKING:
 # Standard
 import asyncio
 import gc
+import json
 import multiprocessing
+import threading
 import time
 
 # Third Party
@@ -34,6 +36,7 @@ from lmcache.usage_context import InitializeUsageContext
 from lmcache.utils import (
     CacheEngineKey,
     CacheStoreEvent,
+    LayerCacheEngineKey,
     _lmcache_nvtx_annotate,
     compress_slot_mapping,
     convert_tokens_to_list,
@@ -191,10 +194,17 @@ class LMCacheEngine:
 
         self.num_layers = metadata.kv_shape[0]
         self.fmt = None
+        # The direct xDS backend persists a whole multi-layer token block in
+        # one GPU-resident blob.  It therefore uses the connector's native
+        # multi-layer layout even though LMCache's layerwise API is disabled.
+        if (config.xds_backend or config.cascadekv_backend) and not self.use_layerwise:
+            self.fmt = MemoryFormat.KV_2LTD
         if self.use_layerwise:
             if metadata.use_mla:
                 self.fmt = MemoryFormat.KV_MLA_FMT
-            elif config.enable_blending:
+            elif config.enable_blending or config.get_extra_config_value(
+                "xds_layerwise_readv", False
+            ):
                 self.fmt = MemoryFormat.KV_2TD
             else:
                 self.fmt = MemoryFormat.KV_T2D
@@ -691,8 +701,21 @@ class LMCacheEngine:
         ends = []
         keys = []
         memory_objs = []
+        layer_major_shapes: list[torch.Size] = []
         tot_token_num = 0
         kv_dtype = self.metadata.kv_dtype
+        use_layer_major_store_allocation = (
+            bool(
+                self.config.get_extra_config_value(
+                    "cascadekv_layer_major_store_allocation", False
+                )
+            )
+            and not self.config.cascadekv_backend
+        )
+        block_blob_layout = bool(
+            self.config.cascadekv_backend
+            or self.config.get_extra_config_value("xds_layerwise_block_blob", False)
+        )
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
@@ -703,24 +726,29 @@ class LMCacheEngine:
         ):
             assert isinstance(key, CacheEngineKey)
 
-            keys_multi_layer = key.split_layers(self.num_layers)
-            # Only check the first layer
-            if self.storage_manager.contains(
-                keys_multi_layer[0], self.retrieve_locations
-            ):
+            keys_multi_layer = (
+                None if block_blob_layout else key.split_layers(self.num_layers)
+            )
+            lookup_key = key if block_blob_layout else keys_multi_layer[0]
+            if self.storage_manager.contains(lookup_key, self.retrieve_locations):
                 continue
 
             # Allocate the memory object
             num_tokens = end - start
             kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
 
-            memory_objs_multi_layer = self.storage_manager.batched_allocate(
-                kv_shape_single_layer,
-                kv_dtype,
-                batch_size=self.num_layers,
-                fmt=self.fmt,
-                busy_loop=self.config.get_extra_config_value("force_store_wait", False),
-            )
+            if use_layer_major_store_allocation:
+                memory_objs_multi_layer = []
+            else:
+                memory_objs_multi_layer = self.storage_manager.batched_allocate(
+                    kv_shape_single_layer,
+                    kv_dtype,
+                    batch_size=self.num_layers,
+                    fmt=self.fmt,
+                    busy_loop=self.config.get_extra_config_value(
+                        "force_store_wait", False
+                    ),
+                )
 
             if memory_objs_multi_layer is None:
                 logger.warning(
@@ -731,8 +759,9 @@ class LMCacheEngine:
 
             starts.append(start)
             ends.append(end)
-            keys.append(keys_multi_layer)
+            keys.append(key if block_blob_layout else keys_multi_layer)
             memory_objs.append(memory_objs_multi_layer)
+            layer_major_shapes.append(kv_shape_single_layer)
             tot_token_num += num_tokens
 
             # Create KV event
@@ -760,10 +789,55 @@ class LMCacheEngine:
                 self.kv_events.append(stored_event)
                 prev_key = key.chunk_hash
 
+        if use_layer_major_store_allocation and keys:
+            allocated_objects: list[MemoryObj] = []
+            allocation_failed = False
+            run_start = 0
+            while run_start < len(layer_major_shapes) and not allocation_failed:
+                run_end = run_start + 1
+                while (
+                    run_end < len(layer_major_shapes)
+                    and layer_major_shapes[run_end] == layer_major_shapes[run_start]
+                ):
+                    run_end += 1
+                run_size = run_end - run_start
+                for _layer_id in range(self.num_layers):
+                    layer_objects = self.storage_manager.batched_allocate(
+                        layer_major_shapes[run_start],
+                        kv_dtype,
+                        batch_size=run_size,
+                        fmt=self.fmt,
+                        busy_loop=self.config.get_extra_config_value(
+                            "force_store_wait", False
+                        ),
+                    )
+                    if layer_objects is None:
+                        allocation_failed = True
+                        break
+                    allocated_objects.extend(layer_objects)
+                    for chunk_offset, memory_obj in enumerate(layer_objects):
+                        memory_objs[run_start + chunk_offset].append(memory_obj)
+                run_start = run_end
+
+            if allocation_failed:
+                for memory_obj in allocated_objects:
+                    memory_obj.ref_count_down()
+                logger.warning(
+                    "Local cpu memory under pressure while allocating "
+                    "layer-major CascadeKV staging; skipping this store."
+                )
+                starts.clear()
+                ends.clear()
+                keys.clear()
+                memory_objs.clear()
+                tot_token_num = 0
+
         if keys:
-            # Transpose the keys and memory objects into layer major format
+            # Transpose payload objects into layer-major format. Block-blob
+            # keys remain one per token block and are never split by layer.
             memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
-            keys = [list(row) for row in zip(*keys, strict=False)]
+            if not block_blob_layout:
+                keys = [list(row) for row in zip(*keys, strict=False)]
 
             # Calculate total KV size for logging
             tot_kv_size = sum(
@@ -782,8 +856,19 @@ class LMCacheEngine:
             for layer_id in range(self.num_layers):
                 yield
                 next(mem_obj_generator)
-                self.storage_manager.batched_put(
-                    keys[layer_id], memory_objs[layer_id], location=self.store_location
+                if not block_blob_layout:
+                    self.storage_manager.batched_put(
+                        keys[layer_id],
+                        memory_objs[layer_id],
+                        location=self.store_location,
+                    )
+            if block_blob_layout:
+                d2h_event = self.gpu_connector.record_transfer_event("store")
+                self.storage_manager.blockwise_batched_put(
+                    keys,
+                    memory_objs,
+                    location=self.store_location,
+                    completion_event=d2h_event,
                 )
 
             tot_time = time.perf_counter() - t_start
@@ -835,6 +920,17 @@ class LMCacheEngine:
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
         """
+        fine_profile_enabled = bool(
+            self.config.get_extra_config_value("retrieve_fine_profile", False)
+        )
+        fine_profile: Optional[dict[str, Any]] = None
+        if fine_profile_enabled:
+            fine_profile = {
+                "schema": 1,
+                "worker_id": self.metadata.worker_id,
+                "request_start_ns": time.monotonic_ns(),
+            }
+
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping retrieve operation")
@@ -846,6 +942,8 @@ class LMCacheEngine:
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
+        if fine_profile is not None:
+            fine_profile["req_id"] = req_id
 
         tot_kv_size = 0
 
@@ -862,6 +960,7 @@ class LMCacheEngine:
             require_req_id=True,
         )
 
+        transfer_start_ns = time.monotonic_ns()
         retrieve_stats = self.stats_monitor.on_retrieve_request(num_required_tokens)
 
         ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
@@ -869,20 +968,28 @@ class LMCacheEngine:
         reordered_chunks: List[ProcessedChunk] = []
         if not self._is_passive():
             with retrieve_stats.profile_process_tokens():
+                if fine_profile is not None:
+                    fine_profile["process_start_ns"] = time.monotonic_ns()
+                    process_kwargs = dict(kwargs)
+                    process_kwargs["_lmcache_retrieve_profile"] = fine_profile
+                else:
+                    process_kwargs = kwargs
                 if self.async_loading:
                     reordered_chunks, tot_kv_size = self._async_process_tokens_internal(  # noqa: E501
                         tokens,
                         mask,
                         ret_mask,
-                        **kwargs,
+                        **process_kwargs,
                     )
                 else:
                     reordered_chunks, tot_kv_size = self._process_tokens_internal(
                         tokens,
                         mask,
                         ret_mask,
-                        **kwargs,
+                        **process_kwargs,
                     )
+                if fine_profile is not None:
+                    fine_profile["process_end_ns"] = time.monotonic_ns()
 
         if self.save_only_first_rank:
             with retrieve_stats.profile_broadcast():
@@ -908,24 +1015,58 @@ class LMCacheEngine:
         if len(reordered_chunks) > 0:
             with retrieve_stats.profile_to_gpu():
                 _, memory_objs, starts, ends = zip(*reordered_chunks, strict=False)
+                transfer_start_event = None
+                if fine_profile is not None:
+                    fine_profile["h2d_host_start_ns"] = time.monotonic_ns()
+                    transfer_start_event = self.gpu_connector.record_transfer_event(
+                        "load", enable_timing=True
+                    )
                 self.gpu_connector.batched_to_gpu(
                     list(memory_objs), list(starts), list(ends), **kwargs
                 )
+                if fine_profile is not None:
+                    transfer_end_event = self.gpu_connector.record_transfer_event(
+                        "load", enable_timing=True
+                    )
+                    transfer_end_event.synchronize()
+                    fine_profile["h2d_host_end_ns"] = time.monotonic_ns()
+                    assert transfer_start_event is not None
+                    fine_profile["h2d_cuda_ms"] = transfer_start_event.elapsed_time(
+                        transfer_end_event
+                    )
 
         # TODO(Jiayi): Remove the following for loop with batched operations
         # TODO(Jiayi): Need to refactor the `remove_after_retrieve` logic.
+        if fine_profile is not None:
+            fine_profile["release_start_ns"] = time.monotonic_ns()
         for key, memory_obj, _, _ in reordered_chunks:
             if self.remove_after_retrieve and not self._is_passive():
                 assert self.storage_manager is not None
                 self.storage_manager.remove(key, self.retrieve_locations)
             if not self.async_loading:
                 memory_obj.ref_count_down()
+        if fine_profile is not None:
+            fine_profile["release_end_ns"] = time.monotonic_ns()
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(
             retrieve_stats,
             retrieved_tokens,
         )
+        transfer_end_ns = time.monotonic_ns()
+        if fine_profile is not None:
+            fine_profile.update(
+                {
+                    "request_end_ns": time.monotonic_ns(),
+                    "bytes": tot_kv_size,
+                    "chunk_count": len(reordered_chunks),
+                    "retrieved_tokens": int(retrieved_tokens),
+                }
+            )
+            logger.info(
+                "[LMCACHE_RETRIEVE_FINE_PROFILE] %s",
+                json.dumps(fine_profile, separators=(",", ":")),
+            )
         onload_time = retrieve_stats.time_to_retrieve()
         # The retrieved may be larger than the need_to_load
         # Example (page_size=16, chunk_size=256):
@@ -952,6 +1093,22 @@ class LMCacheEngine:
                 onload_time * 1000,
                 tot_kv_size / onload_time / 1024**3 if onload_time > 0 else 0,
             )
+            if self.config.get_extra_config_value("benchmark_transfer_metrics", False):
+                logger.info(
+                    "[LMCACHE_SSD_GPU_METRICS] %s",
+                    json.dumps(
+                        {
+                            "worker_id": self.metadata.worker_id,
+                            "mode": "direct",
+                            "bytes": tot_kv_size,
+                            "seconds": onload_time,
+                            "transfer_start_ns": transfer_start_ns,
+                            "transfer_end_ns": transfer_end_ns,
+                            "retrieved_tokens": int(retrieved_tokens),
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
         return ret_mask
 
     @_lmcache_nvtx_annotate
@@ -984,6 +1141,8 @@ class LMCacheEngine:
             last iteration, it moves the memory objects of the last layer to
             the GPU.
         """
+        cache_retrieve_start_ns = time.monotonic_ns()
+
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping retrieve_layer operation")
@@ -1009,12 +1168,18 @@ class LMCacheEngine:
         starts = []
         ends = []
         keys = []
+        first_layer_keys = []
 
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
+        block_blob_layout = bool(
+            self.config.cascadekv_backend
+            or self.config.get_extra_config_value("xds_layerwise_block_blob", False)
+        )
 
         location = None
+        key_scan_start_ns = time.monotonic_ns()
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
             mask=mask,
@@ -1022,11 +1187,11 @@ class LMCacheEngine:
         ):
             assert isinstance(key, CacheEngineKey)
 
-            keys_multi_layer = key.split_layers(self.num_layers)
+            first_layer_key = key if block_blob_layout else key.get_first_layer()
 
             # NOTE: Only check the first layer
             if current_location := self.storage_manager.contains(
-                keys_multi_layer[0], self.retrieve_locations
+                first_layer_key, self.retrieve_locations
             ):
                 if location is None:
                     location = current_location
@@ -1042,43 +1207,536 @@ class LMCacheEngine:
 
             starts.append(start)
             ends.append(end)
-            keys.append(keys_multi_layer)
+            keys.append(key)
+            first_layer_keys.append(first_layer_key)
 
             ret_mask[start:end] = True
+        key_scan_end_ns = time.monotonic_ns()
 
+        transfer_start = time.perf_counter()
+        transfer_start_ns = time.monotonic_ns()
+        tot_kv_size = 0
+        pipeline_h2d_complete_ns: Optional[int] = None
+        pipeline_gpu_ready_complete_ns: Optional[int] = None
+        timeline_trace: Optional[dict[str, Any]] = None
         if keys:
-            # Transpose the keys into layer major format
-            keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
-
-            get_generator = self.storage_manager.layerwise_batched_get(
-                keys_layer_major,
-                location=location,
+            layer_key_build_start_ns = time.monotonic_ns()
+            keys_layer_major = None
+            if not block_blob_layout:
+                keys_layer_major = [first_layer_keys]
+                keys_layer_major.extend(
+                    [LayerCacheEngineKey.from_parent(key, layer_id) for key in keys]
+                    for layer_id in range(1, self.num_layers)
+                )
+            layer_key_build_end_ns = time.monotonic_ns()
+            if self.config.get_extra_config_value("cascadekv_tp_read_barrier", False):
+                if (
+                    torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                ):
+                    torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+            timeline_enabled = bool(
+                self.config.get_extra_config_value(
+                    "cascadekv_layerwise_timeline_trace", False
+                )
             )
+            if timeline_enabled:
+                timeline_trace = {
+                    "schema": 2,
+                    "trace_id": (f"{self.metadata.worker_id}-{transfer_start_ns}"),
+                    "worker_id": self.metadata.worker_id,
+                    "req_id": req_id,
+                    "cache_retrieve_start_ns": cache_retrieve_start_ns,
+                    "request_start_ns": transfer_start_ns,
+                    "input_tokens": len(tokens),
+                    "required_tokens": int(num_required_tokens),
+                    "chunk_count": len(keys),
+                    "key_scan_start_ns": key_scan_start_ns,
+                    "key_scan_end_ns": key_scan_end_ns,
+                    "layer_key_build_start_ns": layer_key_build_start_ns,
+                    "layer_key_build_end_ns": layer_key_build_end_ns,
+                    "layers": [
+                        {"layer": layer_id} for layer_id in range(self.num_layers)
+                    ],
+                }
+            if block_blob_layout and self.config.get_extra_config_value(
+                "xds_layerwise_readv", False
+            ):
+                direct_layers = self.storage_manager.prepare_layerwise_readv(
+                    keys, starts, ends, self.gpu_connector, location=location, **kwargs
+                )
+                if direct_layers is not None:
+                    try:
+                        yield torch.sum(ret_mask)
+                        layer_count = 0
+                        for result in direct_layers:
+                            if not all(result.completed):
+                                raise RuntimeError(
+                                    "incomplete xDS direct layer restore"
+                                )
+                            layer_count += 1
+                            tot_kv_size += result.completed_bytes
+                            yield None
+                        if layer_count != self.num_layers:
+                            raise RuntimeError("xDS direct layer count mismatch")
+                    finally:
+                        direct_layers.close()
+                    retrieved_tokens = torch.sum(ret_mask)
+                    self.stats_monitor.on_retrieve_finished(
+                        monitor_req_id, retrieved_tokens
+                    )
+                    if self.config.get_extra_config_value(
+                        "benchmark_transfer_metrics", False
+                    ):
+                        logger.info(
+                            "[LMCACHE_SSD_GPU_METRICS] %s",
+                            json.dumps(
+                                {
+                                    "worker_id": int(self.metadata.worker_id),
+                                    "mode": "layerwise_readv",
+                                    "bytes": tot_kv_size,
+                                    "seconds": time.perf_counter() - transfer_start,
+                                    "retrieved_tokens": int(retrieved_tokens),
+                                }
+                            ),
+                        )
+                    yield ret_mask
+                    return
+            if block_blob_layout:
+                get_generator = self.storage_manager.blockwise_batched_get(
+                    keys,
+                    self.num_layers,
+                    location=location,
+                    trace_context=timeline_trace,
+                )
+            else:
+                assert keys_layer_major is not None
+                get_generator = self.storage_manager.layerwise_batched_get(
+                    keys_layer_major,
+                    location=location,
+                    trace_context=timeline_trace,
+                )
+            # Start the storage producer before initializing the GPU consumer.
+            # The first Future is returned immediately, so metadata lookup and
+            # staging preparation can overlap connector/stream setup without
+            # changing the per-layer publication contract.
+            first_layer_task = next(get_generator)
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
-            mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
+            direct_xds_layerwise = bool(
+                self.config.xds_backend
+                and self.config.get_extra_config_value(
+                    "xds_layerwise_block_blob", False
+                )
+            )
+            eager_source_release = bool(
+                direct_xds_layerwise or self.config.cascadekv_backend
+            )
+            gpu_producer_enabled = bool(
+                self.config.cascadekv_backend
+                or self.config.get_extra_config_value(
+                    "cascadekv_layerwise_gpu_producer", direct_xds_layerwise
+                )
+            )
+            h2d_start_read_ahead_layers = 1
+            h2d_max_submitted_ahead_layers = self.num_layers
+            h2d_max_inflight_layers = 0
+            prefetched_layer_tasks = [first_layer_task]
+            if gpu_producer_enabled:
+                h2d_start_read_ahead_layers = max(
+                    1,
+                    min(
+                        self.num_layers,
+                        int(
+                            self.config.get_extra_config_value(
+                                "cascadekv_h2d_start_read_ahead_layers", 1
+                            )
+                        ),
+                    ),
+                )
+                configured_h2d_ahead = int(
+                    self.config.get_extra_config_value(
+                        "cascadekv_h2d_max_submitted_ahead_layers", 0
+                    )
+                )
+                if configured_h2d_ahead > 0:
+                    h2d_max_submitted_ahead_layers = max(
+                        1, min(self.num_layers, configured_h2d_ahead)
+                    )
+                configured_h2d_inflight = int(
+                    self.config.get_extra_config_value(
+                        "cascadekv_h2d_max_inflight_layers", 0
+                    )
+                )
+                if configured_h2d_inflight > 0:
+                    h2d_max_inflight_layers = max(
+                        1, min(self.num_layers, configured_h2d_inflight)
+                    )
+                if timeline_trace is not None:
+                    timeline_trace["h2d_max_submitted_ahead_layers"] = (
+                        h2d_max_submitted_ahead_layers
+                    )
+                    timeline_trace["h2d_max_inflight_layers"] = h2d_max_inflight_layers
+                # Keep the transfer layer-granular, but optionally let the SSD
+                # producer establish a short lead before H2D begins.  H2D can
+                # then consume that lead while later layers are still being read,
+                # avoiding the worst startup contention without aggregating GPU
+                # transfers or delaying a layer on GPU compute.
+                for _ in range(1, h2d_start_read_ahead_layers):
+                    prefetched_layer_tasks.append(next(get_generator))
+            consumer_kwargs = kwargs
+            h2d_copy_completion_events: list[Any] = []
+            if gpu_producer_enabled:
+                # The serving thread waits on the exact CUDA event for the next
+                # layer below. Avoid inserting wait_stream edges for every
+                # prefetched layer into vLLM's compute stream.
+                consumer_kwargs = dict(kwargs)
+                consumer_kwargs["sync"] = False
+                consumer_kwargs["h2d_scatter_overlap"] = bool(
+                    self.config.get_extra_config_value(
+                        "cascadekv_layerwise_h2d_scatter_overlap", False
+                    )
+                )
+                if timeline_trace is not None:
+                    consumer_kwargs["layerwise_timeline_trace"] = timeline_trace
+                consumer_kwargs["h2d_copy_completion_events"] = (
+                    h2d_copy_completion_events
+                )
+                self.gpu_connector.set_transfer_stream_priority(
+                    "load",
+                    int(
+                        self.config.get_extra_config_value(
+                            "cascadekv_h2d_stream_priority", -1
+                        )
+                    ),
+                )
+            mem_obj_consumer = self.gpu_connector.batched_to_gpu(
+                starts, ends, **consumer_kwargs
+            )
             next(mem_obj_consumer)
 
-            to_count_down = []
-            for layer_id in range(self.num_layers):
-                task = next(get_generator)
+            def release_completed_layer(memory_objs: list[MemoryObj]) -> None:
+                pooled_ids = self.storage_manager.release_layerwise_memory_objs(
+                    memory_objs,
+                    location=location,
+                )
+                for memory_obj in memory_objs:
+                    if id(memory_obj) not in pooled_ids:
+                        memory_obj.ref_count_down()
+                    if memory_obj.is_pinned:
+                        memory_obj.unpin()
 
+            def submit_layer(
+                layer_id: int,
+            ) -> tuple[Any, list[MemoryObj], Optional[dict[str, Any]], Any]:
+                nonlocal tot_kv_size
+                task = (
+                    prefetched_layer_tasks[layer_id]
+                    if layer_id < len(prefetched_layer_tasks)
+                    else next(get_generator)
+                )
                 assert task is not None
-
-                if layer_id == 0:
-                    # NOTE(Yuwei): For sglang integration we need to provide retrieved
-                    # tokens number in the first layer loading since there is no lookup
-                    yield torch.sum(ret_mask)
-                else:
-                    yield None
-
+                layer_trace = (
+                    timeline_trace["layers"][layer_id]
+                    if timeline_trace is not None
+                    else None
+                )
+                if layer_trace is not None:
+                    layer_trace["future_wait_start_ns"] = time.monotonic_ns()
                 mem_objs_layer = task.result()
+                if layer_trace is not None:
+                    layer_trace["future_wait_end_ns"] = time.monotonic_ns()
+                layer_bytes = sum(mem_obj.get_size() for mem_obj in mem_objs_layer)
+                tot_kv_size += layer_bytes
+                transfer_start_event = None
+                if layer_trace is not None:
+                    layer_trace["bytes"] = layer_bytes
+                    layer_trace["h2d_submit_start_ns"] = time.monotonic_ns()
+                    transfer_start_event = self.gpu_connector.record_transfer_event(
+                        "load", enable_timing=True
+                    )
                 mem_obj_consumer.send(mem_objs_layer)
-                to_count_down.extend(mem_objs_layer)
+                transfer_event = self.gpu_connector.record_transfer_event(
+                    "load", enable_timing=layer_trace is not None
+                )
+                if layer_trace is not None:
+                    layer_trace["h2d_submit_end_ns"] = time.monotonic_ns()
+                return (
+                    transfer_event,
+                    mem_objs_layer,
+                    layer_trace,
+                    transfer_start_event,
+                )
 
-            for mem_obj in to_count_down:
-                mem_obj.ref_count_down()
+            def complete_layer(
+                transfer: tuple[Any, list[MemoryObj], Optional[dict[str, Any]], Any],
+            ) -> None:
+                (
+                    completed_event,
+                    completed_memory_objs,
+                    completed_layer_trace,
+                    completed_start_event,
+                ) = transfer
+                if eager_source_release:
+                    # The producer publishes this transfer only after its
+                    # scatter event has completed and its source staging has
+                    # been released. Synchronizing the same event again on the
+                    # model thread only adds a CUDA API and host scheduling
+                    # round trip.
+                    assert not completed_memory_objs
+                    return
+                sync_start_ns = time.monotonic_ns()
+                completed_event.synchronize()
+                sync_end_ns = time.monotonic_ns()
+                if completed_layer_trace is not None:
+                    completed_layer_trace["h2d_sync_start_ns"] = sync_start_ns
+                    completed_layer_trace["h2d_complete_ns"] = sync_end_ns
+                    assert completed_start_event is not None
+                    completed_layer_trace["h2d_cuda_ms"] = (
+                        completed_start_event.elapsed_time(completed_event)
+                    )
+                release_completed_layer(completed_memory_objs)
+
+            if gpu_producer_enabled:
+                layer_transfers: list[
+                    tuple[Any, list[MemoryObj], Optional[dict[str, Any]], Any]
+                ] = []
+                producer_errors: list[BaseException] = []
+                producer_condition = threading.Condition()
+                cuda_device = torch.cuda.current_device()
+                consumer_completed_layers = 0
+                h2d_pacing_wait_ns = 0
+
+                def run_gpu_producer() -> None:
+                    nonlocal h2d_pacing_wait_ns
+                    nonlocal pipeline_h2d_complete_ns
+                    nonlocal pipeline_gpu_ready_complete_ns
+                    try:
+                        torch.cuda.set_device(cuda_device)
+                        with torch.inference_mode():
+                            if h2d_start_read_ahead_layers > 1:
+                                if timeline_trace is not None:
+                                    timeline_trace["h2d_lead_wait_start_ns"] = (
+                                        time.monotonic_ns()
+                                    )
+                                    timeline_trace["h2d_lead_layers"] = (
+                                        h2d_start_read_ahead_layers
+                                    )
+                                prefetched_layer_tasks[-1].result()
+                                if timeline_trace is not None:
+                                    timeline_trace["h2d_lead_wait_end_ns"] = (
+                                        time.monotonic_ns()
+                                    )
+                            for producer_layer_id in range(self.num_layers):
+                                pace_wait_start_ns = time.monotonic_ns()
+                                producer_layer_trace = (
+                                    timeline_trace["layers"][producer_layer_id]
+                                    if timeline_trace is not None
+                                    else None
+                                )
+                                if producer_layer_trace is not None:
+                                    producer_layer_trace["pacing_wait_start_ns"] = (
+                                        pace_wait_start_ns
+                                    )
+                                if eager_source_release:
+                                    # Drain every SSD-ready layer into final
+                                    # paged KV immediately.  The exact scatter
+                                    # event remains the compute-side readiness
+                                    # fence, while CPU/GPU source staging can be
+                                    # returned without waiting for model
+                                    # progress.  This prevents prefetched
+                                    # requests from exhausting a bounded source
+                                    # pool ahead of the scheduled request.
+                                    if producer_layer_trace is not None:
+                                        producer_layer_trace["pacing_wait_kind"] = (
+                                            "eager_source_release"
+                                        )
+                                elif h2d_max_inflight_layers > 0:
+                                    # Keep the GPU load pipeline work-conserving
+                                    # without coupling it to model progress. Once
+                                    # all staging slots are occupied, wait only
+                                    # for the oldest H2D+scatter event that makes
+                                    # one slot reusable, then immediately submit
+                                    # the next layer.
+                                    completed_index = (
+                                        producer_layer_id - h2d_max_inflight_layers
+                                    )
+                                    if completed_index >= 0:
+                                        if producer_layer_trace is not None:
+                                            producer_layer_trace["pacing_wait_kind"] = (
+                                                "scatter_buffer_reuse"
+                                            )
+                                            producer_layer_trace[
+                                                "pacing_wait_for_layer"
+                                            ] = completed_index
+                                        with producer_condition:
+                                            completed_event = layer_transfers[
+                                                completed_index
+                                            ][0]
+                                        if not direct_xds_layerwise:
+                                            completed_event.synchronize()
+                                    elif producer_layer_trace is not None:
+                                        producer_layer_trace["pacing_wait_kind"] = (
+                                            "initial_free_slot"
+                                        )
+                                else:
+                                    if producer_layer_trace is not None:
+                                        producer_layer_trace["pacing_wait_kind"] = (
+                                            "consumer_window"
+                                        )
+                                    with producer_condition:
+                                        producer_condition.wait_for(
+                                            lambda layer_id=producer_layer_id: (
+                                                layer_id
+                                                < consumer_completed_layers
+                                                + h2d_max_submitted_ahead_layers
+                                            )
+                                        )
+                                pace_wait_end_ns = time.monotonic_ns()
+                                h2d_pacing_wait_ns += (
+                                    pace_wait_end_ns - pace_wait_start_ns
+                                )
+                                if producer_layer_trace is not None:
+                                    producer_layer_trace["pacing_wait_end_ns"] = (
+                                        pace_wait_end_ns
+                                    )
+                                transfer = submit_layer(producer_layer_id)
+                                if eager_source_release:
+                                    # Once this layer's scatter event completes,
+                                    # its source is no longer needed by compute
+                                    # and can be returned immediately. Keep the
+                                    # event for the model thread, but clear the
+                                    # objects to avoid a second release there.
+                                    sync_start_ns = time.monotonic_ns()
+                                    transfer[0].synchronize()
+                                    sync_end_ns = time.monotonic_ns()
+                                    if producer_layer_trace is not None:
+                                        producer_layer_trace["h2d_sync_start_ns"] = (
+                                            sync_start_ns
+                                        )
+                                        producer_layer_trace["h2d_complete_ns"] = (
+                                            sync_end_ns
+                                        )
+                                        assert transfer[3] is not None
+                                        producer_layer_trace["h2d_cuda_ms"] = transfer[
+                                            3
+                                        ].elapsed_time(transfer[0])
+                                    if producer_layer_trace is not None:
+                                        producer_layer_trace[
+                                            "staging_release_start_ns"
+                                        ] = time.monotonic_ns()
+                                    release_completed_layer(transfer[1])
+                                    if producer_layer_trace is not None:
+                                        producer_layer_trace[
+                                            "staging_release_end_ns"
+                                        ] = time.monotonic_ns()
+                                    transfer = (
+                                        transfer[0],
+                                        [],
+                                        transfer[2],
+                                        transfer[3],
+                                    )
+                                with producer_condition:
+                                    layer_transfers.append(transfer)
+                                    producer_condition.notify_all()
+                            if timeline_trace is not None:
+                                timeline_trace["h2d_all_submitted_ns"] = (
+                                    time.monotonic_ns()
+                                )
+                            if len(h2d_copy_completion_events) != self.num_layers:
+                                raise RuntimeError(
+                                    "layerwise connector did not publish one H2D "
+                                    "copy completion event per layer: "
+                                    f"expected={self.num_layers}, "
+                                    f"actual={len(h2d_copy_completion_events)}"
+                                )
+                            if eager_source_release:
+                                # Every eager transfer was synchronized once
+                                # before publication so its source staging
+                                # could be reused safely. Both final events are
+                                # already complete here.
+                                pipeline_h2d_complete_ns = time.monotonic_ns()
+                                pipeline_gpu_ready_complete_ns = (
+                                    pipeline_h2d_complete_ns
+                                )
+                            else:
+                                h2d_copy_completion_events[-1].synchronize()
+                                pipeline_h2d_complete_ns = time.monotonic_ns()
+                                layer_transfers[-1][0].synchronize()
+                                pipeline_gpu_ready_complete_ns = time.monotonic_ns()
+                            if timeline_trace is not None:
+                                timeline_trace["pipeline_h2d_complete_ns"] = (
+                                    pipeline_h2d_complete_ns
+                                )
+                            if timeline_trace is not None:
+                                timeline_trace["pipeline_gpu_ready_complete_ns"] = (
+                                    pipeline_gpu_ready_complete_ns
+                                )
+                    except BaseException as error:
+                        with producer_condition:
+                            producer_errors.append(error)
+                    finally:
+                        with producer_condition:
+                            producer_condition.notify_all()
+
+                gpu_producer = threading.Thread(
+                    target=run_gpu_producer,
+                    name=(f"cascadekv-h2d-producer-{self.metadata.worker_id}"),
+                    daemon=True,
+                )
+                gpu_producer.start()
+
+                # The first step reports the lookup result. Every later vLLM
+                # callback waits only for the exact layer event while the
+                # producer continues filling the load stream independently.
+                yield torch.sum(ret_mask)
+
+                for layer_id in range(self.num_layers):
+                    consumer_submit_wait_start_ns = time.monotonic_ns()
+                    with producer_condition:
+                        producer_condition.wait_for(
+                            lambda awaited_layer=layer_id: (
+                                len(layer_transfers) > awaited_layer
+                                or bool(producer_errors)
+                            )
+                        )
+                        if producer_errors:
+                            raise RuntimeError(
+                                "CascadeKV H2D producer failed"
+                            ) from producer_errors[0]
+                    if timeline_trace is not None:
+                        layer_trace = timeline_trace["layers"][layer_id]
+                        layer_trace["consumer_submit_wait_start_ns"] = (
+                            consumer_submit_wait_start_ns
+                        )
+                        layer_trace["consumer_submit_wait_end_ns"] = time.monotonic_ns()
+                    complete_layer(layer_transfers[layer_id])
+                    with producer_condition:
+                        consumer_completed_layers = layer_id + 1
+                        producer_condition.notify_all()
+                    if layer_id < self.num_layers - 1:
+                        yield None
+                gpu_producer.join()
+                if timeline_trace is not None:
+                    timeline_trace["h2d_pacing_wait_ns"] = h2d_pacing_wait_ns
+            else:
+                pending_layer_transfers = deque()
+                for layer_id in range(self.num_layers):
+                    if layer_id == 0:
+                        # SGLang needs the retrieved-token count on the first step.
+                        yield torch.sum(ret_mask)
+                    else:
+                        yield None
+                    pending_layer_transfers.append(submit_layer(layer_id))
+
+                    # Keep exactly two layer buffers: while layer N+1 is loading,
+                    # layer N may still be consumed by the GPU.
+                    if len(pending_layer_transfers) >= 2:
+                        complete_layer(pending_layer_transfers.popleft())
+
+                while pending_layer_transfers:
+                    complete_layer(pending_layer_transfers.popleft())
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
@@ -1089,16 +1747,29 @@ class LMCacheEngine:
 
         # synchronize the last layer
         next(mem_obj_consumer)
-
-        # Unpin any disk-loaded staging objects now that the device-side sync
-        # has been enqueued (mem_obj_consumer advanced past its sync point).
-        # Without this, pin_count stays at 1 forever and the CPU staging pool
-        # fills up, causing the next retrieve to deadlock inside allocate().
-        for mem_obj in to_count_down:
-            if mem_obj.is_pinned:
-                mem_obj.unpin()
-
+        if self.config.get_extra_config_value("benchmark_transfer_metrics", False):
+            torch.cuda.current_stream().synchronize()
+        transfer_seconds = time.perf_counter() - transfer_start
+        transfer_end_ns = time.monotonic_ns()
+        pipeline_seconds = (
+            (pipeline_h2d_complete_ns - transfer_start_ns) / 1_000_000_000
+            if pipeline_h2d_complete_ns is not None
+            else transfer_seconds
+        )
+        gpu_ready_seconds = (
+            (pipeline_gpu_ready_complete_ns - transfer_start_ns) / 1_000_000_000
+            if pipeline_gpu_ready_complete_ns is not None
+            else transfer_seconds
+        )
         retrieved_tokens = torch.sum(ret_mask)
+        if timeline_trace is not None:
+            timeline_trace["bytes"] = tot_kv_size
+            timeline_trace["request_end_ns"] = transfer_end_ns
+            timeline_trace["retrieved_tokens"] = int(retrieved_tokens)
+            logger.info(
+                "[LMCACHE_LAYERWISE_TIMELINE] %s",
+                json.dumps(timeline_trace, separators=(",", ":")),
+            )
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
         if not self._is_passive():
             logger.info(
@@ -1108,6 +1779,27 @@ class LMCacheEngine:
                 num_required_tokens,
                 len(tokens),
             )
+            if self.config.get_extra_config_value("benchmark_transfer_metrics", False):
+                logger.info(
+                    "[LMCACHE_SSD_GPU_METRICS] %s",
+                    json.dumps(
+                        {
+                            "worker_id": self.metadata.worker_id,
+                            "mode": "layerwise",
+                            "endpoint": (
+                                "h2d_copy_complete"
+                                if pipeline_h2d_complete_ns is not None
+                                else "consumer_complete"
+                            ),
+                            "bytes": tot_kv_size,
+                            "seconds": pipeline_seconds,
+                            "gpu_ready_seconds": gpu_ready_seconds,
+                            "consumer_seconds": transfer_seconds,
+                            "retrieved_tokens": int(retrieved_tokens),
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
 
         yield ret_mask
 
@@ -1175,27 +1867,39 @@ class LMCacheEngine:
 
             # TODO: support batched_contains when layerwise is enabled
             if self.use_layerwise:
+                block_blob_layout = bool(
+                    self.config.cascadekv_backend
+                    or self.config.get_extra_config_value(
+                        "xds_layerwise_block_blob", False
+                    )
+                )
                 for start, end, key in chunk_info_iterator:
                     assert isinstance(key, CacheEngineKey)
 
-                    # TODO(Jiayi): Optimize by checking only the existence of the key
-                    # of one layer
-                    key_all_layers = key.split_layers(self.num_layers)
+                    # A CascadeKV block blob has exactly one owner key and one
+                    # handle for all layers.  Other layerwise backends retain
+                    # the legacy one-key-per-layer lookup contract.
+                    lookup_keys = (
+                        [key]
+                        if block_blob_layout
+                        else key.split_layers(self.num_layers)
+                    )
+                    expected_hits = 1 if block_blob_layout else self.num_layers
 
                     hit_chunks, block_mapping = self.storage_manager.batched_contains(
-                        key_all_layers,  # type: ignore
+                        lookup_keys,
                         search_range,
                         pin,
                     )
                     # Only all layers are hit and hit in one location,
                     # we consider this key as a hit
-                    if hit_chunks == self.num_layers and len(block_mapping) == 1:
+                    if hit_chunks == expected_hits and len(block_mapping) == 1:
                         if pin:
                             assert lookup_id is not None, (
                                 "lookup_id is required when pin is True"
                             )
                             location = next(iter(block_mapping.keys()))
-                            self.lookup_pins[lookup_id][location].extend(key_all_layers)
+                            self.lookup_pins[lookup_id][location].extend(lookup_keys)
                         res = end
                         continue
                     return res
@@ -1687,6 +2391,9 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
+        fine_profile = kwargs.get("_lmcache_retrieve_profile")
+        if fine_profile is not None:
+            fine_profile["chunk_scan_start_ns"] = time.monotonic_ns()
         chunk_infos = []
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
@@ -1695,8 +2402,12 @@ class LMCacheEngine:
         ):
             assert isinstance(key, CacheEngineKey)
             chunk_infos.append((key, start, end))
+        if fine_profile is not None:
+            fine_profile["chunk_scan_end_ns"] = time.monotonic_ns()
 
         # block_mapping: location -> [(CacheEngineKey, start, end)]
+        if fine_profile is not None:
+            fine_profile["mapping_start_ns"] = time.monotonic_ns()
         if (
             "req_id" in kwargs
             and kwargs["req_id"] in self.lookup_pins
@@ -1706,6 +2417,9 @@ class LMCacheEngine:
             block_mapping = {location: chunk_infos}
         else:
             block_mapping = self.storage_manager.get_block_mapping(chunk_infos)
+        if fine_profile is not None:
+            fine_profile["mapping_end_ns"] = time.monotonic_ns()
+            fine_profile["storage_calls"] = []
 
         last_failed_block_start = None
         for location, blocks in block_mapping.items():
@@ -1737,10 +2451,21 @@ class LMCacheEngine:
                         last_failed_block_start = start
                 continue
 
+            storage_start_ns = time.monotonic_ns()
             memory_objs = self.storage_manager.batched_get(
                 keys=keys,
                 location=location,
             )
+            storage_end_ns = time.monotonic_ns()
+            if fine_profile is not None:
+                fine_profile["storage_calls"].append(
+                    {
+                        "location": location,
+                        "keys": len(keys),
+                        "start_ns": storage_start_ns,
+                        "end_ns": storage_end_ns,
+                    }
+                )
 
             for (key, start, end), memory_obj in zip(blocks, memory_objs, strict=False):
                 if memory_obj is None:

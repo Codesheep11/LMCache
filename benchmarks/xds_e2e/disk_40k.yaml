@@ -5,4 +5,5 @@ local_disk: "file:///mnt/lmcache-raid0/disk-cache"
 max_local_disk_size: 1000
 use_layerwise: true
 save_unfull_chunk: true
-
+extra_config:
+  benchmark_transfer_metrics: true

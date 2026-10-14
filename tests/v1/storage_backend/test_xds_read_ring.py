@@ -113,3 +113,149 @@ def test_read_ring_wait_failure_marks_submitted_items_unsafe_for_reuse():
         "second": False,
         "not-submitted": True,
     }
+
+
+def test_batch_submission_and_completion_preserve_depth_and_order():
+    client = FakeClient()
+    batches = []
+
+    def submit_batch(items):
+        batches.append(list(items))
+        return [client.submit(item) for item in items]
+
+    def wait_burst(limit, timeout):
+        return [
+            client.wait_any_result(timeout)
+            for _ in range(min(limit, len(client.pending)))
+        ]
+
+    pump = XDSReadRingPump(
+        3,
+        client.submit,
+        client.wait_any_result,
+        1.0,
+        submit_batch=submit_batch,
+        wait_burst=wait_burst,
+    )
+    worker = _run_pump(pump, range(8))
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    results = [pump.get_completion() for _ in range(8)]
+    assert batches == [[0, 1, 2], [3, 4, 5], [6, 7]]
+    assert client.peak_inflight == 3
+    assert [r.item for r in results] == list(range(8))
+    assert all(r.error is None for r in results)
+
+
+def test_batch_partial_submit_failure_drains_accepted_ids():
+    client = FakeClient()
+
+    def submit_batch(items):
+        return [client.submit(items[0]), OSError("submit failed"), OSError("cancelled")]
+
+    pump = XDSReadRingPump(
+        3, client.submit, client.wait_any_result, 1.0, submit_batch=submit_batch
+    )
+    worker = _run_pump(pump, ["accepted", "failed", "cancelled", "queued"])
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    results = [pump.get_completion() for _ in range(4)]
+    assert client.pending == []
+    assert results[0].item == "accepted" and results[0].error is None
+    assert all(r.safe_to_reuse for r in results)
+    assert all(r.error is not None for r in results[1:])
+
+
+def test_batch_callback_exception_retains_unknown_dma_targets():
+    client = FakeClient()
+
+    def submit_batch(items):
+        client.submit(items[0])
+        raise MemoryError("result allocation failed")
+
+    pump = XDSReadRingPump(
+        2, client.submit, client.wait_any_result, 1.0, submit_batch=submit_batch
+    )
+    worker = _run_pump(pump, ["maybe-live", "unknown", "queued"])
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    results = [pump.get_completion() for _ in range(3)]
+    assert {r.item: r.safe_to_reuse for r in results} == {
+        "maybe-live": False,
+        "unknown": False,
+        "queued": True,
+    }
+
+
+def test_batch_timeout_retains_all_pending_targets():
+    client = FakeClient()
+    pump = XDSReadRingPump(
+        2,
+        client.submit,
+        client.wait_any_result,
+        1.0,
+        submit_batch=lambda items: [client.submit(x) for x in items],
+        wait_burst=lambda limit, timeout: [],
+    )
+    worker = _run_pump(pump, ["a", "b", "queued"])
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    results = [pump.get_completion() for _ in range(3)]
+    assert {r.item: r.safe_to_reuse for r in results} == {
+        "a": False,
+        "b": False,
+        "queued": True,
+    }
+    assert all(isinstance(r.error, TimeoutError) for r in results)
+
+
+def test_batch_waits_for_group_before_refilling_even_with_single_completions():
+    client = FakeClient()
+    batches = []
+
+    def submit_batch(items):
+        assert client.pending == []
+        batches.append(list(items))
+        return [client.submit(item) for item in items]
+
+    pump = XDSReadRingPump(
+        3,
+        client.submit,
+        client.wait_any_result,
+        1.0,
+        submit_batch=submit_batch,
+        wait_burst=lambda limit, timeout: [client.wait_any_result(timeout)],
+    )
+    worker = _run_pump(pump, range(8))
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert batches == [[0, 1, 2], [3, 4, 5], [6, 7]]
+    assert [pump.get_completion().item for _ in range(8)] == list(range(8))
+
+
+def test_batch_respects_sdk_maximum_with_large_queue_depth():
+    client = FakeClient()
+    sizes = []
+
+    def submit_batch(items):
+        sizes.append(len(items))
+        assert len(items) <= 64
+        return [client.submit(item) for item in items]
+
+    def wait_burst(limit, timeout):
+        assert limit <= 64
+        return [client.wait_any_result(timeout) for _ in range(limit)]
+
+    pump = XDSReadRingPump(
+        128,
+        client.submit,
+        client.wait_any_result,
+        1.0,
+        submit_batch=submit_batch,
+        wait_burst=wait_burst,
+    )
+    worker = _run_pump(pump, range(130))
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert sizes == [64, 64, 2]
+    assert [pump.get_completion().item for _ in range(130)] == list(range(130))

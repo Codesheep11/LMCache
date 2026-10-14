@@ -1,0 +1,22 @@
+{
+  "bdev_name": "Raid0Qwen3Numa1",
+  "json_config_file": "/home/yangxc/workspace/xDS/configs/bdev/Raid0Qwen3Numa1.json",
+  "reactor_mask": "0xff00000000",
+  "main_core": 32,
+  "rpc_addr": "/var/tmp/spdk_cascadekv_1mib_24gib.sock",
+  "xds_peer_bdfs": [
+    "0000:aa:00.0",
+    "0000:d3:00.0",
+    "0000:ec:00.0",
+    "0000:ed:00.0"
+  ],
+  "xds_cluster_size_kb": 128,
+  "xds_metadata_page_count": 393216,
+  "xds_blob_size_bytes": 1048576,
+  "xds_blob_count": 32768,
+  "xds_worker_poll": true,
+  "xds_queue_count": 1,
+  "xds_enable_blob_fast_map": false,
+  "xds_enable_direct": true,
+  "xds_gpu_buffer_size_bytes": 67108864
+}

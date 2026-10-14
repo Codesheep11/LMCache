@@ -47,6 +47,8 @@ def init_lmcache_engine(
     local_rank: int,
     global_rank: int,
     kv_dtype: torch.dtype,
+    use_mla: bool = False,
+    tp_group: Optional[Any] = None,
 ) -> LMCacheEngine:
     """
     Initialize LMCache engine for SGLang integration.
@@ -69,10 +71,14 @@ def init_lmcache_engine(
     # construct kv shape (for mem pool)
     num_layer = model_config.num_hidden_layers
     chunk_size = config.chunk_size
-    num_kv_head = model_config.get_num_kv_heads(tp_size)
-    head_dim = model_config.head_dim
+    if use_mla:
+        num_kv_head = 1
+        head_dim = model_config.kv_lora_rank + model_config.qk_rope_head_dim
+    else:
+        num_kv_head = model_config.get_num_kv_heads(tp_size)
+        head_dim = model_config.head_dim
 
-    kv_shape = (num_layer, 2, chunk_size, num_kv_head, head_dim)
+    kv_shape = (num_layer, 1 if use_mla else 2, chunk_size, num_kv_head, head_dim)
 
     # Change current device using local GPU index
     # Use global rank for metadata (tensor parallel rank)
@@ -84,16 +90,25 @@ def init_lmcache_engine(
         local_worker_id=local_rank,
         kv_dtype=kv_dtype,
         kv_shape=kv_shape,
+        use_mla=use_mla,
     )
 
     gpu_connector = CreateGPUConnector(config, metadata, EngineType.SGLANG)
+    broadcast_fn = (
+        tp_group.broadcast if tp_group is not None else mock_up_broadcast_fn
+    )
+    broadcast_object_fn = (
+        tp_group.broadcast_object
+        if tp_group is not None
+        else mock_up_broadcast_object_fn
+    )
     engine = LMCacheEngineBuilder.get_or_create(
         ENGINE_NAME,
         config,
         metadata,
         gpu_connector,
-        mock_up_broadcast_fn,
-        mock_up_broadcast_object_fn,
+        broadcast_fn,
+        broadcast_object_fn,
     )
 
     return engine
@@ -106,10 +121,12 @@ class LMCacheConnector:
         tp_size: int,
         rank: int,
         k_pool: List[torch.Tensor],
-        v_pool: List[torch.Tensor],
+        v_pool: Optional[List[torch.Tensor]],
+        tp_group: Optional[Any] = None,
     ):
         if not k_pool:
             raise ValueError("k_pool cannot be empty during initialization.")
+        use_mla = v_pool is None
         kv_dtype = k_pool[0].dtype
         if k_pool[0].is_cuda and k_pool[0].device.index is not None:
             local_rank = k_pool[0].device.index
@@ -125,11 +142,16 @@ class LMCacheConnector:
             local_rank,
             rank,  # global_rank (tp_rank) for metadata
             kv_dtype,
+            use_mla,
+            tp_group,
         )
         self.sgl_config = sgl_config
         self.tp_size = tp_size
         self.rank = local_rank  # Use local_rank for torch.device() calls
-        self.kvcaches = k_pool + v_pool
+        # SGLang MHA/GQA exposes separate per-layer K and V lists. Keep the
+        # two-level structure expected by both SGLang GPU connectors instead
+        # of flattening it to [k0, ..., v0, ...].
+        self.kvcaches = k_pool if use_mla else [k_pool, v_pool]
         self.num_layer = sgl_config.num_hidden_layers
 
         self.lmcache_engine.post_init(kvcaches=self.kvcaches)
@@ -145,7 +167,10 @@ class LMCacheConnector:
 
         assert isinstance(token_ids, torch.Tensor)
         assert isinstance(slot_mapping, torch.Tensor)
-        assert (len(token_ids) - offset) == len(slot_mapping)
+        # SGLang supplies a full-length mapping and marks an already-cached
+        # prefix with -1 entries. ``offset`` controls the load mask; it does
+        # not shorten the mapping passed to the GPU connector.
+        assert len(token_ids) == len(slot_mapping)
 
         slot_mapping = slot_mapping.cuda()
         load_mask = torch.ones_like(token_ids, dtype=torch.bool)
@@ -205,15 +230,15 @@ class LMCacheLayerwiseConnector(LMCacheConnector):
         tp_size: int,
         rank: int,
         k_pool: List[torch.Tensor],
-        v_pool: List[torch.Tensor],
+        v_pool: Optional[List[torch.Tensor]],
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
-        super().__init__(sgl_config, tp_size, rank, k_pool, v_pool)
+        super().__init__(sgl_config, tp_size, rank, k_pool, v_pool, tp_group)
         self._lmcache_chunk_size = self.lmcache_engine.config.chunk_size
         self.layerwise_retrievers: List[Any] = []
         self.layer_load_layer: List[int] = []
-        self.kvcaches = [k_pool, v_pool]
-        self.tp_group = tp_group
+        self.kvcaches = k_pool if v_pool is None else [k_pool, v_pool]
+        self.tp_group = tp_group.device_group if tp_group is not None else None
         self.lookup_id_list: List[str] = []
 
     @torch.no_grad()

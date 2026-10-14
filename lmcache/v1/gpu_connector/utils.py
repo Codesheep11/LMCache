@@ -178,6 +178,12 @@ def need_gpu_interm_buffer(lmcache_config: LMCacheEngineConfig):
     Check if the GPU Connector needs to create an intermediate
     buffer on the GPU
     """
+    if bool(
+        lmcache_config.get_extra_config_value(
+            "cascadekv_direct_paged_h2d", False
+        )
+    ):
+        return False
     if lmcache_config.enable_pd:
         return False
     else:

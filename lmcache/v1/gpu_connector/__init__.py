@@ -28,6 +28,15 @@ def CreateGPUConnector(
         layout_hints: Optional hints from the serving engine about KV cache
             layout (e.g. ``{"kv_layout": "HND"}``).
     """
+    if config.get_extra_config_value("xds_layerwise_readv", False) and (
+        engine != EngineType.VLLM
+        or not config.use_layerwise
+        or not config.xds_backend
+        or metadata.use_mla
+        or config.enable_blending
+        or not config.get_extra_config_value("xds_layerwise_block_blob", False)
+    ):
+        raise ValueError("xds_layerwise_readv requires VLLM xDS layerwise block blobs")
     use_gpu = need_gpu_interm_buffer(config)
 
     if engine == EngineType.SGLANG:
@@ -51,6 +60,7 @@ def CreateGPUConnector(
                 chunk_size=chunk_size,
                 dtype=kv_dtype,
                 device=device,
+                use_mla=metadata.use_mla,
             )
         else:
             return SGLangGPUConnector(
@@ -60,6 +70,7 @@ def CreateGPUConnector(
                 chunk_size=chunk_size,
                 dtype=kv_dtype,
                 device=device,
+                use_mla=metadata.use_mla,
             )
     elif engine == EngineType.VLLM:
         # First Party
@@ -73,6 +84,11 @@ def CreateGPUConnector(
 
         local_worker_id = metadata.local_worker_id
         torch_dev, dev_name = get_vllm_torch_dev()
+        if (
+            config.get_extra_config_value("xds_layerwise_readv", False)
+            and dev_name != "cuda"
+        ):
+            raise ValueError("xds_layerwise_readv requires CUDA")
         torch_dev.set_device(local_worker_id)
         device = torch.device(f"{dev_name}:{local_worker_id}")
 
@@ -90,6 +106,26 @@ def CreateGPUConnector(
             return VLLMPagedMemXPUConnectorV2.from_metadata(metadata, use_gpu, device)
 
         if config.use_layerwise:
+            if config.get_extra_config_value("xds_layerwise_readv", False):
+                from lmcache.v1.gpu_connector.xds_layerwise import (
+                    XDSReadvLayerwiseGPUConnector,
+                )
+
+                if (
+                    not config.xds_backend
+                    or metadata.use_mla
+                    or config.enable_blending
+                    or not config.get_extra_config_value(
+                        "xds_layerwise_block_blob", False
+                    )
+                ):
+                    raise ValueError(
+                        "xds_layerwise_readv requires xDS block blobs "
+                        "without MLA/blending"
+                    )
+                return XDSReadvLayerwiseGPUConnector.from_metadata(
+                    metadata, use_gpu, device, layout_hints=layout_hints
+                )
             if config.enable_blending:
                 return VLLMBufferLayerwiseGPUConnector.from_metadata(
                     metadata, use_gpu, device, layout_hints=layout_hints

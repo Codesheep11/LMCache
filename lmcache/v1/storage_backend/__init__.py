@@ -11,7 +11,11 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import XDSServiceMemoryAllocator
+from lmcache.v1.memory_management import (
+    MemoryAllocatorInterface,
+    XDSSegmentedServiceMemoryAllocator,
+    XDSServiceMemoryAllocator,
+)
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.gds_backend import GdsBackend
@@ -26,6 +30,8 @@ if TYPE_CHECKING:
     from lmcache.v1.cache_controller.worker import LMCacheWorker
 
 logger = init_logger(__name__)
+
+_CASCADEKV_XDS_ARENA_BYTES = 4 * 1024**3
 
 
 def is_cuda_worker(metadata: LMCacheMetadata) -> bool:
@@ -159,7 +165,7 @@ def CreateStorageBackends(
     if metadata.role == "scheduler":
         # For scheduler role, local_cpu_backend is None
         pass
-    elif config.cascadekv_backend:
+    elif config.cascadekv_backend and not config.local_cpu:
         pass
     elif not config.enable_pd or config.local_cpu:
         if "LocalCPUBackend" in _skip:
@@ -185,7 +191,7 @@ def CreateStorageBackends(
         and selected_xds_backend not in _skip
     ):
         xds_client = connect_xds_client(config, metadata)
-        owned_cascade_cpu_backend: Optional[LocalCPUBackend] = None
+        owned_cascade_allocator: Optional[MemoryAllocatorInterface] = None
         try:
             if config.xds_backend:
                 from lmcache.v1.storage_backend.xds_backend import XDSBackend
@@ -204,35 +210,37 @@ def CreateStorageBackends(
                 service_metadata = xds_client.metadata
                 if service_metadata is None:
                     raise RuntimeError("xDS service did not return metadata")
-                allocator = XDSServiceMemoryAllocator(
+                allocator_size = int(config.max_local_cpu_size * 1024**3)
+                allocator_class = (
+                    XDSSegmentedServiceMemoryAllocator
+                    if allocator_size > _CASCADEKV_XDS_ARENA_BYTES
+                    else XDSServiceMemoryAllocator
+                )
+                allocator_kwargs = {"close_client": True}
+                if allocator_class is XDSSegmentedServiceMemoryAllocator:
+                    allocator_kwargs["arena_size_bytes"] = (
+                        _CASCADEKV_XDS_ARENA_BYTES
+                    )
+                allocator = allocator_class(
                     xds_client,
-                    int(config.max_local_cpu_size * 1024**3),
+                    allocator_size,
                     int(service_metadata.io_unit_size),
-                    close_client=True,
+                    **allocator_kwargs,
                 )
-                local_cpu_backend = LocalCPUBackend(
-                    config,
-                    metadata,
-                    dst_device,
-                    lmcache_worker,
-                    memory_allocator=allocator,
-                )
-                owned_cascade_cpu_backend = local_cpu_backend
-                storage_backends[str(local_cpu_backend)] = local_cpu_backend
+                owned_cascade_allocator = allocator
                 xds_backend = CascadeKVBackend(
                     config,
                     metadata,
                     loop,
-                    local_cpu_backend,
+                    allocator,
                     xds_client,
                     dst_device,
                     lmcache_worker,
                 )
             storage_backends[str(xds_backend)] = xds_backend
         except Exception:
-            if owned_cascade_cpu_backend is not None:
-                storage_backends.pop(str(owned_cascade_cpu_backend), None)
-                owned_cascade_cpu_backend.close()
+            if owned_cascade_allocator is not None:
+                owned_cascade_allocator.close()
             else:
                 xds_client.close()
             raise

@@ -191,6 +191,10 @@ class GdsBackend(AllocatorBackendInterface):
         self.config = config
         self.loop = loop
         self.dst_device = dst_device
+        self.worker_id = metadata.worker_id
+        self.benchmark_transfer_metrics = config.get_extra_config_value(
+            "benchmark_transfer_metrics", False
+        )
 
         # Extract device index from self.dst_device (e.g. "cuda:2" -> 2)
         device_id = (
@@ -906,6 +910,7 @@ class GdsBackend(AllocatorBackendInterface):
                 gds_read_bytes += memory_obj.get_size()
             memory_objs.append(memory_obj)
 
+        metric_start_ns = time.monotonic_ns()
         start_time = time.perf_counter()
         assert self._thread_pool is not None
         results = list(
@@ -918,6 +923,24 @@ class GdsBackend(AllocatorBackendInterface):
             f"Time taken for batched_get_blocking: {total_time:.3f}s |"
             f" {gds_read_bytes / 1024 / 1024}MiB | {gds_reads} ops."
         )
+        if self.benchmark_transfer_metrics:
+            metric_end_ns = time.monotonic_ns()
+            logger.info(
+                "[GDS_READ_METRICS] %s",
+                json.dumps(
+                    {
+                        "worker_id": self.worker_id,
+                        "bytes": gds_read_bytes,
+                        "file_count": gds_reads,
+                        "start_ns": metric_start_ns,
+                        "end_ns": metric_end_ns,
+                        "seconds": (metric_end_ns - metric_start_ns) / 1e9,
+                        "use_cufile": self.use_cufile,
+                        "use_direct_io": self.use_direct_io,
+                    },
+                    separators=(",", ":"),
+                ),
+            )
         return results
 
     @_lmcache_nvtx_annotate
@@ -1082,7 +1105,7 @@ class GdsBackend(AllocatorBackendInterface):
         self,
         shapes: Union[torch.Size, list[torch.Size]],
         dtypes: Union[torch.dtype, list[torch.dtype]],
-        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        fmt: Optional[MemoryFormat] = None,
         eviction: bool = True,
         busy_loop: bool = True,
     ) -> Optional[MemoryObj]:
@@ -1091,6 +1114,13 @@ class GdsBackend(AllocatorBackendInterface):
         """
         if eviction:
             logger.warning("GDS Backend does not support eviction")
+
+        # Non-layerwise cache engines historically pass ``None`` and rely on
+        # allocator backends to select the native multi-layer KV layout.  A
+        # pure GDS backend is itself the allocator, so normalize that value
+        # before creating metadata that is later serialized to disk.
+        if fmt is None:
+            fmt = MemoryFormat.KV_2LTD
 
         logger.debug(f"Allocating memory with busy loop: {busy_loop}")
 
@@ -1130,7 +1160,7 @@ class GdsBackend(AllocatorBackendInterface):
         shapes: Union[torch.Size, list[torch.Size]],
         dtypes: Union[torch.dtype, list[torch.dtype]],
         batch_size: int,
-        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        fmt: Optional[MemoryFormat] = None,
         eviction: bool = True,
         busy_loop: bool = True,
     ) -> Optional[list[MemoryObj]]:
@@ -1139,6 +1169,9 @@ class GdsBackend(AllocatorBackendInterface):
         """
         if eviction:
             logger.warning("GDS Backend does not support eviction")
+
+        if fmt is None:
+            fmt = MemoryFormat.KV_2LTD
 
         logger.debug(
             f"Batched allocating memory in GDS backend with busy loop: {busy_loop}"

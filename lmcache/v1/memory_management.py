@@ -5,7 +5,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import wraps
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Protocol, Tuple, Union, runtime_checkable
 import abc
 import ctypes
 import os
@@ -702,6 +702,31 @@ class TensorMemoryObj(MemoryObj):
         return self.parent_allocator
 
 
+class LayerwiseStagingMemoryObj(TensorMemoryObj):
+    """Expose one contiguous CPU staging view for a complete KV layer.
+
+    The object represents several token-block slots as one logical tensor.  It
+    lets a layerwise GPU connector submit one H2D copy without reconstructing
+    or scanning one ``MemoryObj`` per token block.
+
+    Args:
+        raw_data: Flat bytes covering the logical layer payload.
+        metadata: Logical tensor metadata for the combined layer.
+        chunk_count: Number of token chunks represented by the view.
+    """
+
+    def __init__(
+        self,
+        raw_data: torch.Tensor,
+        metadata: MemoryObjMetadata,
+        chunk_count: int,
+    ) -> None:
+        if chunk_count <= 0:
+            raise ValueError("chunk_count must be positive")
+        super().__init__(raw_data, metadata, parent_allocator=None)
+        self.chunk_count = chunk_count
+
+
 class BytesBufferMemoryObj(MemoryObj):
     """
     Wraps a raw flat tensor with some metadata
@@ -1185,6 +1210,55 @@ class AddressManager:
 
     @_lmcache_nvtx_annotate
     @synchronized("_lock")
+    def allocate_at_most_contiguous(
+        self, size: int, max_batch_size: int
+    ) -> list[tuple[int, int]]:
+        """Allocate the largest contiguous run of equal-sized blocks.
+
+        Args:
+            size: Raw size of one block in bytes.
+            max_batch_size: Maximum number of adjacent blocks to allocate.
+
+        Returns:
+            Adjacent ``(address, size)`` allocations. The result contains at
+            most ``max_batch_size`` entries and is empty when no full block is
+            currently available.
+
+        Raises:
+            ValueError: If ``size`` or ``max_batch_size`` is not positive.
+        """
+        if size <= 0 or max_batch_size <= 0:
+            raise ValueError("size and max_batch_size must be positive")
+        aligned_size = self.compute_aligned_size(size)
+        selected_block = None
+        selected_count = 0
+        for block in self._explicit_list:
+            block_count = min(max_batch_size, block.size // aligned_size)
+            if block_count > selected_count:
+                selected_block = block
+                selected_count = block_count
+                if selected_count == max_batch_size:
+                    break
+        if selected_block is None or selected_count == 0:
+            return []
+
+        self._explicit_list.remove(selected_block)
+        allocated_size = selected_count * aligned_size
+        if selected_block.size > allocated_size:
+            self._explicit_list.add(
+                FreeBlock(
+                    start=selected_block.start + allocated_size,
+                    size=selected_block.size - allocated_size,
+                )
+            )
+        self.total_allocated_size += allocated_size
+        return [
+            (selected_block.start + index * aligned_size, aligned_size)
+            for index in range(selected_count)
+        ]
+
+    @_lmcache_nvtx_annotate
+    @synchronized("_lock")
     def free(self, address: int, size: int):
         """
         Free a previously allocated block of memory.
@@ -1419,6 +1493,59 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         return tensor_mem_objs
 
     @_lmcache_nvtx_annotate
+    def allocate_at_most_contiguous(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        max_batch_size: int,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+    ) -> list[TensorMemoryObj]:
+        """Allocate the largest available adjacent batch up to a limit.
+
+        Args:
+            shapes: Logical shape or grouped logical shapes of one object.
+            dtypes: Dtype or grouped dtypes corresponding to ``shapes``.
+            max_batch_size: Maximum number of adjacent objects to allocate.
+            fmt: Logical memory format for every returned object.
+
+        Returns:
+            Zero or more equal-sized adjacent tensor memory objects. A partial
+            batch is returned instead of failing when the full batch does not
+            fit in the largest free extent.
+        """
+        shapes, dtypes = self._adapt_shapes_and_dtypes(shapes, dtypes)
+        raw_size = get_size_bytes(shapes, dtypes)
+        alloc_results = self.address_manager.allocate_at_most_contiguous(
+            raw_size, max_batch_size
+        )
+        if not alloc_results:
+            return []
+
+        self.num_active_allocations += len(alloc_results)
+        self.stats_monitor.update_local_cache_usage(
+            self.address_manager.total_allocated_size
+        )
+        self.stats_monitor.update_active_memory_objs_count(self.num_active_allocations)
+        return [
+            TensorMemoryObj(
+                raw_data=self._get_buffer_slice(address, raw_size),
+                metadata=MemoryObjMetadata(
+                    shapes[0],
+                    dtypes[0],
+                    address,
+                    allocated_size,
+                    1,
+                    0,
+                    fmt,
+                    shapes=shapes,
+                    dtypes=dtypes,
+                ),
+                parent_allocator=self,
+            )
+            for address, allocated_size in alloc_results
+        ]
+
+    @_lmcache_nvtx_annotate
     def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = None):
         if not memory_obj.is_valid():
             return
@@ -1536,6 +1663,44 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         return "TensorMemoryAllocator"
 
 
+@dataclass(frozen=True)
+class XDSIORegion:
+    """Public xDS address of one allocator-owned memory object."""
+
+    buffer_ref: int
+    offset: int
+    size: int
+
+
+@runtime_checkable
+class XDSBufferAllocatorInterface(Protocol):
+    """Memory allocator operations required by CascadeKV."""
+
+    size: int
+    align_bytes: int
+
+    def allocate(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        fmt: MemoryFormat = MemoryFormat.UNDEFINED,
+        allocator_type: Optional[str] = None,
+    ) -> Optional[MemoryObj]: ...
+
+    def batched_allocate(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        batch_size: int,
+        fmt: MemoryFormat = MemoryFormat.UNDEFINED,
+        allocator_type: Optional[str] = None,
+    ) -> Optional[List[MemoryObj]]: ...
+
+    def get_io_region(self, memory_obj: MemoryObj) -> XDSIORegion: ...
+
+    def close(self) -> None: ...
+
+
 class XDSServiceMemoryAllocator(TensorMemoryAllocator):
     """Allocate LMCache objects from one xDS service-owned CPU DMA buffer."""
 
@@ -1609,6 +1774,16 @@ class XDSServiceMemoryAllocator(TensorMemoryAllocator):
             )
         return offset
 
+    def get_io_region(self, memory_obj: MemoryObj) -> XDSIORegion:
+        """Return the stable service buffer reference, offset, and size."""
+        if self.buffer_ref is None:
+            raise RuntimeError("xDS service allocator is closed")
+        return XDSIORegion(
+            buffer_ref=self.buffer_ref,
+            offset=self.get_buffer_offset(memory_obj),
+            size=memory_obj.get_physical_size(),
+        )
+
     def close(self) -> None:
         """Unregister and release the service-owned CPU DMA buffer."""
         if self._closed:
@@ -1618,8 +1793,7 @@ class XDSServiceMemoryAllocator(TensorMemoryAllocator):
             unregister_status = int(self._cudart.cudaHostUnregister(self.base_ptr))
             if unregister_status != 0:
                 raise RuntimeError(
-                    "xDS service cudaHostUnregister failed: "
-                    f"status={unregister_status}"
+                    f"xDS service cudaHostUnregister failed: status={unregister_status}"
                 )
             self._host_registered = False
         if self.buffer_ref is not None:
@@ -1628,6 +1802,139 @@ class XDSServiceMemoryAllocator(TensorMemoryAllocator):
         if self._close_client and not self._client_closed:
             self.client.close()
             self._client_closed = True
+        self._closed = True
+
+
+class XDSSegmentedServiceMemoryAllocator(MemoryAllocatorInterface):
+    """Expose several service-owned DMA arenas as one logical allocator."""
+
+    def __init__(
+        self,
+        client: Any,
+        size: int,
+        align_bytes: int,
+        arena_size_bytes: int,
+        close_client: bool = False,
+    ) -> None:
+        if size <= 0 or arena_size_bytes <= 0:
+            raise ValueError("xDS segmented allocator sizes must be positive")
+        if arena_size_bytes % align_bytes:
+            raise ValueError("xDS arena size must satisfy I/O alignment")
+        self.client = client
+        self.size = size
+        self.align_bytes = align_bytes
+        self._close_client = close_client
+        self._closed = False
+        self._arenas: list[XDSServiceMemoryAllocator] = []
+        self._allocation_lock = threading.Lock()
+        self._next_arena = 0
+        remaining = size
+        try:
+            while remaining:
+                arena_size = min(remaining, arena_size_bytes)
+                self._arenas.append(
+                    XDSServiceMemoryAllocator(
+                        client,
+                        arena_size,
+                        align_bytes,
+                        close_client=False,
+                    )
+                )
+                remaining -= arena_size
+        except BaseException:
+            for arena in reversed(self._arenas):
+                arena.close()
+            if close_client:
+                client.close()
+            raise
+
+    def allocate(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        allocator_type: Optional[str] = None,
+    ) -> Optional[MemoryObj]:
+        adapted_shapes, adapted_dtypes = self._adapt_shapes_and_dtypes(shapes, dtypes)
+        raw_size = get_size_bytes(adapted_shapes, adapted_dtypes)
+        aligned_size = self._arenas[0].address_manager.compute_aligned_size(raw_size)
+        with self._allocation_lock:
+            for offset in range(len(self._arenas)):
+                arena_index = (self._next_arena + offset) % len(self._arenas)
+                arena = self._arenas[arena_index]
+                if arena.address_manager.get_free_size() < aligned_size:
+                    continue
+                memory_obj = arena.allocate(
+                    adapted_shapes,
+                    adapted_dtypes,
+                    fmt,
+                    allocator_type,
+                )
+                if memory_obj is not None:
+                    self._next_arena = arena_index
+                    return memory_obj
+        return None
+
+    def batched_allocate(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        batch_size: int,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        allocator_type: Optional[str] = None,
+    ) -> Optional[list[MemoryObj]]:
+        memory_objs: list[MemoryObj] = []
+        for _ in range(batch_size):
+            memory_obj = self.allocate(shapes, dtypes, fmt, allocator_type)
+            if memory_obj is None:
+                for allocated in memory_objs:
+                    allocated.ref_count_down()
+                return None
+            memory_objs.append(memory_obj)
+        return memory_objs
+
+    def _arena_for(self, memory_obj: MemoryObj) -> XDSServiceMemoryAllocator:
+        if not isinstance(memory_obj, TensorMemoryObj):
+            raise TypeError("xDS service allocator requires TensorMemoryObj")
+        pointer = memory_obj.raw_data.data_ptr()
+        for arena in self._arenas:
+            if arena.base_ptr <= pointer < arena.base_ptr + arena.size:
+                return arena
+        raise ValueError("memory object is outside the xDS service arenas")
+
+    def get_buffer_offset(self, memory_obj: MemoryObj) -> int:
+        return self._arena_for(memory_obj).get_buffer_offset(memory_obj)
+
+    def get_io_region(self, memory_obj: MemoryObj) -> XDSIORegion:
+        return self._arena_for(memory_obj).get_io_region(memory_obj)
+
+    def free(
+        self,
+        memory_obj: MemoryObj,
+        allocator_type: Optional[str] = None,
+    ) -> None:
+        self._arena_for(memory_obj).free(memory_obj, allocator_type)
+
+    def batched_free(
+        self,
+        memory_objs: list[MemoryObj],
+        allocator_type: Optional[str] = None,
+        update_stats: bool = True,
+    ) -> None:
+        del update_stats
+        for memory_obj in memory_objs:
+            self.free(memory_obj, allocator_type)
+
+    def memcheck(self) -> bool:
+        return all(arena.memcheck() for arena in self._arenas)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        for arena in reversed(self._arenas):
+            arena.close()
+        if self._close_client:
+            self.client.close()
         self._closed = True
 
 

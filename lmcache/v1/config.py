@@ -130,37 +130,6 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": 1.0,
         "env_converter": float,
     },
-    "cascadekv_slot_count": {"type": int, "default": 8, "env_converter": int},
-    "cascadekv_overlap": {
-        "type": bool,
-        "default": True,
-        "env_converter": _to_bool,
-    },
-    "cascadekv_async_write": {
-        "type": bool,
-        "default": True,
-        "env_converter": _to_bool,
-    },
-    "cascadekv_read_slot_count": {
-        "type": int,
-        "default": 8,
-        "env_converter": int,
-    },
-    "cascadekv_write_slot_count": {
-        "type": int,
-        "default": 64,
-        "env_converter": int,
-    },
-    "cascadekv_io_queue_depth": {
-        "type": int,
-        "default": 4,
-        "env_converter": int,
-    },
-    "cascadekv_write_window_size": {
-        "type": int,
-        "default": 64,
-        "env_converter": int,
-    },
     # Feature toggles
     "use_layerwise": {
         "type": bool,
@@ -704,17 +673,14 @@ def _validate_config(self):
                 raise ValueError(f"{field_name} must be positive, got {value}")
 
     if self.cascadekv_backend:
-        positive_legacy_cascade_fields = (
-            "xds_max_size",
-            "xds_chunked_size_kb",
-            "xds_write_window_size",
-            "xds_idle_flush_time",
-            "xds_max_flush_delay",
-        )
-        for field_name in positive_legacy_cascade_fields:
-            value = getattr(self, field_name)
-            if value <= 0:
-                raise ValueError(f"{field_name} must be positive, got {value}")
+        if self.use_layerwise:
+            raise ValueError("cascadekv_backend requires use_layerwise=false")
+        if self.xds_max_size <= 0:
+            raise ValueError(f"xds_max_size must be positive, got {self.xds_max_size}")
+        if self.max_local_cpu_size <= 0:
+            raise ValueError(
+                "cascadekv_backend requires max_local_cpu_size to be positive"
+            )
     return self
 
 

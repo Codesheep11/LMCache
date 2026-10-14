@@ -1,0 +1,2209 @@
+{
+  "parameters": {
+    "disk_dir": "/mnt/lmcache-raid0/single-prompt-vllm-lmcache/lmcache-cpu-pressure-pb_vjywj",
+    "dataset_bytes": 8589934592,
+    "chunk_bytes": 16777216,
+    "num_files": 512,
+    "cpu_size_bytes": 8589934592,
+    "concurrency": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "trials": 5,
+    "odirect": true
+  },
+  "results": [
+    {
+      "mode": "cpu_available",
+      "concurrency": 1,
+      "elapsed_sec": 0.570923495,
+      "bytes": 8589934592,
+      "gib_per_sec": 14.012385319682808,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 1.716469,
+      "allocate_ms_sum": 19.882865,
+      "read_ms_sum": 534.12289,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 14.012385319682808,
+          "read_ms": 23568.0,
+          "util_percent": 100.18855503573208,
+          "average_queue_depth": 41.28048715178555
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 0
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 1,
+      "elapsed_sec": 0.596660846,
+      "bytes": 8589934592,
+      "gib_per_sec": 13.407952027742072,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 7.117989,
+      "metadata_ms_sum": 2.189833,
+      "allocate_ms_sum": 32.644543,
+      "read_ms_sum": 545.228605,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 13.407952027742072,
+          "read_ms": 25296.0,
+          "util_percent": 99.21884500529133,
+          "average_queue_depth": 42.395944311720434
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 0
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 1,
+      "elapsed_sec": 0.70924322,
+      "bytes": 8589934592,
+      "gib_per_sec": 11.279628446783038,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 9.662012,
+      "metadata_ms_sum": 2.766566,
+      "allocate_ms_sum": 45.102921,
+      "read_ms_sum": 637.480738,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 11.279628446783038,
+          "read_ms": 18160.0,
+          "util_percent": 99.26073033169074,
+          "average_queue_depth": 25.604756574197495
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 1
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 1,
+      "elapsed_sec": 0.670571725,
+      "bytes": 8589934592,
+      "gib_per_sec": 11.930118288241278,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 2.79035,
+      "allocate_ms_sum": 26.877608,
+      "read_ms_sum": 618.633971,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 11.930118288241278,
+          "read_ms": 23716.0,
+          "util_percent": 99.01998179240262,
+          "average_queue_depth": 35.36683566549127
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 1
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 1,
+      "elapsed_sec": 0.611722899,
+      "bytes": 8589934592,
+      "gib_per_sec": 13.077816791030411,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 2.487546,
+      "allocate_ms_sum": 23.449291,
+      "read_ms_sum": 566.157675,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 13.077816791030411,
+          "read_ms": 27140.0,
+          "util_percent": 98.7375167722796,
+          "average_queue_depth": 44.36649346357067
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 2
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 1,
+      "elapsed_sec": 0.588764277,
+      "bytes": 8589934592,
+      "gib_per_sec": 13.587780904037423,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 10.017197,
+      "metadata_ms_sum": 2.283721,
+      "allocate_ms_sum": 35.844548,
+      "read_ms_sum": 533.737711,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 13.587780904037423,
+          "read_ms": 25028.0,
+          "util_percent": 99.87018964467507,
+          "average_queue_depth": 42.50937255828108
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 2
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 1,
+      "elapsed_sec": 0.589712162,
+      "bytes": 8589934592,
+      "gib_per_sec": 13.565940327342274,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 6.880397,
+      "metadata_ms_sum": 2.199778,
+      "allocate_ms_sum": 32.193414,
+      "read_ms_sum": 539.188752,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 13.565940327342274,
+          "read_ms": 26032.0,
+          "util_percent": 99.7096614059657,
+          "average_queue_depth": 44.14356982517176
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 3
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 1,
+      "elapsed_sec": 0.570419864,
+      "bytes": 8589934592,
+      "gib_per_sec": 14.024757034057286,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 2.119379,
+      "allocate_ms_sum": 18.84682,
+      "read_ms_sum": 533.814767,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 14.024757034057286,
+          "read_ms": 25500.0,
+          "util_percent": 99.57577494180673,
+          "average_queue_depth": 44.7039130460576
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 3
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 1,
+      "elapsed_sec": 0.575389458,
+      "bytes": 8589934592,
+      "gib_per_sec": 13.903626298276741,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 2.196778,
+      "allocate_ms_sum": 19.527846,
+      "read_ms_sum": 537.358532,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 13.903626298276741,
+          "read_ms": 24996.0,
+          "util_percent": 99.4109280326787,
+          "average_queue_depth": 43.44188036896568
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 4
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 1,
+      "elapsed_sec": 0.589164683,
+      "bytes": 8589934592,
+      "gib_per_sec": 13.578546424854185,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 7.099344,
+      "metadata_ms_sum": 2.518793,
+      "allocate_ms_sum": 32.540056,
+      "read_ms_sum": 537.89211,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 13.578546424854185,
+          "read_ms": 20812.0,
+          "util_percent": 99.80231622267827,
+          "average_queue_depth": 35.32458852425817
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 4
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 2,
+      "elapsed_sec": 0.400566124,
+      "bytes": 8589934592,
+      "gib_per_sec": 19.97173380542784,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 2.614791,
+      "allocate_ms_sum": 22.89964,
+      "read_ms_sum": 755.566053,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 19.97173380542784,
+          "read_ms": 34628.0,
+          "util_percent": 100.8572557174106,
+          "average_queue_depth": 86.4476497767944
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 0
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 2,
+      "elapsed_sec": 0.36069795,
+      "bytes": 8589934592,
+      "gib_per_sec": 22.179222255075196,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 8.099691,
+      "metadata_ms_sum": 2.527393,
+      "allocate_ms_sum": 37.323419,
+      "read_ms_sum": 660.76918,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 22.179222255075196,
+          "read_ms": 28888.0,
+          "util_percent": 100.91546126059214,
+          "average_queue_depth": 80.08917156307653
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 0
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 2,
+      "elapsed_sec": 0.362831601,
+      "bytes": 8589934592,
+      "gib_per_sec": 22.048796130081293,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 8.234835,
+      "metadata_ms_sum": 2.617483,
+      "allocate_ms_sum": 38.200518,
+      "read_ms_sum": 663.376931,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 22.048796130081293,
+          "read_ms": 31372.0,
+          "util_percent": 101.42446219837396,
+          "average_queue_depth": 86.4643540241138
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 1
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 2,
+      "elapsed_sec": 0.343819682,
+      "bytes": 8589934592,
+      "gib_per_sec": 23.26801058468782,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 2.429261,
+      "allocate_ms_sum": 21.094847,
+      "read_ms_sum": 644.559078,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 23.26801058468782,
+          "read_ms": 31184.0,
+          "util_percent": 100.05244551415761,
+          "average_queue_depth": 90.69870525911311
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 1
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 2,
+      "elapsed_sec": 0.395986186,
+      "bytes": 8589934592,
+      "gib_per_sec": 20.202724950612293,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 2.665093,
+      "allocate_ms_sum": 22.864406,
+      "read_ms_sum": 745.441131,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 20.202724950612293,
+          "read_ms": 32512.0,
+          "util_percent": 101.01362475306146,
+          "average_queue_depth": 82.10387419928836
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 2
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 2,
+      "elapsed_sec": 0.356366545,
+      "bytes": 8589934592,
+      "gib_per_sec": 22.448796364989875,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 7.837793,
+      "metadata_ms_sum": 2.474686,
+      "allocate_ms_sum": 35.973516,
+      "read_ms_sum": 654.130252,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 22.448796364989875,
+          "read_ms": 33044.0,
+          "util_percent": 99.89714382420493,
+          "average_queue_depth": 92.72475338559067
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 2
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 2,
+      "elapsed_sec": 0.598599333,
+      "bytes": 8589934592,
+      "gib_per_sec": 13.364532098467942,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 13.554051,
+      "metadata_ms_sum": 4.064153,
+      "allocate_ms_sum": 59.079079,
+      "read_ms_sum": 1104.143443,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 13.364532098467942,
+          "read_ms": 31828.0,
+          "util_percent": 86.20123203511822,
+          "average_queue_depth": 53.170790953754704
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 3
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 2,
+      "elapsed_sec": 0.343789792,
+      "bytes": 8589934592,
+      "gib_per_sec": 23.270033567488824,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 2.517858,
+      "allocate_ms_sum": 21.254042,
+      "read_ms_sum": 643.936003,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 23.270033567488824,
+          "read_ms": 27876.0,
+          "util_percent": 101.2246460185764,
+          "average_queue_depth": 81.0844319659148
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 3
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 2,
+      "elapsed_sec": 0.394668511,
+      "bytes": 8589934592,
+      "gib_per_sec": 20.270175544863775,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 3.373644,
+      "allocate_ms_sum": 21.920217,
+      "read_ms_sum": 743.901552,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 20.270175544863775,
+          "read_ms": 33872.0,
+          "util_percent": 99.32386016983249,
+          "average_queue_depth": 85.82392325695322
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 4
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 2,
+      "elapsed_sec": 0.36675873,
+      "bytes": 8589934592,
+      "gib_per_sec": 21.812705044539772,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 8.373248,
+      "metadata_ms_sum": 2.726655,
+      "allocate_ms_sum": 38.850103,
+      "read_ms_sum": 670.701579,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 21.812705044539772,
+          "read_ms": 30412.0,
+          "util_percent": 99.24780795265598,
+          "average_queue_depth": 82.92099822681796
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 4
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 4,
+      "elapsed_sec": 0.32797935,
+      "bytes": 8589934592,
+      "gib_per_sec": 24.391779543437718,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 2.644431,
+      "allocate_ms_sum": 23.369215,
+      "read_ms_sum": 1258.671526,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 24.391779543437718,
+          "read_ms": 80156.0,
+          "util_percent": 101.22588510526653,
+          "average_queue_depth": 244.39343513547422
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 0
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 4,
+      "elapsed_sec": 0.33687577,
+      "bytes": 8589934592,
+      "gib_per_sec": 23.747626610248638,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 8.772529,
+      "metadata_ms_sum": 2.68595,
+      "allocate_ms_sum": 39.931765,
+      "read_ms_sum": 1275.604806,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 23.747626610248638,
+          "read_ms": 85952.0,
+          "util_percent": 100.92741309355671,
+          "average_queue_depth": 255.14450030051134
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 0
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 4,
+      "elapsed_sec": 0.336143502,
+      "bytes": 8589934592,
+      "gib_per_sec": 23.79935935813509,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 8.710189,
+      "metadata_ms_sum": 2.700887,
+      "allocate_ms_sum": 39.85435,
+      "read_ms_sum": 1272.841643,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 23.79935935813509,
+          "read_ms": 74324.0,
+          "util_percent": 101.14727727207413,
+          "average_queue_depth": 221.10794811675405
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 1
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 4,
+      "elapsed_sec": 0.321196559,
+      "bytes": 8589934592,
+      "gib_per_sec": 24.906867075123305,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 2.56063,
+      "allocate_ms_sum": 22.117905,
+      "read_ms_sum": 1235.135988,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 24.906867075123305,
+          "read_ms": 83300.0,
+          "util_percent": 100.87281165424939,
+          "average_queue_depth": 259.3427534197214
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 1
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 4,
+      "elapsed_sec": 0.324748086,
+      "bytes": 8589934592,
+      "gib_per_sec": 24.634479292974188,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 2.527758,
+      "allocate_ms_sum": 21.871091,
+      "read_ms_sum": 1249.422956,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 24.634479292974188,
+          "read_ms": 75880.0,
+          "util_percent": 101.00136510119415,
+          "average_queue_depth": 233.65803609386015
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 2
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 4,
+      "elapsed_sec": 0.327476941,
+      "bytes": 8589934592,
+      "gib_per_sec": 24.429200955556745,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 8.679494,
+      "metadata_ms_sum": 2.708691,
+      "allocate_ms_sum": 39.59094,
+      "read_ms_sum": 1238.267963,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 24.429200955556745,
+          "read_ms": 75212.0,
+          "util_percent": 101.38118396556048,
+          "average_queue_depth": 229.67113278366674
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 2
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 4,
+      "elapsed_sec": 0.331316629,
+      "bytes": 8589934592,
+      "gib_per_sec": 24.14608655214828,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 8.649556,
+      "metadata_ms_sum": 2.593949,
+      "allocate_ms_sum": 38.644434,
+      "read_ms_sum": 1257.242199,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 24.14608655214828,
+          "read_ms": 90364.0,
+          "util_percent": 98.99895486380794,
+          "average_queue_depth": 272.7421206497909
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 3
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 4,
+      "elapsed_sec": 0.327684772,
+      "bytes": 8589934592,
+      "gib_per_sec": 24.413706963471586,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 2.618736,
+      "allocate_ms_sum": 22.628246,
+      "read_ms_sum": 1259.561054,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 24.413706963471586,
+          "read_ms": 71220.0,
+          "util_percent": 101.3168838984071,
+          "average_queue_depth": 217.34302624230583
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 3
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 4,
+      "elapsed_sec": 0.327306451,
+      "bytes": 8589934592,
+      "gib_per_sec": 24.44192583298641,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 2.53993,
+      "allocate_ms_sum": 22.088931,
+      "read_ms_sum": 1260.382684,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 24.44192583298641,
+          "read_ms": 89596.0,
+          "util_percent": 101.43399220689359,
+          "average_queue_depth": 273.7373483665313
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 4
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 4,
+      "elapsed_sec": 0.33271925,
+      "bytes": 8589934592,
+      "gib_per_sec": 24.044295603575687,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 8.586506,
+      "metadata_ms_sum": 2.670179,
+      "allocate_ms_sum": 39.646813,
+      "read_ms_sum": 1259.647019,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 24.044295603575687,
+          "read_ms": 83152.0,
+          "util_percent": 100.98604153501786,
+          "average_queue_depth": 249.91640850356566
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 4
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 8,
+      "elapsed_sec": 0.320015199,
+      "bytes": 8589934592,
+      "gib_per_sec": 24.99881263452115,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 3.18796,
+      "allocate_ms_sum": 27.881071,
+      "read_ms_sum": 2476.744207,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 24.99881263452115,
+          "read_ms": 157212.0,
+          "util_percent": 99.9952505380846,
+          "average_queue_depth": 491.26416648729236
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 0
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 8,
+      "elapsed_sec": 0.447824637,
+      "bytes": 8589934592,
+      "gib_per_sec": 17.864135509811174,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 23.595236,
+      "metadata_ms_sum": 6.035518,
+      "allocate_ms_sum": 114.877428,
+      "read_ms_sum": 3250.808929,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 17.864135509811174,
+          "read_ms": 106200.0,
+          "util_percent": 76.81578269218805,
+          "average_queue_depth": 237.14639889274335
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 0
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 8,
+      "elapsed_sec": 0.318246165,
+      "bytes": 8589934592,
+      "gib_per_sec": 25.137773459108296,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 12.321909,
+      "metadata_ms_sum": 2.854383,
+      "allocate_ms_sum": 47.669157,
+      "read_ms_sum": 2413.29551,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 25.137773459108296,
+          "read_ms": 152384.0,
+          "util_percent": 100.5510938364332,
+          "average_queue_depth": 478.82430884909485
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 1
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 8,
+      "elapsed_sec": 0.316832775,
+      "bytes": 8589934592,
+      "gib_per_sec": 25.24991298643267,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 2.602472,
+      "allocate_ms_sum": 22.659529,
+      "read_ms_sum": 2471.170412,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 25.24991298643267,
+          "read_ms": 162824.0,
+          "util_percent": 99.73715629640904,
+          "average_queue_depth": 513.9114790128641
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 1
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 8,
+      "elapsed_sec": 0.31644087,
+      "bytes": 8589934592,
+      "gib_per_sec": 25.281184443716135,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 2.600477,
+      "allocate_ms_sum": 22.432116,
+      "read_ms_sum": 2460.786058,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 25.281184443716135,
+          "read_ms": 169812.0,
+          "util_percent": 101.12473777486454,
+          "average_queue_depth": 536.6310615945406
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 2
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 8,
+      "elapsed_sec": 0.320701537,
+      "bytes": 8589934592,
+      "gib_per_sec": 24.945312313860224,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 9.792362,
+      "metadata_ms_sum": 2.853437,
+      "allocate_ms_sum": 43.269639,
+      "read_ms_sum": 2465.716552,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 24.945312313860224,
+          "read_ms": 170124.0,
+          "util_percent": 99.7812492554409,
+          "average_queue_depth": 530.4745390103947
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 2
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 8,
+      "elapsed_sec": 0.320017191,
+      "bytes": 8589934592,
+      "gib_per_sec": 24.998657025272124,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 9.41683,
+      "metadata_ms_sum": 2.841207,
+      "allocate_ms_sum": 45.80621,
+      "read_ms_sum": 2455.288758,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 24.998657025272124,
+          "read_ms": 150804.0,
+          "util_percent": 99.9946281010885,
+          "average_queue_depth": 471.23718425489216
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 3
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 8,
+      "elapsed_sec": 0.318875352,
+      "bytes": 8589934592,
+      "gib_per_sec": 25.088173011252373,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 2.687466,
+      "allocate_ms_sum": 23.220435,
+      "read_ms_sum": 2484.461572,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 25.088173011252373,
+          "read_ms": 166876.0,
+          "util_percent": 99.09828339444687,
+          "average_queue_depth": 523.3267449282188
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 3
+    },
+    {
+      "mode": "cpu_available",
+      "concurrency": 8,
+      "elapsed_sec": 0.318066192,
+      "bytes": 8589934592,
+      "gib_per_sec": 25.151997292437795,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 0,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 0,
+      "cpu_eviction_ms_sum": 0.0,
+      "metadata_ms_sum": 2.63153,
+      "allocate_ms_sum": 22.645414,
+      "read_ms_sum": 2474.149122,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 25.151997292437795,
+          "read_ms": 179080.0,
+          "util_percent": 100.60798916975118,
+          "average_queue_depth": 563.0274593912201
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 4
+    },
+    {
+      "mode": "cpu_full_eviction",
+      "concurrency": 8,
+      "elapsed_sec": 0.320124563,
+      "bytes": 8589934592,
+      "gib_per_sec": 24.99027230222256,
+      "files": 512,
+      "allocation_failures": 0,
+      "cpu_filler_count": 512,
+      "cpu_hot_cache_count_after": 512,
+      "cpu_evictions": 512,
+      "cpu_eviction_ms_sum": 12.437606,
+      "metadata_ms_sum": 2.731802,
+      "allocate_ms_sum": 45.246062,
+      "read_ms_sum": 2460.398383,
+      "devices": {
+        "md127": {
+          "read_gib": 8.0,
+          "read_gib_per_sec": 24.99027230222256,
+          "read_ms": 161112.0,
+          "util_percent": 101.21060282400136,
+          "average_queue_depth": 503.2790938944601
+        },
+        "nvme0n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme1n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme2n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        },
+        "nvme3n1": {
+          "read_gib": 0.0,
+          "read_gib_per_sec": 0.0,
+          "read_ms": 0.0,
+          "util_percent": 0.0,
+          "average_queue_depth": 0.0
+        }
+      },
+      "trial": 4
+    }
+  ],
+  "summary": [
+    {
+      "concurrency": 1,
+      "cpu_available_median_gib_per_sec": 13.903626298276741,
+      "cpu_full_eviction_median_gib_per_sec": 13.565940327342274,
+      "pressure_over_available": 0.9757123815262266,
+      "bandwidth_loss_percent": 2.4287618473773365
+    },
+    {
+      "concurrency": 2,
+      "cpu_available_median_gib_per_sec": 20.270175544863775,
+      "cpu_full_eviction_median_gib_per_sec": 22.048796130081293,
+      "pressure_over_available": 1.0877456922502182,
+      "bandwidth_loss_percent": -8.774569225021821
+    },
+    {
+      "concurrency": 4,
+      "cpu_available_median_gib_per_sec": 24.44192583298641,
+      "cpu_full_eviction_median_gib_per_sec": 24.044295603575687,
+      "pressure_over_available": 0.9837316326001576,
+      "bandwidth_loss_percent": 1.6268367399842387
+    },
+    {
+      "concurrency": 8,
+      "cpu_available_median_gib_per_sec": 25.151997292437795,
+      "cpu_full_eviction_median_gib_per_sec": 24.99027230222256,
+      "pressure_over_available": 0.9935700935263754,
+      "bandwidth_loss_percent": 0.6429906473624625
+    }
+  ]
+}

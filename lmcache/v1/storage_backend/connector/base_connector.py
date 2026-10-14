@@ -105,12 +105,34 @@ class RemoteConnector(metaclass=abc.ABCMeta):
             # full chunk, return directly
             return memory_obj
 
-        # NOTE: for unfull chunk, we have no way to verify
-        shape_list = list(memory_obj.meta.shape)
-        shape_list[2] = bytes_read // self.single_token_size
-        actual_shape = torch.Size(shape_list)
+        # NOTE: for an unfull chunk, all shape views and their cached byte
+        # boundaries must describe the same logical token count.  Updating only
+        # ``meta.shape`` leaves ``meta.shapes`` and TensorMemoryObj's
+        # ``group_prefix_sum`` at the full-chunk size.  That breaks MLA's
+        # save-only-first-rank broadcast path when the final chunk is partial.
+        num_tokens = bytes_read // self.single_token_size
+        actual_shapes = []
+        for shape in memory_obj.meta.shapes or [memory_obj.meta.shape]:
+            shape_list = list(shape)
+            shape_list[2] = num_tokens
+            actual_shapes.append(torch.Size(shape_list))
+
         memory_obj.raw_data = memory_obj.raw_data[:bytes_read]
-        memory_obj.meta.shape = actual_shape
+        memory_obj.meta.shape = actual_shapes[0]
+        if memory_obj.meta.shapes is not None:
+            memory_obj.meta.shapes = actual_shapes
+
+        # TensorMemoryObj caches the byte offsets for each shape group.
+        if hasattr(memory_obj, "group_prefix_sum"):
+            assert memory_obj.meta.dtypes is not None
+            group_prefix_sum = [0]
+            for shape, dtype in zip(
+                actual_shapes, memory_obj.meta.dtypes, strict=True
+            ):
+                group_prefix_sum.append(
+                    group_prefix_sum[-1] + shape.numel() * dtype.itemsize
+                )
+            memory_obj.group_prefix_sum = group_prefix_sum
 
         return memory_obj
 

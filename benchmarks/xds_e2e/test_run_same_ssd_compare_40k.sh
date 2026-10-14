@@ -11,7 +11,7 @@ output=$(BENCHMARK_DRY_RUN=1 RESULT_DIR=/tmp/lmcache-v043-same-ssd-dry-run \
 filesystem_marker='switch_lmcache_test_ssds.sh filesystem --yes --confirm ERASE-aa-d3-ec-ed'
 disk_marker='BACKEND=disk'
 xds_marker='switch_lmcache_test_ssds.sh xds --yes --confirm ERASE-aa-d3-ec-ed'
-service_marker='xds_service --config /home/yangxc/workspace/xDS/configs/setup_qwen3_30b_tp4_numa1.json --service-name xds0'
+service_marker='xds_service --config /home/yangxc/workspace/xDS/configs/setup_qwen3_30b_tp4_numa1_layerwise.json --service-name xds0'
 cascade_marker='BACKEND=cascadekv'
 
 for marker in "$filesystem_marker" "$disk_marker" "$xds_marker" \

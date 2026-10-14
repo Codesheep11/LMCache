@@ -3,6 +3,7 @@
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
+import json
 import os
 import threading
 import time
@@ -135,6 +136,10 @@ class LocalDiskBackend(StorageBackendInterface):
 
         if config.extra_config is not None:
             self.use_odirect = config.extra_config.get("use_odirect", False)
+        self.benchmark_transfer_metrics = config.get_extra_config_value(
+            "benchmark_transfer_metrics", False
+        )
+        self.worker_id = metadata.worker_id if metadata is not None else -1
         logger.info("Using O_DIRECT for disk I/O: %s", self.use_odirect)
 
         self.disk_worker = LocalDiskWorker(loop)
@@ -380,10 +385,12 @@ class LocalDiskBackend(StorageBackendInterface):
     def get_blocking(
         self,
         key: CacheEngineKey,
+        profile: Optional[dict[str, int]] = None,
     ) -> Optional[MemoryObj]:
         """
         Blocking get function.
         """
+        metadata_start_ns = time.monotonic_ns()
         self.disk_lock.acquire()
         if key not in self.dict:
             self.disk_lock.release()
@@ -401,11 +408,50 @@ class LocalDiskBackend(StorageBackendInterface):
         assert shape is not None
 
         self.disk_lock.release()
+        metadata_end_ns = time.monotonic_ns()
         memory_obj = self.load_bytes_from_disk(
-            key, path, dtype=dtype, shape=shape, fmt=fmt
+            key,
+            path,
+            dtype=dtype,
+            shape=shape,
+            fmt=fmt,
+            profile=profile,
         )
+        if profile is not None:
+            profile["metadata_ns"] += metadata_end_ns - metadata_start_ns
 
         return memory_obj
+
+    def batched_get_blocking(
+        self, keys: List[CacheEngineKey]
+    ) -> List[Optional[MemoryObj]]:
+        """Read one request batch and emit one storage-pipeline metric."""
+        metric_start_ns = time.monotonic_ns()
+        profile = {"metadata_ns": 0, "allocate_ns": 0, "read_ns": 0}
+        memory_objs = [self.get_blocking(key, profile) for key in keys]
+        metric_end_ns = time.monotonic_ns()
+        if self.benchmark_transfer_metrics:
+            logger.info(
+                "[LOCAL_DISK_READ_METRICS] %s",
+                json.dumps(
+                    {
+                        "worker_id": self.worker_id,
+                        "bytes": sum(
+                            memory_obj.get_size()
+                            for memory_obj in memory_objs
+                            if memory_obj is not None
+                        ),
+                        "file_count": len(keys),
+                        "start_ns": metric_start_ns,
+                        "end_ns": metric_end_ns,
+                        "seconds": (metric_end_ns - metric_start_ns) / 1e9,
+                        "use_odirect": self.use_odirect,
+                        **profile,
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        return memory_objs
 
     async def batched_get_non_blocking(
         self,
@@ -548,9 +594,12 @@ class LocalDiskBackend(StorageBackendInterface):
         """
 
         logger.debug("Executing `async_load_bytes` from disk.")
+        metric_start_ns = time.monotonic_ns()
+        metric_bytes = 0
         # TODO (Jiayi): handle the case where loading fails.
         for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
             buffer = mem_obj.byte_array
+            metric_bytes += len(buffer)
             self.read_file(key, buffer, path)
 
             # TODO(Jiayi): Please recover the metadata in a more
@@ -562,6 +611,24 @@ class LocalDiskBackend(StorageBackendInterface):
             self.dict[key].unpin()
             self.disk_lock.release()
 
+        if self.benchmark_transfer_metrics:
+            metric_end_ns = time.monotonic_ns()
+            logger.info(
+                "[LOCAL_DISK_READ_METRICS] %s",
+                json.dumps(
+                    {
+                        "worker_id": self.worker_id,
+                        "bytes": metric_bytes,
+                        "file_count": len(memory_objs),
+                        "start_ns": metric_start_ns,
+                        "end_ns": metric_end_ns,
+                        "seconds": (metric_end_ns - metric_start_ns) / 1e9,
+                        "use_odirect": self.use_odirect,
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+
         return memory_objs
 
     def load_bytes_from_disk(
@@ -571,16 +638,41 @@ class LocalDiskBackend(StorageBackendInterface):
         dtype: torch.dtype,
         shape: torch.Size,
         fmt: MemoryFormat,
+        profile: Optional[dict[str, int]] = None,
     ) -> Optional[MemoryObj]:
         """
         Load bytearray from disk.
         """
 
-        memory_obj = self.local_cpu_backend.allocate(shape, dtype, fmt)
-        assert memory_obj is not None, "Memory allocation failed during disk load."
+        allocate_start_ns = time.monotonic_ns()
+        # A disk hit still needs a CPU staging block.  Do not spin forever
+        # when all staging blocks are pinned by other concurrent retrieves.
+        # Returning a miss lets the engine recompute this chunk and releases
+        # the already-loaded objects through the normal partial-hit path.
+        memory_obj = self.local_cpu_backend.allocate(
+            shape,
+            dtype,
+            fmt,
+            busy_loop=False,
+        )
+        allocate_end_ns = time.monotonic_ns()
+        if memory_obj is None:
+            logger.warning(
+                "CPU staging allocation failed during blocking disk load for key %s; "
+                "returning a cache miss instead of waiting indefinitely.",
+                key,
+            )
+            if profile is not None:
+                profile["allocate_ns"] += allocate_end_ns - allocate_start_ns
+            return None
 
         buffer = memory_obj.byte_array
+        read_start_ns = time.monotonic_ns()
         self.read_file(key, buffer, path)
+        read_end_ns = time.monotonic_ns()
+        if profile is not None:
+            profile["allocate_ns"] += allocate_end_ns - allocate_start_ns
+            profile["read_ns"] += read_end_ns - read_start_ns
 
         # TODO(Jiayi): Please recover the metadata in a more
         # elegant way in the future.

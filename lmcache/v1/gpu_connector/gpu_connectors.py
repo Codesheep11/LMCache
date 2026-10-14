@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 import abc
+import ctypes
+import time
 
 # Third Party
 import torch
@@ -23,8 +25,14 @@ from lmcache.v1.gpu_connector.utils import (
     get_tokens_per_layer,
     permute_kv_caches_to_contiguous,
 )
+from lmcache.v1.gpu_connector.xds_readv import XDSReadvPlan, plan_paged_readv_batch
 from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
-from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.memory_management import (
+    LayerwiseStagingMemoryObj,
+    MemoryFormat,
+    MemoryObj,
+    TensorMemoryObj,
+)
 from lmcache.v1.metadata import LMCacheMetadata
 
 if torch.cuda.is_available():
@@ -32,6 +40,77 @@ if torch.cuda.is_available():
     import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+
+
+def _coalesce_contiguous_host_chunks(
+    starts: List[int],
+    ends: List[int],
+    memory_objs: List[MemoryObj],
+) -> list[tuple[int, int, torch.Tensor]]:
+    """Expose adjacent registered host chunks as larger zero-copy tensor views."""
+    if (
+        len(memory_objs) == 1
+        and (
+            isinstance(memory_objs[0], LayerwiseStagingMemoryObj)
+            or hasattr(memory_objs[0], "chunk_count")
+        )
+    ):
+        layer_view = memory_objs[0]
+        if len(starts) != len(ends) or layer_view.chunk_count != len(starts):
+            raise ValueError(
+                "layer staging view does not match the request chunk count"
+            )
+        tensor = layer_view.tensor
+        assert tensor is not None
+        if not starts or tensor.shape[0] != ends[-1] - starts[0]:
+            raise ValueError(
+                "layer staging view does not cover the requested token range"
+            )
+        return [(0, len(starts), tensor)]
+
+    if not (len(starts) == len(ends) == len(memory_objs)):
+        raise ValueError("starts, ends, and memory_objs must have the same length")
+
+    runs: list[tuple[int, int, torch.Tensor]] = []
+    run_start = 0
+    while run_start < len(memory_objs):
+        first = memory_objs[run_start]
+        run_end = run_start + 1
+        if isinstance(first, TensorMemoryObj) and first.raw_tensor.device.type == "cpu":
+            while run_end < len(memory_objs):
+                previous = memory_objs[run_end - 1]
+                current = memory_objs[run_end]
+                if not (
+                    isinstance(previous, TensorMemoryObj)
+                    and isinstance(current, TensorMemoryObj)
+                    and current.raw_tensor.device.type == "cpu"
+                    and previous.get_dtype() == current.get_dtype()
+                    and previous.get_memory_format() == current.get_memory_format()
+                    and previous.data_ptr + previous.get_size() == current.data_ptr
+                    and ends[run_end - 1] == starts[run_end]
+                ):
+                    break
+                run_end += 1
+
+        if run_end - run_start == 1:
+            tensor = first.tensor
+            assert tensor is not None
+        else:
+            total_bytes = sum(
+                memory_obj.get_size() for memory_obj in memory_objs[run_start:run_end]
+            )
+            host_array = (ctypes.c_uint8 * total_bytes).from_address(first.data_ptr)
+            raw_tensor = torch.frombuffer(host_array, dtype=torch.uint8)
+            shape = list(first.get_shape())
+            # KV_T2D's logical token count is described by the request ranges.
+            # MemoryObj.get_num_tokens() follows the memory-format token axis and
+            # is not the leading dimension for this layer-major tensor.
+            shape[0] = ends[run_end - 1] - starts[run_start]
+            tensor = raw_tensor.view(first.get_dtype()).view(shape)
+
+        runs.append((run_start, run_end, tensor))
+        run_start = run_end
+    return runs
 
 
 class GPUConnectorInterface(metaclass=abc.ABCMeta):
@@ -136,12 +215,16 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
             # permute_kv_caches_to_contiguous is a no-op when already contiguous.
             self.kvcaches = permute_kv_caches_to_contiguous(self.kvcaches)
 
-    def record_transfer_event(self, direction: str) -> torch.cuda.Event:
+    def record_transfer_event(
+        self, direction: str, enable_timing: bool = False
+    ) -> torch.cuda.Event:
         """Record completion of the connector's current load or store work.
 
         Args:
             direction: ``"load"`` for staging-to-KV work on the current stream,
                 or ``"store"`` for KV-to-staging work on ``store_stream``.
+            enable_timing: Create an event that supports CUDA elapsed-time
+                measurement. Leave disabled on the normal synchronization path.
 
         Returns:
             A CUDA event recorded after the selected transfer stream's work.
@@ -150,14 +233,27 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
             ValueError: If ``direction`` is not ``"load"`` or ``"store"``.
         """
         if direction == "load":
-            stream = torch.cuda.current_stream()
+            stream = self.load_stream
         elif direction == "store":
             stream = self.store_stream
         else:
             raise ValueError(f"unknown transfer direction: {direction}")
-        event = torch.cuda.Event()
+        event = torch.cuda.Event(enable_timing=enable_timing)
         event.record(stream)
         return event
+
+    def set_transfer_stream_priority(self, direction: str, priority: int) -> None:
+        """Replace an idle transfer stream with the requested CUDA priority."""
+        marker = f"_lmcache_{direction}_stream_priority"
+        if getattr(self, marker, None) == priority:
+            return
+        if direction == "load":
+            self.load_stream = torch.cuda.Stream(priority=priority)
+        elif direction == "store":
+            self.store_stream = torch.cuda.Stream(priority=priority)
+        else:
+            raise ValueError(f"unknown transfer direction: {direction}")
+        setattr(self, marker, priority)
 
 
 class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
@@ -434,6 +530,65 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.from_gpu(memory_obj, start, end, **kwargs)
+
+    def plan_xds_readv(
+        self,
+        shapes: List[torch.Size],
+        dtypes: List[torch.dtype],
+        fmt: MemoryFormat,
+        start: int,
+        end: int,
+        io_unit: int,
+        **kwargs: Any,
+    ) -> Optional[XDSReadvPlan]:
+        """Return a direct-I/O plan or None for a layout requiring a kernel.
+
+        Accepts full NHD blocks in KV_2LTD format. kwargs supplies kvcaches and
+        slot_mapping as in to_gpu. Cached prefix fragments use the old path.
+        """
+        plans = self.plan_xds_readv_batch(
+            [(shapes, dtypes, fmt, start, end)], io_unit, **kwargs
+        )
+        return plans[0] if plans else None
+
+    def plan_xds_readv_batch(
+        self,
+        chunks: List[
+            tuple[List[torch.Size], List[torch.dtype], MemoryFormat, int, int]
+        ],
+        io_unit: int,
+        **kwargs: Any,
+    ) -> Optional[List[XDSReadvPlan]]:
+        """Validate target layout once and plan source-ordered chunk reads.
+
+        chunks contains (shapes, dtypes, format, start, end) per stored chunk.
+        kwargs carries kvcaches and slot_mapping (optionally slot_mapping_cpu).
+        Return None before DMA for unsupported or overlapping destinations.
+        Returned plans own tensors; the engine must retain block ownership.
+        """
+        if not chunks:
+            return []
+        if self.use_mla or any(
+            kwargs.get("vllm_cached_tokens", 0) > chunk[3] for chunk in chunks
+        ):
+            return None
+        self.initialize_kvcaches_ptr(**kwargs)
+        if not isinstance(self.kvcaches, list) or not self.kvcaches:
+            return None
+        slots = kwargs.get("slot_mapping_cpu", kwargs.get("slot_mapping"))
+        if not isinstance(slots, torch.Tensor):
+            return None
+        fmt_gpu = discover_gpu_kv_format(
+            self.kvcaches, EngineType.VLLM, layout_hints=self.layout_hints
+        )
+        layouts = {
+            lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS: "2NB",
+            lmc_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS: "NB2",
+        }
+        layout = layouts.get(fmt_gpu)
+        if layout is None:
+            return None
+        return plan_paged_readv_batch(self.kvcaches, chunks, slots, io_unit, layout)
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         kv_size = 1 if self.use_mla else 2
@@ -722,13 +877,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         the gpu buffer size in gpu connector.
         Also, the first request might be a bit slower due to buffer creation.
         """
-        if self.use_gpu and self.gpu_buffer_allocator is None:
-            logger.info("Lazily initializing GPU buffer.")
-            # NOTE (Jiayi): We use the first layer to determine the gpu buffer size.
-            # NOTE (Jiayi): Using the exact number of tokens in the first layer
-            # is okay since fragmentation shouldn't exist in the `gpu_buffer_allocator`
-            # in layerwise mode.
-
+        if not hasattr(self, "gpu_kv_format"):
             kv_caches = ensure_contiguous_kv_caches(
                 kv_caches, kv_layout=self.layout_hints.get("kv_layout")
             )
@@ -741,10 +890,18 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             self.elements_per_layer = get_elements_per_layer(
                 kv_caches, self.gpu_kv_format
             )
+
+        if self.use_gpu and self.gpu_buffer_allocator is None:
+            logger.info("Lazily initializing GPU buffer.")
+            # NOTE (Jiayi): We use the first layer to determine the gpu buffer size.
+            # NOTE (Jiayi): Using the exact number of tokens in the first layer
+            # is okay since fragmentation shouldn't exist in the `gpu_buffer_allocator`
+            # in layerwise mode.
             logger.info(
                 f"Lazily initializing GPU buffer (max tokens={self.tokens_per_layer})."
             )
-            gpu_buffer_size = self.elements_per_layer * self.element_size
+            # Two layer slots allow an optional H2D/scatter ping-pong pipeline.
+            gpu_buffer_size = 2 * self.elements_per_layer * self.element_size
             self.gpu_buffer_allocator = GPUMemoryAllocator(
                 gpu_buffer_size, device=self.device
             )
@@ -1138,13 +1295,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         the gpu buffer size in gpu connector.
         Also, the first request might be a bit slower due to buffer creation.
         """
-        if self.use_gpu and self.gpu_buffer_allocator is None:
-            logger.info("Lazily initializing GPU buffer.")
-            # NOTE (Jiayi): We use the first layer to determine the gpu buffer size.
-            # NOTE (Jiayi): Using the exact number of tokens in the first layer
-            # is okay since fragmentation shouldn't exist in the `gpu_buffer_allocator`
-            # in layerwise mode.
-
+        if not hasattr(self, "gpu_kv_format"):
             kv_caches = ensure_contiguous_kv_caches(
                 kv_caches, kv_layout=self.layout_hints.get("kv_layout")
             )
@@ -1157,6 +1308,13 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             self.elements_per_layer = get_elements_per_layer(
                 kv_caches, self.gpu_kv_format
             )
+
+        if self.use_gpu and self.gpu_buffer_allocator is None:
+            logger.info("Lazily initializing GPU buffer.")
+            # NOTE (Jiayi): We use the first layer to determine the gpu buffer size.
+            # NOTE (Jiayi): Using the exact number of tokens in the first layer
+            # is okay since fragmentation shouldn't exist in the `gpu_buffer_allocator`
+            # in layerwise mode.
             logger.info(
                 f"Lazily initializing GPU buffer (max tokens={self.tokens_per_layer})."
             )
@@ -1209,71 +1367,172 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         sync: bool = kwargs["sync"]
+        h2d_scatter_overlap = bool(kwargs.get("h2d_scatter_overlap", False))
+        timeline_trace = kwargs.get("layerwise_timeline_trace")
+        h2d_copy_completion_events: Optional[list[torch.cuda.Event]] = kwargs.get(
+            "h2d_copy_completion_events"
+        )
+        phase_events: list[
+            tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event]
+        ] = []
+        if timeline_trace is not None:
+            timeline_trace["gpu_connector_setup_start_ns"] = time.monotonic_ns()
 
         self._lazy_initialize_buffer(self.kvcaches)
 
+        if timeline_trace is not None:
+            timeline_trace["slot_mapping_build_start_ns"] = time.monotonic_ns()
         slot_mapping_chunks = []
         for start, end in zip(starts, ends, strict=False):
             slot_mapping_chunks.append(slot_mapping[start:end])
 
         # TODO(Jiayi): Optimize away this `cat`
         slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
+        if timeline_trace is not None:
+            timeline_trace["slot_mapping_build_end_ns"] = time.monotonic_ns()
 
         num_tokens = len(slot_mapping_full)
 
-        tmp_gpu_buffer_obj: Optional[MemoryObj] = None
+        tmp_gpu_buffer_objs: list[MemoryObj] = []
+        if timeline_trace is not None:
+            timeline_trace["gpu_staging_allocate_start_ns"] = time.monotonic_ns()
         if self.use_gpu:
             buffer_shape = self.get_shape(num_tokens)
             assert self.gpu_buffer_allocator is not None
-            tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-                buffer_shape, self.dtype, MemoryFormat.KV_T2D
+            buffer_count = 2 if h2d_scatter_overlap else 1
+            for _ in range(buffer_count):
+                tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+                    buffer_shape, self.dtype, MemoryFormat.KV_T2D
+                )
+                assert tmp_gpu_buffer_obj is not None, (
+                    "Failed to allocate GPU buffer in GPUConnector"
+                )
+                assert tmp_gpu_buffer_obj.tensor is not None
+                tmp_gpu_buffer_objs.append(tmp_gpu_buffer_obj)
+        if timeline_trace is not None:
+            timeline_trace["gpu_staging_allocate_end_ns"] = time.monotonic_ns()
+
+        h2d_stream = self.load_stream
+        if h2d_scatter_overlap:
+            h2d_stream = torch.cuda.Stream(
+                priority=getattr(self, "_lmcache_load_stream_priority", 0)
             )
-            assert tmp_gpu_buffer_obj is not None, (
-                "Failed to allocate GPU buffer in GPUConnector"
-            )
-            assert tmp_gpu_buffer_obj.tensor is not None
+        buffer_reuse_events: list[Optional[torch.cuda.Event]] = [
+            None for _ in tmp_gpu_buffer_objs
+        ]
 
         offset = starts[0]
         current_stream = torch.cuda.current_stream()
+        if timeline_trace is not None:
+            timeline_trace["gpu_connector_setup_end_ns"] = time.monotonic_ns()
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = yield
+            layer_trace = (
+                timeline_trace["layers"][layer_id]
+                if timeline_trace is not None
+                else None
+            )
             if sync:
                 current_stream.wait_stream(self.load_stream)
             if layer_id > 0:
                 logger.debug(f"Finished loading layer {layer_id - 1}")
 
-            # memobj -> gpu_buffer -> kvcaches
-            with torch.cuda.stream(self.load_stream):
-                for start, end, memory_obj in zip(
-                    starts, ends, memory_objs_layer, strict=False
-                ):
-                    # Validate memory format
-                    if self.use_mla:
-                        assert memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT, (
-                            f"Expected memory format {MemoryFormat.KV_MLA_FMT}, "
-                            f"got {memory_obj.metadata.fmt}"
-                        )
-                    else:
-                        assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D, (
-                            f"Expected memory format {MemoryFormat.KV_T2D}, "
-                            f"got {memory_obj.metadata.fmt}"
-                        )
-                    if self.use_gpu:
-                        tmp_gpu_buffer_obj.tensor[start - offset : end - offset].copy_(
-                            memory_obj.tensor, non_blocking=True
-                        )
-                    else:
-                        lmc_ops.single_layer_kv_transfer(
-                            memory_obj.tensor,
-                            self.kvcaches[layer_id],
-                            slot_mapping_full,
-                            lmc_ops.TransferDirection.H2D,
-                            self.gpu_kv_format,
-                            token_major=True,
-                        )
+            # memobj -> GPU ping-pong buffer -> paged KV. Layers remain separate,
+            # while layer N+1's copy can overlap layer N's scatter kernel.
+            copy_start_event = None
+            copy_end_event = None
+            scatter_end_event = None
+            if timeline_trace is not None:
+                copy_start_event = torch.cuda.Event(enable_timing=True)
+                copy_end_event = torch.cuda.Event(enable_timing=True)
+                scatter_end_event = torch.cuda.Event(enable_timing=True)
+            for memory_obj in memory_objs_layer:
+                if self.use_mla:
+                    assert memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT, (
+                        f"Expected memory format {MemoryFormat.KV_MLA_FMT}, "
+                        f"got {memory_obj.metadata.fmt}"
+                    )
+                else:
+                    assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D, (
+                        f"Expected memory format {MemoryFormat.KV_T2D}, "
+                        f"got {memory_obj.metadata.fmt}"
+                    )
 
-                if self.use_gpu:
+            direct_xds_gpu_source = (
+                len(memory_objs_layer) == 1
+                and getattr(memory_objs_layer[0], "chunk_count", 0) == len(starts)
+                and memory_objs_layer[0].tensor is not None
+                and memory_objs_layer[0].tensor.device.type == "cuda"
+            )
+            if direct_xds_gpu_source:
+                source_tensor = memory_objs_layer[0].tensor
+                assert source_tensor is not None
+                if source_tensor.shape[0] != num_tokens:
+                    raise ValueError(
+                        "xDS GPU layer staging does not cover requested tokens"
+                    )
+                with torch.cuda.stream(self.load_stream):
+                    if copy_start_event is not None:
+                        copy_start_event.record(self.load_stream)
+                    if copy_end_event is None:
+                        copy_end_event = torch.cuda.Event()
+                    copy_end_event.record(self.load_stream)
+                    if h2d_copy_completion_events is not None:
+                        h2d_copy_completion_events.append(copy_end_event)
+                    lmc_ops.single_layer_kv_transfer(
+                        source_tensor,
+                        self.kvcaches[layer_id],
+                        slot_mapping_full,
+                        lmc_ops.TransferDirection.H2D,
+                        self.gpu_kv_format,
+                        token_major=True,
+                    )
+                    if scatter_end_event is not None:
+                        scatter_end_event.record(self.load_stream)
+                if layer_trace is not None:
+                    assert copy_start_event is not None
+                    assert scatter_end_event is not None
+                    phase_events.append(
+                        (copy_start_event, copy_end_event, scatter_end_event)
+                    )
+                    layer_trace["direct_xds_gpu_staging"] = True
+                continue
+
+            if self.use_gpu:
+                buffer_index = layer_id % len(tmp_gpu_buffer_objs)
+                tmp_gpu_buffer_obj = tmp_gpu_buffer_objs[buffer_index]
+                assert tmp_gpu_buffer_obj.tensor is not None
+                coalesce_start_ns = time.monotonic_ns()
+                coalesced_runs = _coalesce_contiguous_host_chunks(
+                    starts, ends, memory_objs_layer
+                )
+                coalesce_end_ns = time.monotonic_ns()
+                copy_enqueue_start_ns = time.monotonic_ns()
+                with torch.cuda.stream(h2d_stream):
+                    reuse_event = buffer_reuse_events[buffer_index]
+                    if reuse_event is not None:
+                        h2d_stream.wait_event(reuse_event)
+                    if copy_start_event is not None:
+                        copy_start_event.record(h2d_stream)
+                    for (
+                        run_start,
+                        run_end,
+                        host_tensor,
+                    ) in coalesced_runs:
+                        tmp_gpu_buffer_obj.tensor[
+                            starts[run_start] - offset : ends[run_end - 1] - offset
+                        ].copy_(host_tensor, non_blocking=True)
+                    if copy_end_event is None:
+                        copy_end_event = torch.cuda.Event()
+                    copy_end_event.record(h2d_stream)
+                    if h2d_copy_completion_events is not None:
+                        h2d_copy_completion_events.append(copy_end_event)
+                copy_enqueue_end_ns = time.monotonic_ns()
+
+                scatter_enqueue_start_ns = time.monotonic_ns()
+                with torch.cuda.stream(self.load_stream):
+                    self.load_stream.wait_event(copy_end_event)
                     lmc_ops.single_layer_kv_transfer(
                         tmp_gpu_buffer_obj.tensor,
                         self.kvcaches[layer_id],
@@ -1282,14 +1541,80 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         self.gpu_kv_format,
                         token_major=True,
                     )
+                    reuse_event = (
+                        scatter_end_event
+                        if scatter_end_event is not None
+                        else torch.cuda.Event()
+                    )
+                    reuse_event.record(self.load_stream)
+                    buffer_reuse_events[buffer_index] = reuse_event
+                scatter_enqueue_end_ns = time.monotonic_ns()
+                if layer_trace is not None:
+                    layer_trace["host_coalesce_start_ns"] = coalesce_start_ns
+                    layer_trace["host_coalesce_end_ns"] = coalesce_end_ns
+                    layer_trace["host_coalesced_run_count"] = len(coalesced_runs)
+                    layer_trace["copy_enqueue_start_ns"] = copy_enqueue_start_ns
+                    layer_trace["copy_enqueue_end_ns"] = copy_enqueue_end_ns
+                    layer_trace["scatter_enqueue_start_ns"] = (
+                        scatter_enqueue_start_ns
+                    )
+                    layer_trace["scatter_enqueue_end_ns"] = scatter_enqueue_end_ns
+                    layer_trace["gpu_staging_buffer_index"] = buffer_index
+            else:
+                with torch.cuda.stream(self.load_stream):
+                    if copy_start_event is not None:
+                        copy_start_event.record(self.load_stream)
+                    for (
+                        run_start,
+                        run_end,
+                        host_tensor,
+                    ) in _coalesce_contiguous_host_chunks(
+                        starts, ends, memory_objs_layer
+                    ):
+                        lmc_ops.single_layer_kv_transfer(
+                            host_tensor,
+                            self.kvcaches[layer_id],
+                            slot_mapping[starts[run_start] : ends[run_end - 1]],
+                            lmc_ops.TransferDirection.H2D,
+                            self.gpu_kv_format,
+                            token_major=True,
+                        )
+                    if copy_end_event is not None:
+                        copy_end_event.record(self.load_stream)
+                    elif h2d_copy_completion_events is not None:
+                        copy_end_event = torch.cuda.Event()
+                        copy_end_event.record(self.load_stream)
+                    if h2d_copy_completion_events is not None:
+                        assert copy_end_event is not None
+                        h2d_copy_completion_events.append(copy_end_event)
+                    if scatter_end_event is not None:
+                        scatter_end_event.record(self.load_stream)
+            if scatter_end_event is not None:
+                assert copy_start_event is not None
+                assert copy_end_event is not None
+                phase_events.append(
+                    (copy_start_event, copy_end_event, scatter_end_event)
+                )
         yield
+
+        if timeline_trace is not None:
+            for layer_trace, events in zip(
+                timeline_trace["layers"], phase_events, strict=True
+            ):
+                copy_start_event, copy_end_event, scatter_end_event = events
+                layer_trace["gpu_copy_cuda_ms"] = copy_start_event.elapsed_time(
+                    copy_end_event
+                )
+                layer_trace["gpu_scatter_cuda_ms"] = copy_end_event.elapsed_time(
+                    scatter_end_event
+                )
 
         # synchronize the last layer
         if sync:
             current_stream.wait_stream(self.load_stream)
 
         # free the buffer memory
-        if tmp_gpu_buffer_obj is not None:
+        for tmp_gpu_buffer_obj in tmp_gpu_buffer_objs:
             tmp_gpu_buffer_obj.ref_count_down()
 
         logger.debug(f"Finished loading all {self.num_layers} layers.")
@@ -1444,6 +1769,12 @@ class SGLangGPUConnector(GPUConnectorInterface):
         self.num_layers = num_layers
 
         self.kv_cache_pointers_on_gpu: dict[int, torch.Tensor] = {}
+        # SGLang invokes ``to_gpu`` once per restored chunk.  The KV pool tensors
+        # are stable for the lifetime of a scheduler process, so copying the same
+        # pointer table to CUDA for every chunk only adds host-side serialization.
+        # Keep one signature per CUDA device and refresh the table if SGLang ever
+        # replaces its KV pool tensors.
+        self._kv_cache_pointer_signatures: dict[int, tuple[int, ...]] = {}
         self.page_buffer_size = 0
 
         self.gpu_buffer: Optional[torch.Tensor] = None
@@ -1453,6 +1784,7 @@ class SGLangGPUConnector(GPUConnectorInterface):
         self.kv_cache_pointers = torch.empty(
             self.num_kv_cache, dtype=torch.int64, device="cpu"
         )
+        self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
 
         if use_gpu:
@@ -1468,6 +1800,7 @@ class SGLangGPUConnector(GPUConnectorInterface):
             )
             logger.info(f"GPU buffer: {self.gpu_buffer.shape}")
 
+    @torch.inference_mode()
     def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> torch.Tensor:
         # Discover format first to handle flattening correctly
         self.gpu_kv_format = discover_gpu_kv_format(kv_caches, EngineType.SGLANG)
@@ -1485,14 +1818,17 @@ class SGLangGPUConnector(GPUConnectorInterface):
             f"Expected {self.num_kv_cache} KV caches, got {len(flat_kv_caches)}"
         )
 
-        self.kv_cache_pointers.numpy()[:] = [t.data_ptr() for t in flat_kv_caches]
+        pointer_signature = tuple(t.data_ptr() for t in flat_kv_caches)
         assert device.type == "cuda", "The device should be CUDA."
         idx = device.index
         if idx not in self.kv_cache_pointers_on_gpu:
             self.kv_cache_pointers_on_gpu[idx] = torch.empty(
                 self.num_kv_cache, dtype=torch.int64, device=device
             )
-        self.kv_cache_pointers_on_gpu[idx].copy_(self.kv_cache_pointers)
+        if self._kv_cache_pointer_signatures.get(idx) != pointer_signature:
+            self.kv_cache_pointers.numpy()[:] = pointer_signature
+            self.kv_cache_pointers_on_gpu[idx].copy_(self.kv_cache_pointers)
+            self._kv_cache_pointer_signatures[idx] = pointer_signature
 
         # sglang MLA kv_caches[0].shape: [num_pages * page_size, 1, head_size]
         # sglang MHA kv_caches: [[k_list], [v_list]]
@@ -1622,7 +1958,10 @@ class SGLangGPUConnector(GPUConnectorInterface):
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
     def get_shape(self, num_tokens: int) -> torch.Size:
-        return torch.Size([2, self.num_layers, num_tokens, self.hidden_dim_size])
+        kv_size = 1 if self.use_mla else 2
+        return torch.Size(
+            [kv_size, self.num_layers, num_tokens, self.hidden_dim_size]
+        )
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):

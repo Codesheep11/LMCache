@@ -636,8 +636,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
         if memory_objs is not None or not eviction:
             return memory_objs
 
-        assert isinstance(self.memory_allocator, MixedMemoryAllocator)
-
         evict_keys_count = 0
         num_attempts = 0
         while True:

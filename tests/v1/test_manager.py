@@ -345,6 +345,10 @@ class TestLMCacheManagerHelpers:
         config.enable_pd = True
         assert need_gpu_interm_buffer(config) is False
 
+        config.enable_pd = False
+        config.extra_config = {"cascadekv_direct_paged_h2d": True}
+        assert need_gpu_interm_buffer(config) is False
+
 
 class TestLMCacheManagerValidation:
     """Tests for validate_mla_config (now in utils)."""

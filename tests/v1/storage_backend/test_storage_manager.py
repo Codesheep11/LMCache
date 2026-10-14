@@ -21,6 +21,7 @@ Key scenarios tested:
 
 # Standard
 import asyncio
+import threading
 
 # Third Party
 import pytest
@@ -57,6 +58,39 @@ class MockAsyncLookupServer:
 
     def send_response_to_scheduler(self, lookup_id: str, retrieved_length: int):
         self.responses.append((lookup_id, retrieved_length))
+
+
+class MockLayerwiseBackend:
+    """Record layerwise non-blocking reads made by StorageManager."""
+
+    def __init__(self):
+        self.requested_keys = []
+        self.request_condition = threading.Condition()
+
+    async def batched_get_non_blocking(self, lookup_id, keys):
+        """Record and immediately complete one layer read."""
+        with self.request_condition:
+            self.requested_keys.append((lookup_id, keys))
+            self.request_condition.notify_all()
+        return keys
+
+    def batched_get_blocking(self, keys):
+        """Record a synchronous cross-layer backend batch."""
+        with self.request_condition:
+            self.requested_keys.append(("fake_lookup_id", keys))
+            self.request_condition.notify_all()
+        return keys
+
+    def wait_for_request_count(self, count: int) -> bool:
+        """Wait until the requested number of layer reads have started."""
+        with self.request_condition:
+            return self.request_condition.wait_for(
+                lambda: len(self.requested_keys) >= count,
+                timeout=1,
+            )
+
+    def close(self) -> None:
+        """Close the mock backend."""
 
 
 @pytest.fixture
@@ -236,7 +270,6 @@ class TestStorageManagerPrefetchCallback:
         # Verify: Tier 0 objects should NOT have ref_count_down called
         for obj in tier0_objs:
             assert not obj.ref_count_down_called
-
         # Verify: All Tier 1 and Tier 2 objects should have ref_count_down called
         for obj in tier1_objs + tier2_objs:
             assert obj.ref_count_down_called
@@ -317,3 +350,105 @@ class TestStorageManagerPrefetchCallback:
         # (no remaining chunks in current tier, no subsequent tiers)
         for obj in tier0_objs:
             assert not obj.ref_count_down_called
+
+
+def test_layerwise_batched_get_uses_bounded_read_ahead(
+    storage_manager,
+) -> None:
+    """Layerwise reads sequentially fill and then roll a bounded buffer."""
+    backend = MockLayerwiseBackend()
+    storage_manager.storage_backends["CascadeKVBackend"] = backend
+    storage_manager.config.extra_config = {
+        "cascadekv_layerwise_read_ahead": 2,
+    }
+    layers = [["layer-0"], ["layer-1"], ["layer-2"]]
+    producer_loop = asyncio.new_event_loop()
+
+    def keep_test_loop_awake() -> None:
+        producer_loop.call_later(0.01, keep_test_loop_awake)
+
+    producer_loop.call_soon(keep_test_loop_awake)
+    producer_thread = threading.Thread(target=producer_loop.run_forever)
+    producer_thread.start()
+    manager_loop = storage_manager.loop
+    storage_manager.loop = producer_loop
+
+    try:
+        futures = storage_manager.layerwise_batched_get(
+            layers,
+            location="CascadeKVBackend",
+        )
+        first = next(futures)
+        assert first.result(timeout=1) == layers[0]
+        assert backend.wait_for_request_count(2)
+        assert [request[1] for request in backend.requested_keys] == layers[:2]
+
+        second = next(futures)
+        assert second.result(timeout=1) == layers[1]
+        assert backend.wait_for_request_count(3)
+        assert [request[1] for request in backend.requested_keys] == layers
+
+        third = next(futures)
+        assert third.result(timeout=1) == layers[2]
+        with pytest.raises(StopIteration):
+            next(futures)
+    finally:
+        storage_manager.loop = manager_loop
+        producer_loop.call_soon_threadsafe(producer_loop.stop)
+        producer_thread.join(timeout=1)
+        producer_loop.close()
+
+
+def test_layerwise_batched_get_combines_layers_with_bounded_buffers(
+    storage_manager,
+) -> None:
+    """Adjacent layers share one backend I/O window without unbounded buffering."""
+    backend = MockLayerwiseBackend()
+    storage_manager.storage_backends["CascadeKVBackend"] = backend
+    storage_manager.config.extra_config = {
+        "cascadekv_layerwise_read_ahead": 4,
+        "cascadekv_layerwise_io_batch_layers": 2,
+    }
+    layers = [[f"layer-{index}"] for index in range(6)]
+    producer_loop = asyncio.new_event_loop()
+
+    def keep_test_loop_awake() -> None:
+        producer_loop.call_later(0.01, keep_test_loop_awake)
+
+    producer_loop.call_soon(keep_test_loop_awake)
+    producer_thread = threading.Thread(target=producer_loop.run_forever)
+    producer_thread.start()
+    manager_loop = storage_manager.loop
+    storage_manager.loop = producer_loop
+
+    try:
+        futures = storage_manager.layerwise_batched_get(
+            layers,
+            location="CascadeKVBackend",
+        )
+        first = next(futures)
+        assert first.result(timeout=1) == layers[0]
+        assert backend.wait_for_request_count(2)
+        assert [request[1] for request in backend.requested_keys] == [
+            layers[0] + layers[1],
+            layers[2] + layers[3],
+        ]
+
+        second = next(futures)
+        assert second.result(timeout=1) == layers[1]
+        assert len(backend.requested_keys) == 2
+
+        third = next(futures)
+        assert third.result(timeout=1) == layers[2]
+        assert backend.wait_for_request_count(3)
+        assert backend.requested_keys[2][1] == layers[4] + layers[5]
+
+        for expected_layer in layers[3:]:
+            assert next(futures).result(timeout=1) == expected_layer
+        with pytest.raises(StopIteration):
+            next(futures)
+    finally:
+        storage_manager.loop = manager_loop
+        producer_loop.call_soon_threadsafe(producer_loop.stop)
+        producer_thread.join(timeout=1)
+        producer_loop.close()

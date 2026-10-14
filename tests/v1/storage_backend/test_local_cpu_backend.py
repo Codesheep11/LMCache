@@ -445,6 +445,36 @@ class TestLocalCPUBackend:
 
         local_cpu_backend.memory_allocator.close()
 
+    def test_batched_allocate_exhausted_non_mixed_allocator_does_not_assert(
+        self, local_cpu_backend
+    ):
+        """Service-backed allocators should use the normal pressure path."""
+
+        class ExhaustedServiceAllocator:
+            def __init__(self):
+                self.calls = 0
+
+            def batched_allocate(self, shapes, dtypes, batch_size, fmt):
+                self.calls += 1
+                return None
+
+        allocator = ExhaustedServiceAllocator()
+        original_allocator = local_cpu_backend.memory_allocator
+        local_cpu_backend.memory_allocator = allocator
+        try:
+            memory_objs = local_cpu_backend.batched_allocate(
+                torch.Size([2, 2]),
+                torch.float16,
+                batch_size=2,
+                busy_loop=False,
+            )
+
+            assert memory_objs is None
+            # A non-blocking store reports pressure without asserting or spinning.
+            assert allocator.calls == 1
+        finally:
+            local_cpu_backend.memory_allocator = original_allocator
+
     def test_get_keys(self, local_cpu_backend):
         """Test get_keys()."""
         keys = [create_test_key(f"key_{i}") for i in range(3)]

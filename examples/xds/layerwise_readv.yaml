@@ -1,0 +1,19 @@
+# Opt-in VLLM layerwise NHD path. New stores use explicitly tagged KV_2TD
+# [K/V, token, hidden] data, one blob per chunk with one offset per layer.
+# Existing KV_T2D entries and unsupported direct layouts use the kernel fallback.
+# Keep this connector enabled while reading its KV_2TD entries.
+# Set the service blob size to num_layers * aligned per-layer chunk bytes.
+chunk_size: 256
+local_cpu: false
+use_layerwise: true
+xds_backend: true
+xds_service_name: xds0
+xds_require_direct: true
+xds_windowed_io: true
+xds_read_slot_count: 1
+xds_write_slot_count: 1
+xds_io_queue_depth: 32
+xds_async_write: false
+extra_config:
+  xds_layerwise_block_blob: true
+  xds_layerwise_readv: true
