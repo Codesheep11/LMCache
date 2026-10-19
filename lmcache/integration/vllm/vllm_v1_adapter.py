@@ -842,7 +842,9 @@ class LMCacheConnectorV1Impl:
                         token_mask[:lmcache_cached_tokens],
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        slot_mapping_cpu=request.slot_mapping[:lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                        req_id=request.req_id,
                         sync=sync,
                     )
                     # NOTE: retrieve for two layers at the first layer
@@ -906,6 +908,7 @@ class LMCacheConnectorV1Impl:
                 token_mask,
                 kvcaches=kvcaches,
                 slot_mapping=slot_mapping,
+                slot_mapping_cpu=request.slot_mapping[: len(tokens)],
                 vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                 request_configs=request.request_configs,
                 req_id=request.req_id,
@@ -1277,7 +1280,21 @@ class LMCacheConnectorV1Impl:
         if self._retrieve_executor is not None:
             self._retrieve_executor.shutdown(wait=True, cancel_futures=True)
             self._retrieve_executor = None
-        self._manager.stop_services()
+        # Release final KV registrations while the worker still owns its HBM.
+        # Manager teardown can wait on lookup services; vLLM may exit the worker
+        # before that finishes. Final KV pins are independent of staging objects
+        # which the cache engine still owns until its later close.
+        try:
+            engine = self.lmcache_engine
+            if engine is not None and engine.storage_manager is not None:
+                backend = engine.storage_manager.storage_backends.get("XDSBackend")
+                if backend is not None:
+                    backend.unregister_kv_caches()
+        except Exception:
+            logger.exception("Failed to release final xDS KV registrations")
+            raise
+        finally:
+            self._manager.stop_services()
 
     ###################
     # Scheduler side APIs

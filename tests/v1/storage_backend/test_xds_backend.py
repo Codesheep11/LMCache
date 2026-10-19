@@ -2,6 +2,7 @@
 # Standard
 from types import SimpleNamespace
 from threading import Event
+from typing import Any
 
 # Third Party
 import pytest
@@ -825,6 +826,9 @@ def test_xds_backend_async_failure_rolls_back_and_close_cleans_resources(
     "failure", ["none", "short", "timeout", "partial_timeout", "descriptor_error"]
 )
 @pytest.mark.parametrize("native", [False, True])
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Requires CUDA device streams"
+)
 def test_direct_readv_skips_scatter_and_releases_pins(
     direct_config, direct_metadata, cache_key, monkeypatch, failure, native
 ):
@@ -1005,6 +1009,9 @@ def test_direct_readv_skips_scatter_and_releases_pins(
 
 
 @pytest.mark.parametrize("failure", ["none", "overlap", "cancel", "timeout", "short"])
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Requires CUDA device streams"
+)
 def test_layerwise_readv_offsets_readiness_and_lifetime(failure):
     from lmcache.v1.gpu_connector.xds_layerwise import XDSReadvLayerwiseGPUConnector
 
@@ -1114,6 +1121,76 @@ def test_layerwise_readv_offsets_readiness_and_lifetime(failure):
     backend.close()
 
 
+@pytest.mark.parametrize(
+    "mode", ["legacy", "validated", "short", "wrong_pointer", "wrong_count"]
+)
+def test_direct_readv_validates_carried_registration_ranges(
+    direct_config: LMCacheEngineConfig,
+    direct_metadata: LMCacheMetadata,
+    cache_key: CacheEngineKey,
+    mode: str,
+) -> None:
+    """Carried registrations must cover the exact target before any submission."""
+    from lmcache.v1.gpu_connector.xds_readv import XDSReadvPlan
+
+    class Client(FakeXDSClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.readv_calls = []
+
+        def submit_readv(
+            self, handle: int, offset: int, slices: list[tuple[int, int, int]]
+        ) -> int:
+            self.readv_calls.append((handle, offset, slices))
+            return self._new_request()
+
+    client = Client()
+    backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
+    obj = backend.allocate([torch.Size([2048])], [torch.float16])
+    assert obj is not None
+    assert backend.batched_submit_put_task([cache_key], [obj])[0].result()
+    size = obj.get_size()
+    obj.ref_count_down()
+    target = torch.empty(size, dtype=torch.uint8)
+    ranges = ((target.data_ptr(), size),)
+    if mode == "legacy":
+        ranges = None
+    elif mode == "short":
+        ranges = ((target.data_ptr(), size - 1),)
+    elif mode == "wrong_pointer":
+        ranges = ((target.data_ptr() + 4096, size),)
+    elif mode == "wrong_count":
+        ranges = ()
+    plan = XDSReadvPlan((target,), ((0, 0, size),), size, (0,), ranges)
+
+    class Connector:
+        def plan_xds_readv(self, *args: Any, **kwargs: Any) -> XDSReadvPlan:
+            return plan
+
+        def prepare_xds_readv_dma(self, device: torch.device) -> None:
+            pass
+
+        def finish_xds_readv_dma(self, device: torch.device) -> None:
+            pass
+
+    direct_config.extra_config = {"xds_readv_direct": True}
+    direct_config.xds_windowed_io = False
+    try:
+        if mode in ("short", "wrong_pointer", "wrong_count"):
+            with pytest.raises(ValueError, match="registration"):
+                backend.batched_get_to_gpu_blocking([cache_key], [0], [4], Connector())
+            assert client.readv_calls == []
+        else:
+            result = backend.batched_get_to_gpu_blocking(
+                [cache_key], [0], [4], Connector()
+            )
+            assert result is not None and result.completed == (True,)
+            assert client.registered[-1] == (target.data_ptr(), size)
+        assert backend.remove(cache_key, force=False)
+    finally:
+        backend.close()
+
+
 def test_layerwise_kv_major_fallback_keeps_chunk_layout() -> None:
     config = LMCacheEngineConfig.from_defaults()
     config.xds_backend = True
@@ -1164,3 +1241,85 @@ def test_layerwise_kv_major_fallback_keeps_chunk_layout() -> None:
     for key in keys:
         assert backend.remove(key, force=False)
     backend.close()
+
+
+def test_kv_pool_registers_once_and_invalidates_on_close(
+    direct_config: Any, direct_metadata: Any
+) -> None:
+    """Startup is idempotent and close releases every final target exactly once."""
+    direct_config.extra_config = {"xds_readv_direct": True}
+    client = FakeXDSClient()
+    backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
+    tensors = (
+        torch.empty(4096, dtype=torch.uint8),
+        torch.empty(4096, dtype=torch.uint8),
+    )
+    pool = SimpleNamespace(
+        tensors=tensors,
+        registration_ranges=tuple((t.data_ptr(), t.numel()) for t in tensors),
+        owner=None,
+        buffer_refs=None,
+        closed=False,
+    )
+    connector = SimpleNamespace(initialize_xds_readv_pool=lambda caches: pool)
+    initial = len(client.registered)
+    backend.register_kv_caches(connector, tensors)
+    refs = pool.buffer_refs
+    assert len(client.registered) == initial + 2
+    assert refs is not None and len(refs) == 2
+    backend.register_kv_caches(connector, tensors)
+    assert pool.buffer_refs is refs
+    assert len(client.registered) == initial + 2
+    staging = backend.allocate(
+        direct_metadata.get_shapes(), direct_metadata.get_dtypes()
+    )
+    assert staging is not None
+    backend.unregister_kv_caches()
+    assert pool.closed and pool.buffer_refs is None
+    assert pool.tensors == () and pool.owner is None
+    assert len(client.unregistered) == 2  # final KV pins precede staging cleanup
+    backend.unregister_kv_caches()
+    assert len(client.unregistered) == 2
+    staging.ref_count_down()
+    backend.close()
+    assert len(client.unregistered) == 3  # staging plus the two final targets
+    backend.close()
+    assert len(client.unregistered) == 3
+    with pytest.raises(RuntimeError, match="closing"):
+        backend.register_kv_caches(connector, tensors)
+
+
+def test_kv_pool_registration_failure_rolls_back(
+    direct_config: Any, direct_metadata: Any
+) -> None:
+    """A partial startup must not publish handles or leak successful pins."""
+    direct_config.extra_config = {"xds_readv_direct": True}
+    client = FakeXDSClient()
+    backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
+    tensors = (
+        torch.empty(4096, dtype=torch.uint8),
+        torch.empty(4096, dtype=torch.uint8),
+    )
+    pool = SimpleNamespace(
+        tensors=tensors,
+        registration_ranges=tuple((t.data_ptr(), t.numel()) for t in tensors),
+        owner=None,
+        buffer_refs=None,
+        closed=False,
+    )
+    connector = SimpleNamespace(initialize_xds_readv_pool=lambda caches: pool)
+    attempts = []
+
+    def fail_second(ptr: int, size: int) -> int:
+        attempts.append((ptr, size))
+        if len(attempts) == 2:
+            raise RuntimeError("registration failed")
+        return 901
+
+    client.register_gpu_buffer = fail_second
+    with pytest.raises(RuntimeError, match="registration failed"):
+        backend.register_kv_caches(connector, tensors)
+    assert pool.buffer_refs is None and pool.owner is None
+    assert client.unregistered == [901]
+    backend.close()
+    assert client.unregistered == [901, 77]

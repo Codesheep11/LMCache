@@ -143,7 +143,9 @@ class XDSBackend(AllocatorBackendInterface):
         self.metadata = metadata
         self.client = xds_client
         self._closed = False
+        self._closing = False
         self._readv_targets: dict[tuple[int, int], tuple[torch.Tensor, int]] = {}
+        self._readv_pools: list[Any] = []
         self._readv_poisoned = False
         self._readv_failed_staging: list[MemoryObj] = []
         self._entries: OrderedDict[
@@ -1255,8 +1257,15 @@ class XDSBackend(AllocatorBackendInterface):
                 for p, e in zip(layer, entries, strict=True)
             ):
                 return None
-        cuda_readv_flush_function()
         device = plans[0][0].tensors[0].device
+        prepare_dma = getattr(gpu_connector, "prepare_xds_readv_dma", None)
+        finish_dma = getattr(gpu_connector, "finish_xds_readv_dma", None)
+        if not (callable(prepare_dma) and callable(finish_dma)):
+            if device.type != "cuda":
+                raise ValueError("layerwise readv requires platform DMA fences")
+            cuda_readv_flush_function()
+            prepare_dma = torch.cuda.synchronize
+            finish_dma = finish_readv_dma
 
         def restore() -> Iterator[BackendTransferResult]:
             pinned = False
@@ -1289,6 +1298,8 @@ class XDSBackend(AllocatorBackendInterface):
 
             try:
                 with self._io_lock:
+                    if self._closing or self._closed:
+                        raise RuntimeError("xDS backend is closing")
                     if self._readv_poisoned:
                         raise RuntimeError(
                             "xDS direct KV target has an unresolved DMA failure"
@@ -1304,22 +1315,50 @@ class XDSBackend(AllocatorBackendInterface):
                         for entry in entries:
                             entry.pin()
                         pinned = True
-                    torch.cuda.synchronize(device)
-                    refs = []
-                    for layer in plans:
-                        tensor = layer[0].tensors[0]
-                        target = (
-                            tensor.data_ptr(),
-                            tensor.numel() * tensor.element_size(),
-                        )
-                        if target not in self._readv_targets:
-                            ref = int(self.client.register_gpu_buffer(*target))
-                            if ref <= 0:
-                                raise RuntimeError("invalid final KV buffer reference")
-                            self._readv_targets[target] = (tensor, ref)
-                        refs.append(self._readv_targets[target][1])
+                    prepare_dma(device)
+                    if device.type == "npu" and plans[0][0].buffer_refs is None:
+                        raise RuntimeError("register xDS KV caches before restoring")
+                    if plans[0][0].buffer_refs is not None:
+                        refs = [layer[0].buffer_refs for layer in plans]
+                    else:
+                        refs = []
+                        for layer in plans:
+                            plan = layer[0]
+                            ranges = plan.registration_ranges
+                            if ranges is not None and len(ranges) != len(plan.tensors):
+                                raise ValueError(
+                                    "readv registration count differs from target pool"
+                                )
+                            layer_refs = []
+                            for index, tensor in enumerate(plan.tensors):
+                                target = (
+                                    tensor.data_ptr(),
+                                    tensor.numel() * tensor.element_size(),
+                                )
+                                if tensor.device != device:
+                                    raise ValueError(
+                                        "layerwise readv targets span devices"
+                                    )
+                                if ranges is not None:
+                                    pointer, size = ranges[index]
+                                    if pointer != target[0] or size < target[1]:
+                                        raise ValueError(
+                                            "readv registration does not cover target"
+                                        )
+                                    target = (pointer, size)
+                                if target not in self._readv_targets:
+                                    ref = int(self.client.register_gpu_buffer(*target))
+                                    if ref <= 0:
+                                        raise RuntimeError(
+                                            "invalid final KV buffer reference"
+                                        )
+                                    self._readv_targets[target] = (tensor, ref)
+                                layer_refs.append(self._readv_targets[target][1])
+                            refs.append(layer_refs)
 
                 def submit(item: Any) -> int:
+                    if self._closing or self._closed:
+                        raise RuntimeError("xDS backend is closing")
                     if self._readv_poisoned:
                         raise RuntimeError(
                             "xDS direct KV target has an unresolved DMA failure"
@@ -1329,10 +1368,12 @@ class XDSBackend(AllocatorBackendInterface):
                         self.client,
                         entry.blob_handle,
                         layer_id * self.block_blob_layer_stride,
-                        [refs[layer_id]],
+                        refs[layer_id],
                     )
 
                 def submit_batch(items: list[Any]) -> list[int | BaseException]:
+                    if self._closing or self._closed:
+                        raise RuntimeError("xDS backend is closing")
                     return XDSReadvPlan.submit_batch(
                         self.client,
                         [
@@ -1340,7 +1381,7 @@ class XDSBackend(AllocatorBackendInterface):
                                 plan,
                                 entry.blob_handle,
                                 layer_id * self.block_blob_layer_stride,
-                                [refs[layer_id]],
+                                refs[layer_id],
                             )
                             for layer_id, entry, plan in items
                         ],
@@ -1348,6 +1389,9 @@ class XDSBackend(AllocatorBackendInterface):
 
                 batch_capable = bool(
                     getattr(self.client, "supports_readv_batch", False)
+                    and callable(getattr(self.client, "prepare_indexed_readv", None))
+                    and callable(getattr(self.client, "submit_readv_plan", None))
+                    and getattr(self.client, "supports_native_readv", True)
                 )
                 pump = XDSReadRingPump(
                     self.config.xds_io_queue_depth,
@@ -1408,7 +1452,7 @@ class XDSBackend(AllocatorBackendInterface):
                         consume()
                         if error is not None:
                             raise error
-                    finish_readv_dma(device)
+                    finish_dma(device)
                     size = sum(plan.size for plan in layer)
                     yield self._make_transfer_result(
                         [True] * len(entries),
@@ -1430,7 +1474,7 @@ class XDSBackend(AllocatorBackendInterface):
                     worker.join()
                     while processed < total:
                         consume()
-                    finish_readv_dma(device)
+                    finish_dma(device)
                 if pinned:
                     with self._entries_lock:
                         for entry in entries:
@@ -2428,15 +2472,100 @@ class XDSBackend(AllocatorBackendInterface):
                 retained_ids.add(object_id)
         return retained_ids
 
+    def register_kv_caches(self, gpu_connector: Any, kvcaches: Any) -> None:
+        """Register fixed final KV targets before serving the first request.
+
+        A platform connector supplies validated ranges and retains fixed tensor
+        storage. Registrations are owned by this backend until close. Failed
+        initialization rolls back new registrations; pool replacement or use
+        with another client raises RuntimeError. Unsupported connectors return
+        without changing their existing registration behavior.
+        """
+        initialize = getattr(gpu_connector, "initialize_xds_readv_pool", None)
+        if not callable(initialize):
+            return
+        if not self.config.get_extra_config_value("xds_readv_direct", False) and not (
+            self.config.get_extra_config_value("xds_layerwise_readv", False)
+        ):
+            return
+        with self._io_lock:
+            if self._closing or self._closed:
+                raise RuntimeError("cannot register KV caches on a closing xDS backend")
+            pool = initialize(kvcaches)
+            if pool.owner is not None and pool.owner is not self.client:
+                raise RuntimeError("xDS KV pool belongs to another client")
+            if pool.buffer_refs is not None:
+                return
+            added: list[tuple[int, int]] = []
+            refs = []
+            try:
+                for tensor, target in zip(
+                    pool.tensors, pool.registration_ranges, strict=True
+                ):
+                    if target not in self._readv_targets:
+                        ref = int(self.client.register_gpu_buffer(*target))
+                        if ref <= 0:
+                            raise RuntimeError("invalid final KV buffer reference")
+                        self._readv_targets[target] = (tensor, ref)
+                        added.append(target)
+                    refs.append(self._readv_targets[target][1])
+            except BaseException:
+                for target in reversed(added):
+                    try:
+                        self.client.unregister_buffer(self._readv_targets[target][1])
+                        del self._readv_targets[target]
+                    except BaseException:
+                        logger.exception("Failed to roll back xDS KV registration")
+                raise
+            pool.owner = self.client
+            pool.buffer_refs = tuple(refs)
+            self._readv_pools.append(pool)
+            logger.info(
+                "[XDS_KV_POOL_REGISTERED] targets=%d registered_bytes=%d",
+                len(refs),
+                sum(size for _, size in pool.registration_ranges),
+            )
+
+    def unregister_kv_caches(self) -> None:
+        """Drain xDS I/O and release final KV pins before worker HBM teardown.
+
+        Called after request executors stop. Staging allocations may still be
+        owned by the cache engine; those are released by its subsequent close.
+        Repeated calls are safe. Failed DMA retains pins and raises RuntimeError.
+        """
+        if self._closed or not self._readv_pools:
+            return
+        self._closing = True
+        if self._write_scheduler is not None:
+            self._write_scheduler.close(timeout=30.0)
+        with self._io_lock:
+            if self._readv_poisoned:
+                raise RuntimeError("cannot unregister KV pool with unresolved DMA")
+            self._unregister_readv_targets()
+
     def close(self) -> None:
+        """Stop writes, wait for active DMA, then unregister owned KV pools.
+
+        Unresolved DMA failures retain registrations and raise RuntimeError.
+        Calling close again after a successful close has no effect.
+        """
         if self._closed:
             return
+        self._closing = True
         first_error: Optional[BaseException] = None
         if self._write_scheduler is not None:
             try:
                 self._write_scheduler.close(timeout=30.0)
             except BaseException as error:
                 first_error = error
+        with self._io_lock:
+            if self._closed:
+                return
+            if self._readv_poisoned:
+                raise RuntimeError("cannot unregister KV pool with unresolved DMA")
+            self._close_after_io(first_error)
+
+    def _close_after_io(self, first_error: Optional[BaseException]) -> None:
         active_allocations = self.memory_allocator.num_active_allocations
         if active_allocations:
             active_error = RuntimeError(
@@ -2465,13 +2594,11 @@ class XDSBackend(AllocatorBackendInterface):
         except BaseException as error:
             if first_error is None:
                 first_error = error
-        for target_key, (_, buffer_ref) in list(self._readv_targets.items()):
-            try:
-                self.client.unregister_buffer(buffer_ref)
-                del self._readv_targets[target_key]
-            except BaseException as error:
-                if first_error is None:
-                    first_error = error
+        try:
+            self._unregister_readv_targets()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
         client_close = getattr(self.client, "close", None)
         if callable(client_close):
             try:
@@ -2480,6 +2607,27 @@ class XDSBackend(AllocatorBackendInterface):
                 if first_error is None:
                     first_error = error
         self._closed = True
+        if first_error is not None:
+            raise first_error
+
+    def _unregister_readv_targets(self) -> None:
+        first_error: Optional[BaseException] = None
+        for target_key, (_, buffer_ref) in list(self._readv_targets.items()):
+            try:
+                self.client.unregister_buffer(buffer_ref)
+                del self._readv_targets[target_key]
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        newly_closed = sum(not pool.closed for pool in self._readv_pools)
+        for pool in self._readv_pools:
+            pool.closed = True
+            pool.buffer_refs = None
+            if not self._readv_targets:
+                pool.tensors = ()
+                pool.owner = None
+        if newly_closed and not self._readv_targets:
+            logger.info("[XDS_KV_POOL_UNREGISTERED] pools=%d", newly_closed)
         if first_error is not None:
             raise first_error
 
@@ -2756,6 +2904,8 @@ class XDSBackend(AllocatorBackendInterface):
         if not (len(keys) == len(starts) == len(ends)):
             raise ValueError("xDS readv batch lengths differ")
         with self._io_lock:
+            if self._closing or self._closed:
+                raise RuntimeError("xDS backend is closing")
             if self._readv_poisoned:
                 raise RuntimeError("xDS direct KV target has an unresolved DMA failure")
             with self._put_tasks_lock:
@@ -2812,28 +2962,68 @@ class XDSBackend(AllocatorBackendInterface):
                         if seen_blocks.intersection(plan.block_ids):
                             return None
                         seen_blocks.update(plan.block_ids)
-                cuda_readv_flush_function()  # Fail before submission if unsupported.
                 device = items[0][2].tensors[0].device
                 pools = {id(plan.tensors): plan.tensors for _, _, plan in items}
                 if any(t.device != device for pool in pools.values() for t in pool):
                     return None
                 # The engine owns these destination blocks through completion.
                 # Finish prior users before DMA; no GPU copy kernel is launched.
-                torch.cuda.synchronize(device)
+                prepare_dma = getattr(gpu_connector, "prepare_xds_readv_dma", None)
+                finish_dma = getattr(gpu_connector, "finish_xds_readv_dma", None)
+                if callable(prepare_dma) and callable(finish_dma):
+                    prepare_dma(device)
+                else:
+                    cuda_readv_flush_function()  # Fail before submission.
+                    torch.cuda.synchronize(device)
+                    finish_dma = finish_readv_dma
                 # Target identity was checked across all plans above. Resolve
                 # registrations once for the batch, before the first DMA.
-                refs = []
-                for tensor in items[0][2].tensors:
-                    target_key = (
-                        tensor.data_ptr(),
-                        tensor.numel() * tensor.element_size(),
-                    )
-                    if target_key not in self._readv_targets:
-                        ref = int(self.client.register_gpu_buffer(*target_key))
-                        if ref <= 0:
-                            raise RuntimeError("invalid final KV buffer reference")
-                        self._readv_targets[target_key] = (tensor, ref)
-                    refs.append(self._readv_targets[target_key][1])
+                plan = items[0][2]
+                if device.type == "npu" and plan.buffer_refs is None:
+                    raise RuntimeError("register xDS KV caches before restoring")
+                if plan.buffer_refs is not None:
+                    refs = plan.buffer_refs
+                else:
+                    refs = []
+                    plan = items[0][2]
+                    registration_ranges = getattr(plan, "registration_ranges", None)
+                    if registration_ranges is not None and len(
+                        registration_ranges
+                    ) != len(plan.tensors):
+                        raise ValueError(
+                            "readv registration count differs from target pool"
+                        )
+                    for target_index, tensor in enumerate(plan.tensors):
+                        target_key = (
+                            tensor.data_ptr(),
+                            tensor.numel() * tensor.element_size(),
+                        )
+                        if registration_ranges is not None:
+                            validated_key = registration_ranges[target_index]
+                            if (
+                                validated_key[0] != target_key[0]
+                                or validated_key[1] < target_key[1]
+                            ):
+                                raise ValueError(
+                                    "readv registration does not cover target"
+                                )
+                            target_key = validated_key
+                        else:
+                            registration = getattr(
+                                gpu_connector, "get_xds_readv_registration", None
+                            )
+                            if callable(registration):
+                                target_key = registration(tensor)
+                            if target_key[0] != tensor.data_ptr():
+                                raise ValueError(
+                                    "readv registration must start at the KV view"
+                                )
+                        if target_key not in self._readv_targets:
+                            ref = int(self.client.register_gpu_buffer(*target_key))
+                            if ref <= 0:
+                                raise RuntimeError("invalid final KV buffer reference")
+                            self._readv_targets[target_key] = (tensor, ref)
+                        refs.append(self._readv_targets[target_key][1])
 
                 def submit(item: Any) -> int:
                     _, entry, plan = item
@@ -2878,10 +3068,24 @@ class XDSBackend(AllocatorBackendInterface):
                     else:
                         completed[index] = True
                         completed_bytes += plan.size
-                finish_readv_dma(device)
+                finish_dma(device)
                 if error is not None:
                     raise error
                 elapsed = time.perf_counter() - begin
+                logger.info(
+                    "[XDS_READV_DIRECT_METRICS] %s",
+                    json.dumps(
+                        {
+                            "device": str(device),
+                            "bytes": completed_bytes,
+                            "chunks": len(items),
+                            "seconds": elapsed,
+                            "peak_staging_bytes": 0,
+                            "gpu_copy_seconds": 0.0,
+                        },
+                        sort_keys=True,
+                    ),
+                )
                 return self._make_transfer_result(
                     completed,
                     requested_bytes=sum(p.size for _, _, p in items),

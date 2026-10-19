@@ -36,6 +36,8 @@ class _PagedSlices(Sequence[tuple[int, int, int]]):
         group, block_index = divmod(index, len(self.block_ids))
         kv, layer = divmod(group, self.layers)
         block = self.block_ids[block_index]
+        if self.layout == "SEPARATE":
+            return 2 * layer + kv, block * self.block_bytes, self.block_bytes
         offset = kv * self.blocks + block if self.layout == "2NB" else block * 2 + kv
         return layer, offset * self.block_bytes, self.block_bytes
 
@@ -45,6 +47,17 @@ class _PagedSlices(Sequence[tuple[int, int, int]]):
         # final SDK tuples; no intermediate (layer, offset, length) objects.
         result = []
         for kv in range(2):
+            if self.layout == "SEPARATE":
+                for layer in range(self.layers):
+                    result.extend(
+                        (
+                            refs[2 * layer + kv],
+                            block * self.block_bytes,
+                            self.block_bytes,
+                        )
+                        for block in self.block_ids
+                    )
+                continue
             offsets = [
                 (
                     (kv * self.blocks + block)
@@ -61,12 +74,18 @@ class _PagedSlices(Sequence[tuple[int, int, int]]):
 
 @dataclass(frozen=True)
 class XDSReadvPlan:
-    """Owned targets and a source-ordered, possibly lazy destination sequence."""
+    """Owned targets and a source-ordered, possibly lazy destination sequence.
+
+    Plans carry fresh block mappings on every retrieval. Registration ranges
+    and optional buffer_refs may be shared for the lifetime of a fixed KV pool.
+    """
 
     tensors: tuple[torch.Tensor, ...]
     slices: Sequence[tuple[int, int, int]]
     size: int
     block_ids: tuple[int, ...]
+    registration_ranges: Optional[tuple[tuple[int, int], ...]] = None
+    buffer_refs: Optional[tuple[int, ...]] = None
 
     def submit(
         self,
@@ -107,6 +126,12 @@ class XDSReadvPlan:
             slices = self.slices
             groups = []
             for kv in range(2):
+                if slices.layout == "SEPARATE":
+                    groups.extend(
+                        (refs[2 * layer + kv], 0, slices.block_bytes)
+                        for layer in range(slices.layers)
+                    )
+                    continue
                 base = kv * slices.blocks if slices.layout == "2NB" else kv
                 stride = 1 if slices.layout == "2NB" else 2
                 groups.extend(
@@ -161,6 +186,8 @@ def plan_paged_readv_batch(
     slots: torch.Tensor,
     io_unit: int,
     layout: str,
+    device_type: str = "cuda",
+    registration_ranges: Optional[tuple[tuple[int, int], ...]] = None,
 ) -> Optional[list[XDSReadvPlan]]:
     """Validate a whole restore before DMA, sharing target-pool validation.
 
@@ -168,16 +195,28 @@ def plan_paged_readv_batch(
     Return lazy plans in chunk order, or None for unsupported layouts, invalid
     metadata, unaligned spans or overlapping target blocks, including overlap
     across chunks. The caller owns tensors and slot assignments until completion.
-    No descriptors or validation results are reused across calls.
+    No descriptors or validation results are reused across calls. An optional
+    registration_ranges tuple carries ranges validated by the connector for
+    this call, so the backend need not repeat platform-specific validation.
     """
     if not chunks:
         return []
-    if not tensors or io_unit <= 0 or slots.ndim != 1 or layout not in ("2NB", "NB2"):
+    if (
+        not tensors
+        or io_unit <= 0
+        or slots.ndim != 1
+        or layout not in ("2NB", "NB2", "SEPARATE")
+        or device_type not in ("cuda", "npu")
+    ):
         return None
+    separate = layout == "SEPARATE"
+    if separate and len(tensors) % 2:
+        return None
+    layers = len(tensors) // 2 if separate else len(tensors)
     first = tensors[0]
     if any(
-        t.device.type != "cuda"
-        or t.ndim != 5
+        t.device.type != device_type
+        or t.ndim != (4 if separate else 5)
         or not t.is_contiguous()
         or t.dtype != first.dtype
         or t.device != first.device
@@ -185,11 +224,14 @@ def plan_paged_readv_batch(
         for t in tensors
     ):
         return None
-    axis = 0 if layout == "2NB" else 1
-    if first.shape[axis] != 2:
-        return None
-    blocks = first.shape[1 if axis == 0 else 0]
-    block_size, heads, head_size = first.shape[2:]
+    if separate:
+        blocks, block_size, heads, head_size = first.shape
+    else:
+        axis = 0 if layout == "2NB" else 1
+        if first.shape[axis] != 2:
+            return None
+        blocks = first.shape[1 if axis == 0 else 0]
+        block_size, heads, head_size = first.shape[2:]
     if min(blocks, block_size, heads, head_size) <= 0:
         return None
     element_size = first.element_size()
@@ -199,7 +241,10 @@ def plan_paged_readv_batch(
     spans = sorted(
         (t.data_ptr(), t.data_ptr() + t.numel() * element_size) for t in tensors
     )
-    if any(a % io_unit or (b - a) % io_unit for a, b in spans):
+    registration_alignment = max(io_unit, 4096) if device_type == "npu" else io_unit
+    if any(
+        a % registration_alignment or (b - a) % registration_alignment for a, b in spans
+    ):
         return None
     if any(b > c for (_, b), (c, _) in zip(spans, spans[1:], strict=False)):
         return None
@@ -213,7 +258,7 @@ def plan_paged_readv_batch(
             or end <= start
             or end > slots.numel()
             or (end - start) % block_size
-            or tuple(shapes[0]) != (2, len(tensors), end - start, heads * head_size)
+            or tuple(shapes[0]) != (2, layers, end - start, heads * head_size)
         ):
             return None
     # One device-to-host synchronization, if the caller did not provide the CPU
@@ -243,9 +288,10 @@ def plan_paged_readv_batch(
         plans.append(
             XDSReadvPlan(
                 owned_tensors,
-                _PagedSlices(len(tensors), blocks, block_bytes, ids, layout),
+                _PagedSlices(layers, blocks, block_bytes, ids, layout),
                 shapes[0].numel() * element_size,
                 ids,
+                registration_ranges,
             )
         )
     return plans
@@ -277,6 +323,8 @@ def plan_layerwise_readv_batch(
     slots: torch.Tensor,
     io_unit: int,
     layout: str,
+    device_type: str = "cuda",
+    registration_ranges: Optional[tuple[tuple[int, int], ...]] = None,
 ) -> Optional[list[list[XDSReadvPlan]]]:
     """Plan KV_2TD blobs as layer-major reads without changing source byte order.
 
@@ -284,6 +332,9 @@ def plan_layerwise_readv_batch(
     for legacy token-major metadata or unsupported spans/layouts. The result is
     indexed by layer, then chunk. Caller retains target ownership through DMA.
     """
+    if not tensors or (layout == "SEPARATE" and len(tensors) % 2):
+        return None
+    layers = len(tensors) // 2 if layout == "SEPARATE" else len(tensors)
     expanded = []
     for shapes, dtypes, fmt, start, end in chunks:
         if fmt != MemoryFormat.KV_2TD or len(shapes) != 1:
@@ -293,25 +344,34 @@ def plan_layerwise_readv_batch(
             return None
         expanded.append(
             (
-                [torch.Size([2, len(tensors), end - start, shape[2]])],
+                [torch.Size([2, layers, end - start, shape[2]])],
                 dtypes,
                 MemoryFormat.KV_2LTD,
                 start,
                 end,
             )
         )
-    plans = plan_paged_readv_batch(tensors, expanded, slots, io_unit, layout)
+    plans = plan_paged_readv_batch(
+        tensors, expanded, slots, io_unit, layout, device_type, registration_ranges
+    )
     if plans is None:
         return None
     result = []
-    for tensor in tensors:
+    for layer in range(layers):
+        indices = (2 * layer, 2 * layer + 1) if layout == "SEPARATE" else (layer,)
+        targets = tuple(tensors[i] for i in indices)
+        ranges = (
+            tuple(registration_ranges[i] for i in indices)
+            if registration_ranges is not None
+            else None
+        )
         layer_plans = []
         for plan in plans:
             slices = plan.slices
             assert isinstance(slices, _PagedSlices)
             layer_plans.append(
                 XDSReadvPlan(
-                    (tensor,),
+                    targets,
                     _PagedSlices(
                         1,
                         slices.blocks,
@@ -319,8 +379,9 @@ def plan_layerwise_readv_batch(
                         slices.block_ids,
                         slices.layout,
                     ),
-                    plan.size // len(tensors),
+                    plan.size // layers,
                     plan.block_ids,
+                    ranges,
                 )
             )
         result.append(layer_plans)
