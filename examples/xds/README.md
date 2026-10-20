@@ -2,7 +2,8 @@
 
 这两个配置连接同一个名为 `xds0` 的外部 xDS 服务，但数据路径互斥：
 
-- `direct.yaml`：SSD 直接读写服务注册的 GPU buffer。
+- `direct.yaml` / `readv.yaml`：默认通过 readv/writev 直接读写最终 vLLM HBM KV pages，
+  不分配 KV staging pool。
 - `cascadekv.yaml`：SSD 先读写服务管理的 CPU staging buffer，再由 LMCache
   connector 在 CPU 与 GPU 之间传输。
 
@@ -23,33 +24,20 @@ export LMCACHE_CONFIG_FILE=/home/yangxc/workspace/LMCache-v043-xds/examples/xds/
 export LMCACHE_CONFIG_FILE=/home/yangxc/workspace/LMCache-v043-xds/examples/xds/cascadekv.yaml
 ```
 
-`use_layerwise: true` 同时满足 SGLang connector 的要求；vLLM 0.18.0 也支持该
-模式。CascadeKV 的 staging 容量由 `cascadekv_slot_count × xDS blob_size`
-决定；保持 `local_cpu: false` 和 `max_local_cpu_size: 0`，可以避免额外创建
-LocalCPUBackend，确保命中必须经过 xDS。
+默认直接读写要求非 layerwise、完整且对齐的 NHD KV blocks，以及同步存储。
+保持 `local_cpu: false`、`max_local_cpu_size: 0`、`store_async: false` 和
+`xds_async_write: false`。不支持的布局或未对齐 chunk 会报错，不会自动回退到 staging。
+当前双向路径已在 Ascend 验证；不能据此认定所有 CUDA/SGLang connector 均已支持。
 
-示例把 `chunk_size` 设为 32。xDS direct fast-map 要求一个 blob 对应一个 SPDK
-cluster；本机服务的 blob/cluster 都是 6 MiB。在 `use_layerwise: true` 下，
-每个 xDS blob 保存一个 layer 的一个 LMCache chunk。更换模型、TP、KV dtype
-或关闭 layerwise 后，必须保证每次提交的对象不大于
-`xds_blob_size_bytes`；否则应减小 `chunk_size`，不要直接修改已经格式化的
-blobstore cluster 大小。
+`xds_io_queue_depth` 控制每个客户端同时在途的 I/O 数量，不分配 payload buffer。
+`xds_read_slot_count` 和 `xds_write_slot_count` 已从配置中移除。
+KV 内存池在启动时一次注册，关闭时等待 DMA 完成再注销。
+服务的 blob 必须容纳一个 chunk 的全部 KV；更换模型、TP 或 dtype 时需重新计算。
 
-direct 后端还把 xDS 服务配置的 `xds_gpu_buffer_size_bytes` 作为注册 GPU
-allocator。启用 `xds_windowed_io` 后，注册池只需至少容纳
-`(xds_read_slot_count + xds_write_slot_count) × 对齐后的 xDS blob_size`，不再按
-prompt 的总 chunk 数预分配 staging 显存。例如读槽位为 2、写槽位为 8 时，
-注册池至少需要 10 个 blob；4K 或更长 prompt 会循环复用这些槽位。服务侧 SSD
-blob pool 仍需有足够的持久化容量。
-
-`xds_read_window_size` 和 `xds_write_window_size` 只用于逻辑窗口统计，实际同时
-驻留的 staging 对象数量由 read/write slot count 限制，xDS 同时在途请求数由
-`xds_io_queue_depth` 限制。`xds_async_write: true` 时，每个异步 lease 同样不超过
-写槽位预算，并在下一批 GPU gather 前施加反压。
-
-当前有界 direct hook 由非 layerwise 的 `store()` / `retrieve()` 路径调用。
-`use_layerwise: true` 的 SGLang 路径继续使用原有逐层接口，不应把本节的长
-prompt 有界 staging 结论直接套用到逐层模式。
+旧 staging 路径仅在 `extra_config.xds_direct_kv_io: false` 时启用，读写缓冲预算
+各为 `xds_io_queue_depth × 对齐后的 blob_size`。`layerwise_readv.yaml` 显式选择
+此兼容路径；它不能作为双向无 staging 的示例。CascadeKV 的 CPU staging 仍由
+`cascadekv_slot_count × xDS blob_size` 控制，不受本次更改影响。
 
 ## 启动外部 xDS 服务
 
@@ -77,7 +65,10 @@ vllm serve /mnt/adminserver-nfsrdma/Model/Qwen3-0.6B \
   '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
 ```
 
-## SGLang 0.5.9
+## SGLang 0.5.9（旧 layerwise 路径）
+
+该路径需单独配置 `use_layerwise: true` 和
+`extra_config.xds_direct_kv_io: false`，不能直接使用默认无 staging 的配置。
 
 ```bash
 PYTHONHASHSEED=0 CUDA_VISIBLE_DEVICES=4 \

@@ -269,9 +269,8 @@ def direct_config():
     config = LMCacheEngineConfig.from_defaults()
     config.xds_service_name = "xds0"
     config.xds_backend = True
+    config.extra_config = {"xds_direct_kv_io": False}
     config.xds_require_direct = True
-    config.xds_read_slot_count = 1
-    config.xds_write_slot_count = 1
     return config
 
 
@@ -409,6 +408,7 @@ def test_xds_backend_batched_read_uses_bounded_ring(
 ):
     direct_config.xds_io_queue_depth = 2
     client = FakeXDSClient()
+    client.metadata.gpu_buffer_size_bytes = 4 * 4096
     backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
     keys = [
         CacheEngineKey("test-model", 1, 0, chunk_hash, torch.float16)
@@ -442,10 +442,8 @@ def test_xds_layerwise_block_blob_reuses_handle_and_reads_layer_offsets():
     config.xds_require_direct = True
     config.xds_windowed_io = True
     config.xds_io_queue_depth = 2
-    config.xds_read_slot_count = 1
-    config.xds_write_slot_count = 1
     config.use_layerwise = True
-    config.extra_config = {"xds_layerwise_block_blob": True}
+    config.extra_config = {"xds_direct_kv_io": False, "xds_layerwise_block_blob": True}
     metadata = LMCacheMetadata(
         model_name="test-model",
         world_size=1,
@@ -564,9 +562,7 @@ def test_xds_backend_windowed_read_bounds_registered_gpu_staging(
     direct_config,
     direct_metadata,
 ):
-    direct_config.xds_read_slot_count = 2
-    direct_config.xds_write_slot_count = 2
-    direct_config.xds_io_queue_depth = 1
+    direct_config.xds_io_queue_depth = 2
     client = FakeXDSClient()
     client.metadata.gpu_buffer_size_bytes = 4 * 4096
     backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
@@ -586,7 +582,7 @@ def test_xds_backend_windowed_read_bounds_registered_gpu_staging(
     assert connector.peak_active <= 2
     assert backend.get_memory_allocator().num_active_allocations == 0
     assert result.peak_staging_bytes <= 2 * 4096
-    assert result.peak_inflight_io == 1
+    assert result.peak_inflight_io == 2
     assert all(event.synchronized for event in connector.events)
     backend.close()
 
@@ -595,9 +591,7 @@ def test_xds_backend_windowed_write_bounds_registered_gpu_staging(
     direct_config,
     direct_metadata,
 ):
-    direct_config.xds_read_slot_count = 2
-    direct_config.xds_write_slot_count = 2
-    direct_config.xds_io_queue_depth = 1
+    direct_config.xds_io_queue_depth = 2
     client = FakeXDSClient()
     client.metadata.gpu_buffer_size_bytes = 4 * 4096
     backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
@@ -717,9 +711,8 @@ def test_xds_backend_windowed_pool_reserves_read_and_write_slots(
     direct_config,
     direct_metadata,
 ):
-    direct_config.xds_read_slot_count = 2
-    direct_config.xds_write_slot_count = 2
     client = FakeXDSClient()
+    direct_config.xds_io_queue_depth = 2
     client.metadata.gpu_buffer_size_bytes = 3 * 4096
 
     with pytest.raises(ValueError, match="read_slots=2, write_slots=2"):
@@ -731,8 +724,7 @@ def test_xds_backend_async_direct_write_uses_bounded_leases(
     direct_metadata,
 ):
     direct_config.xds_async_write = True
-    direct_config.xds_read_slot_count = 2
-    direct_config.xds_write_slot_count = 2
+    direct_config.xds_io_queue_depth = 2
     client = FakeXDSClient()
     client.metadata.gpu_buffer_size_bytes = 4 * 4096
     backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
@@ -871,7 +863,7 @@ def test_direct_readv_skips_scatter_and_releases_pins(
             result.completed_bytes = self.sizes[result.request_id]
             return result
 
-    direct_config.extra_config = {"xds_readv_direct": True}
+    direct_config.extra_config = {"xds_direct_kv_io": False, "xds_readv_direct": True}
     direct_config.xds_windowed_io = False
     client = ReadvClient()
     if native:
@@ -1053,6 +1045,7 @@ def test_layerwise_readv_offsets_readiness_and_lifetime(failure):
     config.xds_windowed_io = False
     config.xds_io_queue_depth = 2
     config.extra_config = {
+        "xds_direct_kv_io": False,
         "xds_layerwise_block_blob": True,
         "xds_layerwise_readv": True,
     }
@@ -1173,7 +1166,7 @@ def test_direct_readv_validates_carried_registration_ranges(
         def finish_xds_readv_dma(self, device: torch.device) -> None:
             pass
 
-    direct_config.extra_config = {"xds_readv_direct": True}
+    direct_config.extra_config = {"xds_direct_kv_io": False, "xds_readv_direct": True}
     direct_config.xds_windowed_io = False
     try:
         if mode in ("short", "wrong_pointer", "wrong_count"):
@@ -1197,7 +1190,7 @@ def test_layerwise_kv_major_fallback_keeps_chunk_layout() -> None:
     config.use_layerwise = True
     config.xds_windowed_io = False
     config.xds_io_queue_depth = 2
-    config.extra_config = {"xds_layerwise_block_blob": True}
+    config.extra_config = {"xds_direct_kv_io": False, "xds_layerwise_block_blob": True}
     metadata = LMCacheMetadata(
         model_name="fallback",
         world_size=1,
@@ -1247,7 +1240,7 @@ def test_kv_pool_registers_once_and_invalidates_on_close(
     direct_config: Any, direct_metadata: Any
 ) -> None:
     """Startup is idempotent and close releases every final target exactly once."""
-    direct_config.extra_config = {"xds_readv_direct": True}
+    direct_config.extra_config = {"xds_direct_kv_io": False, "xds_readv_direct": True}
     client = FakeXDSClient()
     backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
     tensors = (
@@ -1293,7 +1286,7 @@ def test_kv_pool_registration_failure_rolls_back(
     direct_config: Any, direct_metadata: Any
 ) -> None:
     """A partial startup must not publish handles or leak successful pins."""
-    direct_config.extra_config = {"xds_readv_direct": True}
+    direct_config.extra_config = {"xds_direct_kv_io": False, "xds_readv_direct": True}
     client = FakeXDSClient()
     backend = XDSBackend(direct_config, direct_metadata, client, "cpu")
     tensors = (

@@ -1,20 +1,14 @@
-# xDS direct path: SSD -> registered GPU buffer
-# In layerwise mode, each xDS object contains one layer's 32-token KV chunk,
-# which fits the current service's one-cluster 6 MiB blob.
-chunk_size: 32
+# SSD <-> final serving KV pages, without a KV staging pool.
+# Full aligned NHD blocks are required; unsupported layouts fail explicitly.
+chunk_size: 256
 local_cpu: false
 max_local_cpu_size: 0
-use_layerwise: true
-save_unfull_chunk: true
-
-xds_service_name: xds0
+use_layerwise: false
+save_unfull_chunk: false
+use_gpu_connector_v3: false
 xds_backend: true
-cascadekv_backend: false
+xds_service_name: xds0
 xds_require_direct: true
-xds_windowed_io: true
-xds_read_window_size: 64
-xds_write_window_size: 64
-xds_io_queue_depth: 1
-xds_read_slot_count: 2
-xds_write_slot_count: 8
+xds_io_queue_depth: 4
 xds_async_write: false
+store_async: false

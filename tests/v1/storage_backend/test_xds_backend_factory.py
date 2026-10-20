@@ -29,6 +29,12 @@ class FakeXDSClient:
         )
         self.closed = False
 
+    def submit_readv(self, *_args):
+        raise AssertionError("factory must not submit I/O")
+
+    def submit_writev(self, *_args):
+        raise AssertionError("factory must not submit I/O")
+
     def register_gpu_buffer(self, _ptr, _size):
         return 71
 
@@ -172,7 +178,7 @@ def test_factory_constructs_only_selected_xds_backend(
 def test_storage_manager_selects_direct_xds_allocator(metadata, monkeypatch):
     config = LMCacheEngineConfig.from_defaults()
     config.local_cpu = False
-    config.max_local_cpu_size = 8192 / 1024**3
+    config.max_local_cpu_size = 0
     config.xds_service_name = "xds0"
     config.xds_backend = True
     config.xds_require_direct = True
@@ -193,6 +199,8 @@ def test_storage_manager_selects_direct_xds_allocator(metadata, monkeypatch):
     manager.storage_backends = backends
 
     assert manager._get_allocator_backend(config) is backends["XDSBackend"]
+    assert backends["XDSBackend"].staging_size == 0
+    assert backends["XDSBackend"].gpu_tensor is None
     backends["XDSBackend"].close()
 
 

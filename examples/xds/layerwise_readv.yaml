@@ -10,10 +10,9 @@ xds_backend: true
 xds_service_name: xds0
 xds_require_direct: true
 xds_windowed_io: true
-xds_read_slot_count: 1
-xds_write_slot_count: 1
 xds_io_queue_depth: 32
 xds_async_write: false
 extra_config:
+  xds_direct_kv_io: false
   xds_layerwise_block_blob: true
   xds_layerwise_readv: true

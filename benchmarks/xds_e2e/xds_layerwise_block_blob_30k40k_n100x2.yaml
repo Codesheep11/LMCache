@@ -12,10 +12,9 @@ xds_read_window_size: 64
 xds_write_window_size: 64
 # Each rank maintains eight 128 KiB reads; TP4 therefore exposes QD32.
 xds_io_queue_depth: 8
-xds_read_slot_count: 2
-xds_write_slot_count: 1
 xds_async_write: false
 extra_config:
+  xds_direct_kv_io: false
   benchmark_transfer_metrics: true
   xds_layerwise_block_blob: true
   xds_layerwise_io_window_layers: 8

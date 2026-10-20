@@ -106,8 +106,6 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     "xds_read_window_size": {"type": int, "default": 64, "env_converter": int},
     "xds_write_window_size": {"type": int, "default": 64, "env_converter": int},
     "xds_io_queue_depth": {"type": int, "default": 1, "env_converter": int},
-    "xds_read_slot_count": {"type": int, "default": 2, "env_converter": int},
-    "xds_write_slot_count": {"type": int, "default": 8, "env_converter": int},
     "xds_async_write": {
         "type": bool,
         "default": False,
@@ -664,8 +662,6 @@ def _validate_config(self):
             "xds_read_window_size",
             "xds_write_window_size",
             "xds_io_queue_depth",
-            "xds_read_slot_count",
-            "xds_write_slot_count",
         )
         for field_name in positive_direct_fields:
             value = getattr(self, field_name)

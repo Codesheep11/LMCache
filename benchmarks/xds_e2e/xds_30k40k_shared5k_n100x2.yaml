@@ -11,10 +11,9 @@ xds_windowed_io: true
 xds_read_window_size: 64
 xds_write_window_size: 64
 # The native 6 MiB block-blob sweep showed one outstanding request per GPU
-# outperforming QD=2. Two read slots let GPU scatter overlap the next read.
+# outperforming QD=2. This legacy staging experiment uses a QD-sized buffer budget.
 xds_io_queue_depth: 1
-xds_read_slot_count: 2
-xds_write_slot_count: 8
 xds_async_write: true
 extra_config:
+  xds_direct_kv_io: false
   benchmark_transfer_metrics: true

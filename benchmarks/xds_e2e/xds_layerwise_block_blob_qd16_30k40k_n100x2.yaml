@@ -12,10 +12,9 @@ xds_read_window_size: 64
 xds_write_window_size: 64
 # Sixteen 128 KiB requests per rank; TP4 aggregate QD64.
 xds_io_queue_depth: 16
-xds_read_slot_count: 2
-xds_write_slot_count: 1
 xds_async_write: false
 extra_config:
+  xds_direct_kv_io: false
   benchmark_transfer_metrics: true
   xds_layerwise_block_blob: true
   cascadekv_layerwise_gpu_producer: true

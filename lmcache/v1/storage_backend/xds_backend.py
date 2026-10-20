@@ -31,6 +31,7 @@ from lmcache.v1.storage_backend.transfer_result import (
     BackendTransferResult,
     BackendWriteSubmissionResult,
 )
+from lmcache.v1.storage_backend.xds_direct_allocator import XDSDirectKVAllocator
 from lmcache.v1.storage_backend.xds_read_ring import XDSReadRingPump
 from lmcache.v1.storage_backend.xds_write_scheduler import (
     LeaseState,
@@ -129,7 +130,7 @@ class XDSLayerReadSlotLease:
 
 
 class XDSBackend(AllocatorBackendInterface):
-    """Allocator/storage backend whose registered pool resides on the GPU."""
+    """xDS storage using direct serving-KV I/O by default, with opt-in staging."""
 
     def __init__(
         self,
@@ -148,6 +149,12 @@ class XDSBackend(AllocatorBackendInterface):
         self._readv_pools: list[Any] = []
         self._readv_poisoned = False
         self._readv_failed_staging: list[MemoryObj] = []
+        self.direct_kv_io = bool(
+            config.get_extra_config_value("xds_direct_kv_io", True)
+        )
+        self._read_slot_count = 0
+        self._write_slot_count = 0
+        self._direct_write_leases: dict[int, Any] = {}
         self._entries: OrderedDict[
             CacheEngineKey, XDSBlobMetadata | XDSLayerwiseBlockMetadata
         ] = OrderedDict()
@@ -181,6 +188,41 @@ class XDSBackend(AllocatorBackendInterface):
         )
         self.num_layers = int(metadata.kv_shape[0])
         self.block_blob_layer_stride = 0
+        self._write_scheduler: Optional[XDSAsyncWriteScheduler] = None
+        if self.direct_kv_io:
+            if (
+                config.use_layerwise
+                or config.xds_async_write
+                or getattr(config, "store_async", False)
+                or config.local_cpu
+                or config.max_local_cpu_size > 0
+            ):
+                raise ValueError(
+                    "xds_direct_kv_io requires non-layerwise synchronous stores "
+                    "and local_cpu=false, max_local_cpu_size=0"
+                )
+            if not all(
+                callable(getattr(xds_client, name, None))
+                for name in ("submit_writev", "submit_readv")
+            ):
+                raise ValueError("xds_direct_kv_io requires an xDS readv/writev SDK")
+            self.registered_size = 0
+            self.gpu_tensor = None
+            self.registered_base_ptr = 0
+            self.buffer_ref = 0
+            self.memory_allocator = XDSDirectKVAllocator()
+            self.staging_tensor = None
+            self.staging_base_ptr = 0
+            self.staging_size = 0
+            self.staging_buffer_ref = 0
+            logger.info(
+                "[XDS_DIRECT_KV_IO] staging_pool_bytes=0 synchronous_writev=true"
+            )
+            return
+        # Only the explicitly selected legacy path owns staging buffers.
+        # Bound its residency with the same concurrency budget as the I/O pump.
+        self._read_slot_count = int(config.xds_io_queue_depth)
+        self._write_slot_count = int(config.xds_io_queue_depth)
         if self.block_blob_layout:
             if not config.use_layerwise:
                 raise ValueError("xds_layerwise_block_blob requires use_layerwise=true")
@@ -203,14 +245,14 @@ class XDSBackend(AllocatorBackendInterface):
             )
         if config.xds_windowed_io:
             required_size = (
-                config.xds_read_slot_count + config.xds_write_slot_count
+                self._read_slot_count + self._write_slot_count
             ) * self.blob_size
             if self.registered_size < required_size:
                 raise ValueError(
                     f"xDS windowed I/O requires {required_size} bytes: "
                     f"pool={self.registered_size}, blob={self.blob_size}, "
-                    f"read_slots={config.xds_read_slot_count}, "
-                    f"write_slots={config.xds_write_slot_count}"
+                    f"read_slots={self._read_slot_count}, "
+                    f"write_slots={self._write_slot_count}"
                 )
         if self.registered_size % self.io_unit_size != 0:
             raise ValueError(
@@ -245,10 +287,9 @@ class XDSBackend(AllocatorBackendInterface):
         self.staging_size = self.registered_size
         self.staging_buffer_ref = self.buffer_ref
 
-        self._write_scheduler: Optional[XDSAsyncWriteScheduler] = None
         if config.xds_async_write:
             self._write_scheduler = XDSAsyncWriteScheduler(
-                write_budget_bytes=config.xds_write_slot_count * self.blob_size,
+                write_budget_bytes=self._write_slot_count * self.blob_size,
                 submit_write=self._submit_async_lease,
                 commit=self._commit_async_lease,
                 rollback=self._rollback_async_lease,
@@ -261,7 +302,7 @@ class XDSBackend(AllocatorBackendInterface):
         self,
         config: LMCacheEngineConfig,
         metadata: LMCacheMetadata,
-    ) -> TensorMemoryAllocator:
+    ) -> MemoryAllocatorInterface:
         del config, metadata
         return self.memory_allocator
 
@@ -301,7 +342,7 @@ class XDSBackend(AllocatorBackendInterface):
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self._put_tasks_lock:
-            if key in self._put_tasks:
+            if key in self._put_tasks and not self.direct_kv_io:
                 return True
         with self._entries_lock:
             metadata = self._entries.get(key)
@@ -548,6 +589,8 @@ class XDSBackend(AllocatorBackendInterface):
             self._keys_in_request.clear()
 
     def calculate_chunk_budget(self) -> int:
+        if self.direct_kv_io:
+            return int(self.client.metadata.capacity_bytes) // self.blob_size
         if self.block_blob_layout:
             return self.registered_size // self.block_blob_layer_stride
         return self.registered_size // self.blob_size
@@ -582,8 +625,8 @@ class XDSBackend(AllocatorBackendInterface):
             short_io_chunks=short_io_chunks,
             timeout_chunks=0,
             logical_chunk_count=len(completed),
-            read_slot_count=self.config.xds_read_slot_count,
-            write_slot_count=self.config.xds_write_slot_count,
+            read_slot_count=self._read_slot_count,
+            write_slot_count=self._write_slot_count,
             io_queue_depth=self.config.xds_io_queue_depth,
             peak_inflight_io=peak_inflight_io,
             slot_wait_seconds=slot_wait_seconds,
@@ -714,10 +757,14 @@ class XDSBackend(AllocatorBackendInterface):
         **kwargs: Any,
     ) -> Optional[BackendTransferResult]:
         """Read a logical batch through a bounded registered-GPU slot ring."""
-        if self.config.get_extra_config_value("xds_readv_direct", False):
+        if self.direct_kv_io or self.config.get_extra_config_value(
+            "xds_readv_direct", False
+        ):
             direct = self._get_readv_to_gpu(keys, starts, ends, gpu_connector, **kwargs)
             if direct is not None:
                 return direct
+            if self.direct_kv_io:
+                raise ValueError("unsupported KV layout/span for xDS direct readv")
         transfer_start_ns = time.monotonic_ns()
         benchmark_metrics = bool(
             self.config.get_extra_config_value("benchmark_transfer_metrics", False)
@@ -853,9 +900,9 @@ class XDSBackend(AllocatorBackendInterface):
 
         def fill_free_slots() -> None:
             nonlocal next_task, input_closed, peak_staging_bytes, submitted_count
-            while len(
-                live_entries
-            ) < self.config.xds_read_slot_count and next_task < len(task_infos):
+            while len(live_entries) < self._read_slot_count and next_task < len(
+                task_infos
+            ):
                 info = task_infos[next_task]
                 next_task += 1
                 memory_obj = self.allocate(
@@ -982,7 +1029,7 @@ class XDSBackend(AllocatorBackendInterface):
                         "storage_wait_seconds": storage_seconds,
                         "gpu_seconds": gpu_seconds,
                         "slot_wait_seconds": slot_wait_seconds,
-                        "read_slots": self.config.xds_read_slot_count,
+                        "read_slots": self._read_slot_count,
                         "io_queue_depth": self.config.xds_io_queue_depth,
                         "peak_inflight_io": result.peak_inflight_io,
                     },
@@ -1815,6 +1862,184 @@ class XDSBackend(AllocatorBackendInterface):
             )
         return []
 
+    def _put_writev_from_gpu(
+        self,
+        keys: Sequence[CacheEngineKey],
+        starts: list[int],
+        ends: list[int],
+        gpu_connector: Any,
+        **kwargs: Any,
+    ) -> BackendTransferResult:
+        """Write caller-owned final KV pages and drain before returning.
+
+        Called synchronously inside the serving worker's wait_for_save hook.
+        The caller must not replace/reuse source slots before this call returns.
+        Unsupported geometry fails before submission; accepted I/O is drained
+        on errors. Unknown DMA completion retains registrations and blob leases
+        and poisons the backend, preventing successful worker teardown.
+        """
+        if not (len(keys) == len(starts) == len(ends)):
+            raise ValueError("xDS direct write inputs must have equal lengths")
+        with self._io_lock:
+            if self._closing or self._closed or self._readv_poisoned:
+                raise RuntimeError(
+                    "xDS direct KV backend is closed or has unresolved DMA"
+                )
+            completed = [False] * len(keys)
+            selected = []
+            with self._put_tasks_lock, self._entries_lock:
+                for index, (key, start, end) in enumerate(
+                    zip(keys, starts, ends, strict=True)
+                ):
+                    if key in self._entries or key in self._put_tasks:
+                        continue
+                    self._put_tasks.add(key)
+                    selected.append((index, key, start, end))
+            items: list[dict[str, Any]] = []
+            unsafe: set[int] = set()
+            committed: set[int] = set()
+            begin = time.perf_counter()
+            try:
+                chunks = [
+                    (
+                        self.metadata.get_shapes(end - start),
+                        self.metadata.get_dtypes(),
+                        MemoryFormat.KV_2LTD,
+                        start,
+                        end,
+                    )
+                    for _, _, start, end in selected
+                ]
+                planner = getattr(gpu_connector, "plan_xds_readv_batch", None)
+                plans = (
+                    planner(chunks, self.io_unit_size, **kwargs)
+                    if callable(planner)
+                    else None
+                )
+                if plans is None or len(plans) != len(selected):
+                    raise ValueError("unsupported KV layout/span for xDS direct writev")
+                for (index, key, _, _), chunk, plan in zip(
+                    selected, chunks, plans, strict=True
+                ):
+                    if (
+                        plan.buffer_refs is None
+                        or plan.size <= 0
+                        or plan.size > self.blob_size
+                        or plan.size % self.io_unit_size
+                    ):
+                        raise ValueError(
+                            "direct writev requires registered, aligned KV pages"
+                        )
+                    # Host descriptors only: source KV bytes never leave vLLM pages.
+                    items.append(
+                        dict(
+                            index=index,
+                            key=key,
+                            plan=plan,
+                            shapes=chunk[0],
+                            dtypes=chunk[1],
+                            handle=0,
+                            slices=plan.bind_slices(plan.buffer_refs),
+                        )
+                    )
+                if items:
+                    prepare = getattr(gpu_connector, "prepare_xds_readv_dma", None)
+                    if not callable(prepare):
+                        raise ValueError(
+                            "direct writev requires a device producer fence"
+                        )
+                    prepare(items[0]["plan"].tensors[0].device)
+                for item in items:
+                    handle = int(self.client.get_blob(timeout=5.0))
+                    if handle <= 0:
+                        raise RuntimeError("xDS returned an invalid blob handle")
+                    item["handle"] = handle
+                    self._direct_write_leases[handle] = item
+
+                pump = XDSReadRingPump(
+                    self.config.xds_io_queue_depth,
+                    lambda item: int(
+                        self.client.submit_writev(item["handle"], 0, item["slices"])
+                    ),
+                    self.client.wait_any_result,
+                    30.0,
+                )
+                for item in items:
+                    pump.put(item)
+                pump.close_input()
+                pump.run()
+                error = pump.error
+                for _ in items:
+                    outcome = pump.get_completion()
+                    item = outcome.item
+                    if not outcome.safe_to_reuse:
+                        unsafe.add(item["handle"])
+                        self._readv_poisoned = True
+                    if outcome.error is not None:
+                        error = error or outcome.error
+                        continue
+                    try:
+                        self._validate_io_result(
+                            outcome.completion, item["plan"].size, "writev"
+                        )
+                    except Exception as exc:
+                        error = error or exc
+                if error is not None:
+                    raise error
+                with self._entries_lock:
+                    for item in items:
+                        self._entries[item["key"]] = XDSBlobMetadata(
+                            blob_handle=item["handle"],
+                            size=item["plan"].size,
+                            shapes=item["shapes"],
+                            dtypes=item["dtypes"],
+                            fmt=MemoryFormat.KV_2LTD,
+                        )
+                        committed.add(item["handle"])
+                        completed[item["index"]] = True
+                total = sum(item["plan"].size for item in items)
+                elapsed = time.perf_counter() - begin
+                logger.info(
+                    "[XDS_WRITEV_DIRECT_METRICS] %s",
+                    json.dumps(
+                        dict(
+                            bytes=total,
+                            chunks=len(items),
+                            seconds=elapsed,
+                            peak_staging_bytes=0,
+                            gpu_copy_seconds=0.0,
+                        ),
+                        sort_keys=True,
+                    ),
+                )
+                return self._make_transfer_result(
+                    completed,
+                    requested_bytes=total,
+                    completed_bytes=total,
+                    window_size=len(items),
+                    window_count=bool(items),
+                    peak_staging_bytes=0,
+                    storage_seconds=elapsed,
+                    gpu_seconds=0.0,
+                    slot_wait_seconds=0.0,
+                    short_io_chunks=0,
+                    peak_inflight_io=min(len(items), self.config.xds_io_queue_depth),
+                )
+            finally:
+                retained_keys = set()
+                for item in items:
+                    handle = item["handle"]
+                    if handle in unsafe:
+                        retained_keys.add(item["key"])
+                        continue
+                    self._direct_write_leases.pop(handle, None)
+                    if handle and handle not in committed:
+                        self.client.release_blob(handle)
+                with self._put_tasks_lock:
+                    for _, key, _, _ in selected:
+                        if key not in retained_keys:
+                            self._put_tasks.discard(key)
+
     def batched_put_from_gpu_blocking(
         self,
         keys: Sequence[CacheEngineKey],
@@ -1823,7 +2048,11 @@ class XDSBackend(AllocatorBackendInterface):
         gpu_connector: Any,
         **kwargs: Any,
     ) -> Optional[BackendTransferResult | BackendWriteSubmissionResult]:
-        """Gather and persist a logical batch through bounded GPU slots."""
+        """Persist a batch through direct writev or bounded GPU staging slots."""
+        if self.direct_kv_io:
+            return self._put_writev_from_gpu(
+                keys, starts, ends, gpu_connector, **kwargs
+            )
         if not self.config.xds_windowed_io:
             return None
         if not (len(keys) == len(starts) == len(ends)):
@@ -1860,11 +2089,9 @@ class XDSBackend(AllocatorBackendInterface):
         slot_wait_seconds = 0.0
         wall_start = time.perf_counter()
         try:
-            for window_start in range(
-                0, len(task_infos), self.config.xds_write_slot_count
-            ):
+            for window_start in range(0, len(task_infos), self._write_slot_count):
                 window_infos = task_infos[
-                    window_start : window_start + self.config.xds_write_slot_count
+                    window_start : window_start + self._write_slot_count
                 ]
                 objects: list[MemoryObj] = []
                 try:
@@ -1933,7 +2160,7 @@ class XDSBackend(AllocatorBackendInterface):
         logger.info(
             "[xDS Window] direction=write chunks=%d slots=%d bytes=%d wall_ms=%.3f",
             len(task_infos),
-            self.config.xds_write_slot_count,
+            self._write_slot_count,
             completed_bytes,
             (time.perf_counter() - wall_start) * 1000,
         )
@@ -1974,11 +2201,9 @@ class XDSBackend(AllocatorBackendInterface):
                         }
                     )
 
-            for lease_start in range(
-                0, len(task_infos), self.config.xds_write_slot_count
-            ):
+            for lease_start in range(0, len(task_infos), self._write_slot_count):
                 lease_infos = task_infos[
-                    lease_start : lease_start + self.config.xds_write_slot_count
+                    lease_start : lease_start + self._write_slot_count
                 ]
                 reserved_bytes = len(lease_infos) * self.blob_size
                 backpressure_seconds += scheduler.acquire_credits(
@@ -2484,8 +2709,10 @@ class XDSBackend(AllocatorBackendInterface):
         initialize = getattr(gpu_connector, "initialize_xds_readv_pool", None)
         if not callable(initialize):
             return
-        if not self.config.get_extra_config_value("xds_readv_direct", False) and not (
-            self.config.get_extra_config_value("xds_layerwise_readv", False)
+        if (
+            not self.direct_kv_io
+            and not self.config.get_extra_config_value("xds_readv_direct", False)
+            and not (self.config.get_extra_config_value("xds_layerwise_readv", False))
         ):
             return
         with self._io_lock:
@@ -2590,7 +2817,8 @@ class XDSBackend(AllocatorBackendInterface):
             if first_error is None:
                 first_error = error
         try:
-            self.client.unregister_buffer(self.buffer_ref)
+            if self.buffer_ref:
+                self.client.unregister_buffer(self.buffer_ref)
         except BaseException as error:
             if first_error is None:
                 first_error = error
