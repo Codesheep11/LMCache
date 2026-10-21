@@ -104,6 +104,7 @@ class XDSAsyncConnector(LMCacheConnectorV1Dynamic):
         # Keep the cached-token accounting for normal store metadata, but never
         # restore again when vLLM schedules the remaining prompt after readiness.
         spec.can_load = False
+        spec.allow_compact_metadata = adapter.kv_role != "kv_producer"
 
     def build_connector_meta(self, scheduler_output: Any) -> XDSAsyncMetadata:
         """Dispatch reserved loads even without a forward or after an abort."""

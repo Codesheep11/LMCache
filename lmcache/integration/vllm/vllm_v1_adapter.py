@@ -67,6 +67,8 @@ class LoadSpec:
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
+    # Async connectors may omit no-op payloads once their load is dispatched.
+    allow_compact_metadata: bool = False
 
 
 @dataclass
@@ -290,6 +292,8 @@ class ReqMeta:
     disagg_spec: Optional[DisaggSpec] = None
     # the configs of the request
     request_configs: Optional[dict] = None
+    # Metrics-only metadata need not carry prompt tokens or GPU slot mappings.
+    num_prompt_tokens: Optional[int] = None
 
     @staticmethod
     def from_request_tracker(
@@ -362,6 +366,27 @@ class ReqMeta:
         if not skip_save:
             tracker.num_saved_tokens = num_tokens_to_save
         save_spec = SaveSpec(skip_leading_tokens, not skip_save)
+
+        # Completed asynchronous loads retain LoadSpec for hit accounting. Send
+        # only the counts when neither load nor save is due; rebuilding and
+        # sharing a full slot tensor adds IPC work before prefill. Keep this
+        # opt-in: producer connectors can use payloads even with can_save=False.
+        if (
+            skip_save
+            and load_spec is not None
+            and not load_spec.can_load
+            and load_spec.allow_compact_metadata
+        ):
+            return ReqMeta(
+                req_id=tracker.req_id,
+                token_ids=[],
+                slot_mapping=torch.empty(0, dtype=torch.long),
+                is_last_prefill=is_last_prefill,
+                save_spec=save_spec,
+                load_spec=load_spec,
+                request_configs=tracker.request_configs,
+                num_prompt_tokens=num_tokens_to_save,
+            )
 
         # Calculate the token ids and slot mappings for load and save
         token_ids = input_token_ids[:num_tokens_to_save]
@@ -808,7 +833,9 @@ class LMCacheConnectorV1Impl:
                     request.load_spec.vllm_cached_tokens
                 )
                 self._stats_monitor.update_interval_prompt_tokens(
-                    len(request.token_ids)
+                    request.num_prompt_tokens
+                    if request.num_prompt_tokens is not None
+                    else len(request.token_ids)
                 )
 
             if request.load_spec is None or not request.load_spec.can_load:
