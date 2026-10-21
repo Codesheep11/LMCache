@@ -26,7 +26,13 @@ from lmcache.v1.gpu_connector.utils import (
     get_tokens_per_layer,
     permute_kv_caches_to_contiguous,
 )
-from lmcache.v1.gpu_connector.xds_readv import XDSReadvPlan, plan_paged_readv_batch
+from lmcache.v1.gpu_connector.xds_readv import (
+    XDSKVPool,
+    XDSReadvPlan,
+    cuda_readv_flush_function,
+    finish_readv_dma,
+    plan_paged_readv_batch,
+)
 from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import (
     LayerwiseStagingMemoryObj,
@@ -288,6 +294,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         self.kv_cache_pointers_on_gpu: dict[int, torch.Tensor] = {}
 
         self.kvcaches: Optional[List[torch.Tensor]] = None
+        self.xds_kv_pool: Optional[XDSKVPool] = None
 
         self.gpu_buffer: Optional[torch.Tensor] = None
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
@@ -549,6 +556,69 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         )
         return plans[0] if plans else None
 
+    def prepare_xds_readv_dma(self, device: torch.device) -> None:
+        """Wait for CUDA producers/consumers before external DMA touches KV pages.
+
+        Args:
+            device: CUDA device owning the registered KV pool.
+        """
+        cuda_readv_flush_function()  # Fail before DMA if visibility fencing is absent.
+        torch.cuda.synchronize(device)
+
+    def finish_xds_readv_dma(self, device: torch.device) -> None:
+        """Make completed external DMA writes visible to subsequent CUDA work.
+
+        Args:
+            device: CUDA device owning the registered KV pool. The backend must
+                have observed all I/O completions before calling this method.
+        """
+        finish_readv_dma(device)
+
+    def initialize_xds_readv_pool(self, kvcaches: List[torch.Tensor]) -> XDSKVPool:
+        """Validate and retain fixed CUDA KV storage for backend registration.
+
+        Args:
+            kvcaches: Final vLLM KV tensors in layer order.
+        Returns:
+            The same pool on repeated initialization with identical storage.
+        Raises:
+            ValueError: Layout or alignment cannot support direct KV I/O.
+            RuntimeError: A fixed pool was replaced or already closed.
+        """
+        tensors = tuple(permute_kv_caches_to_contiguous(kvcaches))
+        ranges = tuple((t.data_ptr(), t.numel() * t.element_size()) for t in tensors)
+        if self.xds_kv_pool is not None:
+            pool = self.xds_kv_pool
+            if (
+                pool.closed
+                or ranges != pool.registration_ranges
+                or any(
+                    t.shape != old.shape
+                    or t.stride() != old.stride()
+                    or t.dtype != old.dtype
+                    or t.device != old.device
+                    for t, old in zip(tensors, pool.tensors, strict=True)
+                )
+            ):
+                raise RuntimeError("cannot replace or reuse a closed xDS KV pool")
+            return pool
+        if not tensors or self.use_mla or tensors[0].ndim != 5:
+            raise ValueError("unsupported CUDA xDS KV pool")
+        block_size = tensors[0].shape[2]
+        shape = torch.Size(
+            (2, len(tensors), block_size, tensors[0].shape[3] * tensors[0].shape[4])
+        )
+        plans = self.plan_xds_readv_batch(
+            [([shape], [tensors[0].dtype], MemoryFormat.KV_2LTD, 0, block_size)],
+            4096,
+            kvcaches=list(tensors),
+            slot_mapping_cpu=torch.arange(block_size),
+        )
+        if plans is None:
+            raise ValueError("unaligned or unsupported CUDA xDS KV pool")
+        self.xds_kv_pool = XDSKVPool(tensors, ranges)
+        return self.xds_kv_pool
+
     def plan_xds_readv_batch(
         self,
         chunks: List[
@@ -586,6 +656,9 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         layout = layouts.get(fmt_gpu)
         if layout is None:
             return None
+        pool = self.xds_kv_pool
+        if pool is not None:
+            self.initialize_xds_readv_pool(self.kvcaches)
         return plan_paged_readv_batch(
             self.kvcaches,
             chunks,
@@ -593,6 +666,8 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             io_unit,
             layout,
             compact=kwargs.get("xds_compact_batch", False),
+            registration_ranges=pool.registration_ranges if pool else None,
+            buffer_refs=pool.buffer_refs if pool else None,
         )
 
     def get_shape(self, num_tokens: int) -> torch.Size:

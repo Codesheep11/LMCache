@@ -748,6 +748,13 @@ class LMCacheConnectorV1Impl:
         self.kv_caches = kv_caches
         self._build_kv_layer_groups()
         self._manager.post_init()
+        engine = self.lmcache_engine
+        if engine is not None and engine.storage_manager is not None:
+            backend = engine.storage_manager.storage_backends.get("XDSBackend")
+            if backend is not None:
+                backend.register_kv_caches(
+                    engine.gpu_connector, list(self.kv_caches.values())
+                )
 
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:

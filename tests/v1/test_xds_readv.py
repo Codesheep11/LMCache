@@ -383,3 +383,59 @@ def test_compact_batch_rejects_invalid_owned_mapping(mapping: dict) -> None:
     fields.update(mapping)
     with pytest.raises(ValueError, match="invalid compact readv"):
         XDSPagedReadvBatch(geometry, **fields)
+
+
+@pytest.mark.parametrize("layout", ["2NB", "NB2"])
+@pytest.mark.parametrize("compact", [False, True])
+def test_cuda_fixed_pool_reuses_registration_and_refreshes_slots(
+    layout: str, compact: bool
+) -> None:
+    """Fixed storage keeps refs, but each request gets its own block mapping."""
+    from lmcache.v1.gpu_connector.gpu_connectors import VLLMPagedMemGPUConnectorV2
+
+    shape = (2, 8, 16, 2, 128) if layout == "2NB" else (8, 2, 16, 2, 128)
+    tensors = [torch.empty(shape, dtype=torch.float16, device="cuda")]
+    connector = VLLMPagedMemGPUConnectorV2(hidden_dim_size=256, num_layers=1)
+    pool = connector.initialize_xds_readv_pool(tensors)
+    assert connector.initialize_xds_readv_pool(tensors) is pool
+    pool.buffer_refs = (123,)
+    chunk = (
+        [torch.Size([2, 1, 16, 256])],
+        [torch.float16],
+        MemoryFormat.KV_2LTD,
+        0,
+        16,
+    )
+    for block in (0, 3):
+        plans = connector.plan_xds_readv_batch(
+            [chunk],
+            4096,
+            kvcaches=tensors,
+            slot_mapping_cpu=torch.arange(block * 16, (block + 1) * 16),
+            xds_compact_batch=compact,
+        )
+        assert plans is not None
+        assert plans[0].buffer_refs == (123,)
+        assert plans[0].block_ids == (block,)
+    with pytest.raises(RuntimeError, match="replace"):
+        connector.initialize_xds_readv_pool([torch.empty_like(tensors[0])])
+    pool.closed = True
+    with pytest.raises(RuntimeError, match="closed"):
+        connector.initialize_xds_readv_pool(tensors)
+
+
+def test_cuda_dma_fence_waits_for_other_streams() -> None:
+    """External DMA must not race a producer running outside the current stream."""
+    from lmcache.v1.gpu_connector.gpu_connectors import VLLMPagedMemGPUConnectorV2
+
+    connector = VLLMPagedMemGPUConnectorV2(hidden_dim_size=256, num_layers=1)
+    tensor = torch.empty(1024 * 1024, device="cuda")
+    stream = torch.cuda.Stream()
+    done = torch.cuda.Event()
+    with torch.cuda.stream(stream):
+        tensor.fill_(7)
+        done.record()
+    connector.prepare_xds_readv_dma(tensor.device)
+    assert done.query()
+    connector.finish_xds_readv_dma(tensor.device)
+    assert torch.all(tensor == 7)

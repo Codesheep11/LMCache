@@ -17,6 +17,17 @@ import torch
 from lmcache.v1.memory_management import MemoryFormat
 
 
+@dataclass
+class XDSKVPool:
+    """Fixed tensor storage retained until its owning backend releases DMA pins."""
+
+    tensors: tuple[torch.Tensor, ...]
+    registration_ranges: tuple[tuple[int, int], ...]
+    owner: Any = None
+    buffer_refs: Optional[tuple[int, ...]] = None
+    closed: bool = False
+
+
 @dataclass(frozen=True)
 class _PagedSlices(Sequence[tuple[int, int, int]]):
     layers: int
