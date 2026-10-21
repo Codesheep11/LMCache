@@ -1,0 +1,21 @@
+# vLLM V1 asynchronous per-request restore (CUDA, text-only, single KV group).
+# Select the connector with:
+# --kv-transfer-config '{"kv_connector":"XDSAsyncConnector",
+#   "kv_connector_module_path":"lmcache.integration.vllm.xds_async_connector",
+#   "kv_role":"kv_both"}'
+# This uses vLLM's async scheduling protocol, not LMCache CPU prefetch.
+enable_async_loading: false
+# SSD <-> final serving KV pages, without a KV staging pool.
+# Full aligned NHD blocks are required; unsupported layouts fail explicitly.
+chunk_size: 256
+local_cpu: false
+max_local_cpu_size: 0
+use_layerwise: false
+save_unfull_chunk: false
+use_gpu_connector_v3: false
+xds_backend: true
+xds_service_name: xds0
+xds_require_direct: true
+xds_io_queue_depth: 4
+xds_async_write: false
+store_async: false
