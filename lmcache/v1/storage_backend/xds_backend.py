@@ -3118,6 +3118,7 @@ class XDSBackend(AllocatorBackendInterface):
     ) -> Optional[BackendTransferResult]:
         """Restore eligible chunks to final KV blocks; never fall back after DMA."""
         from lmcache.v1.gpu_connector.xds_readv import (
+            XDSPagedReadvBatch,
             cuda_readv_flush_function,
             finish_readv_dma,
         )
@@ -3143,19 +3144,19 @@ class XDSBackend(AllocatorBackendInterface):
             unsafe: dict[int, int] = {}
             try:
                 selected = []
-                for index, (key, start, end) in enumerate(
-                    zip(keys, starts, ends, strict=True)
-                ):
-                    with self._entries_lock:
+                with self._entries_lock:
+                    for index, (key, start, end) in enumerate(
+                        zip(keys, starts, ends, strict=True)
+                    ):
                         entry = self._entries.get(key)
                         if entry is None:
                             continue
                         entry.pin()
                         pinned.append(entry)
                         self._entries.move_to_end(key)
-                    if entry.blob_offset % self.io_unit_size:
-                        return None
-                    selected.append((index, entry, start, end))
+                        if entry.blob_offset % self.io_unit_size:
+                            return None
+                        selected.append((index, entry, start, end))
                 if not selected:
                     return None
                 chunks = [
@@ -3164,21 +3165,32 @@ class XDSBackend(AllocatorBackendInterface):
                 ]
                 batch_planner = getattr(gpu_connector, "plan_xds_readv_batch", None)
                 if callable(batch_planner):
-                    plans = batch_planner(chunks, self.io_unit_size, **kwargs)
+                    plans = batch_planner(
+                        chunks,
+                        self.io_unit_size,
+                        **{**kwargs, "xds_compact_batch": True},
+                    )
                 else:
                     plans = [
                         planner(*chunk, self.io_unit_size, **kwargs) for chunk in chunks
                     ]
                 if plans is None or len(plans) != len(selected):
                     return None
+                compact = isinstance(plans, XDSPagedReadvBatch)
                 items = []
-                for (index, entry, _, _), plan in zip(selected, plans, strict=True):
+                planned = range(len(plans)) if compact else plans
+                for (index, entry, _, _), plan in zip(selected, planned, strict=True):
+                    if compact:
+                        if plans.sizes[plan] != entry.size:
+                            return None
+                        items.append((index, entry, plan))
+                        continue
                     if plan is None or plan.size != entry.size:
                         return None
                     items.append((index, entry, plan))
                 # Full-block plans share one KV pool. Check block ownership once,
                 # not every K/V/layer fragment, avoiding a large address sort.
-                if len(items) > 1:
+                if not compact and len(items) > 1:
                     targets = tuple(t.data_ptr() for t in items[0][2].tensors)
                     seen_blocks: set[int] = set()
                     for _, _, plan in items:
@@ -3190,10 +3202,12 @@ class XDSBackend(AllocatorBackendInterface):
                         if seen_blocks.intersection(plan.block_ids):
                             return None
                         seen_blocks.update(plan.block_ids)
-                device = items[0][2].tensors[0].device
-                pools = {id(plan.tensors): plan.tensors for _, _, plan in items}
-                if any(t.device != device for pool in pools.values() for t in pool):
-                    return None
+                target_plan = plans if compact else items[0][2]
+                device = target_plan.tensors[0].device
+                if not compact:
+                    pools = {id(plan.tensors): plan.tensors for _, _, plan in items}
+                    if any(t.device != device for pool in pools.values() for t in pool):
+                        return None
                 # The engine owns these destination blocks through completion.
                 # Finish prior users before DMA; no GPU copy kernel is launched.
                 prepare_dma = getattr(gpu_connector, "prepare_xds_readv_dma", None)
@@ -3206,14 +3220,14 @@ class XDSBackend(AllocatorBackendInterface):
                     finish_dma = finish_readv_dma
                 # Target identity was checked across all plans above. Resolve
                 # registrations once for the batch, before the first DMA.
-                plan = items[0][2]
+                plan = target_plan
                 if device.type == "npu" and plan.buffer_refs is None:
                     raise RuntimeError("register xDS KV caches before restoring")
                 if plan.buffer_refs is not None:
                     refs = plan.buffer_refs
                 else:
                     refs = []
-                    plan = items[0][2]
+                    plan = target_plan
                     registration_ranges = getattr(plan, "registration_ranges", None)
                     if registration_ranges is not None and len(
                         registration_ranges
@@ -3253,8 +3267,19 @@ class XDSBackend(AllocatorBackendInterface):
                             self._readv_targets[target_key] = (tensor, ref)
                         refs.append(self._readv_targets[target_key][1])
 
+                groups = plans.prepare_groups(refs) if compact else None
+
                 def submit(item: Any) -> int:
                     _, entry, plan = item
+                    if compact:
+                        return plans.submit_chunk(
+                            self.client,
+                            plan,
+                            entry.blob_handle,
+                            entry.blob_offset,
+                            refs,
+                            groups,
+                        )
                     # All metadata and cross-chunk block ownership are validated
                     # already. Materialize this vector just in time, while prior
                     # chunks can execute; the pump drains I/O on submit errors.
@@ -3288,13 +3313,14 @@ class XDSBackend(AllocatorBackendInterface):
                         error = error or outcome.error
                         continue
                     result = outcome.completion
-                    if result.status or result.completed_bytes != plan.size:
+                    expected_size = entry.size
+                    if result.status or result.completed_bytes != expected_size:
                         error = error or RuntimeError(
                             "xDS direct KV read failed or was short"
                         )
                     else:
                         completed[index] = True
-                        completed_bytes += plan.size
+                        completed_bytes += expected_size
                 finish_dma(device)
                 if error is not None:
                     raise error
@@ -3315,7 +3341,7 @@ class XDSBackend(AllocatorBackendInterface):
                 )
                 return self._make_transfer_result(
                     completed,
-                    requested_bytes=sum(p.size for _, _, p in items),
+                    requested_bytes=sum(entry.size for _, entry, _ in items),
                     completed_bytes=completed_bytes,
                     window_size=max(1, len(items)),
                     window_count=1,

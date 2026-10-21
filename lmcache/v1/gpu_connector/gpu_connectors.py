@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections.abc import Sequence
 from typing import Any, List, Optional, Tuple, Union
 import abc
 import ctypes
@@ -48,12 +49,9 @@ def _coalesce_contiguous_host_chunks(
     memory_objs: List[MemoryObj],
 ) -> list[tuple[int, int, torch.Tensor]]:
     """Expose adjacent registered host chunks as larger zero-copy tensor views."""
-    if (
-        len(memory_objs) == 1
-        and (
-            isinstance(memory_objs[0], LayerwiseStagingMemoryObj)
-            or hasattr(memory_objs[0], "chunk_count")
-        )
+    if len(memory_objs) == 1 and (
+        isinstance(memory_objs[0], LayerwiseStagingMemoryObj)
+        or hasattr(memory_objs[0], "chunk_count")
     ):
         layer_view = memory_objs[0]
         if len(starts) != len(ends) or layer_view.chunk_count != len(starts):
@@ -558,7 +556,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         ],
         io_unit: int,
         **kwargs: Any,
-    ) -> Optional[List[XDSReadvPlan]]:
+    ) -> Optional[Sequence[XDSReadvPlan]]:
         """Validate target layout once and plan source-ordered chunk reads.
 
         chunks contains (shapes, dtypes, format, start, end) per stored chunk.
@@ -588,7 +586,14 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         layout = layouts.get(fmt_gpu)
         if layout is None:
             return None
-        return plan_paged_readv_batch(self.kvcaches, chunks, slots, io_unit, layout)
+        return plan_paged_readv_batch(
+            self.kvcaches,
+            chunks,
+            slots,
+            io_unit,
+            layout,
+            compact=kwargs.get("xds_compact_batch", False),
+        )
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         kv_size = 1 if self.use_mla else 2
@@ -1555,9 +1560,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     layer_trace["host_coalesced_run_count"] = len(coalesced_runs)
                     layer_trace["copy_enqueue_start_ns"] = copy_enqueue_start_ns
                     layer_trace["copy_enqueue_end_ns"] = copy_enqueue_end_ns
-                    layer_trace["scatter_enqueue_start_ns"] = (
-                        scatter_enqueue_start_ns
-                    )
+                    layer_trace["scatter_enqueue_start_ns"] = scatter_enqueue_start_ns
                     layer_trace["scatter_enqueue_end_ns"] = scatter_enqueue_end_ns
                     layer_trace["gpu_staging_buffer_index"] = buffer_index
             else:
@@ -1959,9 +1962,7 @@ class SGLangGPUConnector(GPUConnectorInterface):
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         kv_size = 1 if self.use_mla else 2
-        return torch.Size(
-            [kv_size, self.num_layers, num_tokens, self.hidden_dim_size]
-        )
+        return torch.Size([kv_size, self.num_layers, num_tokens, self.hidden_dim_size])
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):

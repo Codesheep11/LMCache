@@ -201,6 +201,147 @@ class XDSPagedKVGeometry:
     address_alignment: int
 
 
+@dataclass(frozen=True)
+class XDSPagedReadvBatch(Sequence[XDSReadvPlan]):
+    """Compact, owned request mapping with one shared immutable KV geometry.
+
+    Offsets delimit each chunk in block_ids; sizes are source byte counts.
+    Construction rejects empty/overlapping/out-of-range blocks and inconsistent
+    chunk sizes with ValueError. All fields must be immutable tuples. Indexing
+    materializes a compatibility plan; submit_chunk avoids those allocations.
+    The caller retains pool and block ownership through all completions.
+    """
+
+    geometry: XDSPagedKVGeometry
+    block_ids: tuple[int, ...]
+    offsets: tuple[int, ...]
+    sizes: tuple[int, ...]
+    registration_ranges: Optional[tuple[tuple[int, int], ...]] = None
+    buffer_refs: Optional[tuple[int, ...]] = None
+
+    def __post_init__(self) -> None:
+        if (
+            any(
+                type(x) is not tuple for x in (self.block_ids, self.offsets, self.sizes)
+            )
+            or any(not isinstance(x, int) for x in (*self.offsets, *self.sizes))
+            or not self.sizes
+            or len(self.offsets) != len(self.sizes) + 1
+            or self.offsets[0] != 0
+            or self.offsets[-1] != len(self.block_ids)
+            or any(
+                not isinstance(b, int) or b < 0 or b >= self.geometry.blocks
+                for b in self.block_ids
+            )
+            or len(set(self.block_ids)) != len(self.block_ids)
+            or any(
+                end <= start
+                or size
+                != (end - start) * self.geometry.block_size * self.geometry.token_bytes
+                for start, end, size in zip(
+                    self.offsets, self.offsets[1:], self.sizes, strict=False
+                )
+            )
+        ):
+            raise ValueError("invalid compact readv block mapping or sizes")
+        for refs in (self.buffer_refs, self.registration_ranges):
+            if refs is not None and (
+                type(refs) is not tuple or len(refs) != len(self.tensors)
+            ):
+                raise ValueError(
+                    "compact readv reference count differs from target pool"
+                )
+
+    @property
+    def tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return the pool owned by this batch until completion."""
+        return self.geometry.tensors
+
+    def __len__(self) -> int:
+        return len(self.sizes)
+
+    def __getitem__(self, index: Any) -> Any:
+        if isinstance(index, slice):
+            return tuple(self[i] for i in range(*index.indices(len(self))))
+        if index < 0:
+            index += len(self)
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        geometry = self.geometry
+        ids = self.block_ids[self.offsets[index] : self.offsets[index + 1]]
+        return XDSReadvPlan(
+            self.tensors,
+            _PagedSlices(
+                geometry.layers,
+                geometry.blocks,
+                geometry.block_bytes,
+                ids,
+                geometry.layout,
+            ),
+            self.sizes[index],
+            ids,
+            self.registration_ranges,
+            self.buffer_refs,
+        )
+
+    def prepare_groups(self, refs: Sequence[int]) -> tuple[tuple[int, int, int], ...]:
+        """Build shared indexed SDK geometry once for registered references.
+
+        Raises ValueError if refs does not cover the owned pool. The returned
+        tuple can be shared by all submit_chunk calls for this batch.
+        """
+        if len(refs) != len(self.tensors):
+            raise ValueError("readv reference count differs from tensor count")
+        g = self.geometry
+        if g.layout == "SEPARATE":
+            return tuple(
+                (refs[2 * layer + kv], 0, g.block_bytes)
+                for kv in range(2)
+                for layer in range(g.layers)
+            )
+        stride = 1 if g.layout == "2NB" else 2
+        return tuple(
+            (
+                ref,
+                (kv * g.blocks if g.layout == "2NB" else kv) * g.block_bytes,
+                stride * g.block_bytes,
+            )
+            for kv in range(2)
+            for ref in refs
+        )
+
+    def submit_chunk(
+        self,
+        client: Any,
+        index: int,
+        handle: int,
+        offset: int,
+        refs: Sequence[int],
+        groups: tuple[tuple[int, int, int], ...],
+    ) -> int:
+        """Submit one chunk using shared groups, without allocating Python plans.
+
+        groups must come from prepare_groups(refs) on this batch. Native SDK
+        descriptors are copied on submit. Older SDKs materialize a compatibility
+        vector just in time. IndexError and SDK failures propagate to the pump,
+        which must drain accepted I/O before target ownership can be released.
+        """
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        prepare = getattr(client, "prepare_indexed_readv", None)
+        submit = getattr(client, "submit_readv_plan", None)
+        if (
+            callable(prepare)
+            and callable(submit)
+            and getattr(client, "supports_native_readv", True)
+        ):
+            ids = self.block_ids[self.offsets[index] : self.offsets[index + 1]]
+            return int(
+                submit(handle, offset, prepare(ids, groups, self.geometry.block_bytes))
+            )
+        return int(client.submit_readv(handle, offset, self[index].bind_slices(refs)))
+
+
 def validate_paged_readv_pool(
     tensors: Sequence[torch.Tensor], layout: str, device_type: str = "cuda"
 ) -> Optional[XDSPagedKVGeometry]:
@@ -277,7 +418,8 @@ def plan_paged_readv_batch(
     registration_ranges: Optional[tuple[tuple[int, int], ...]] = None,
     buffer_refs: Optional[tuple[int, ...]] = None,
     geometry: Optional[XDSPagedKVGeometry] = None,
-) -> Optional[list[XDSReadvPlan]]:
+    compact: bool = False,
+) -> Optional[Sequence[XDSReadvPlan]]:
     """Validate a whole restore before DMA, sharing target-pool validation.
 
     Each chunk supplies shapes, dtypes, format, start and end token positions.
@@ -292,6 +434,8 @@ def plan_paged_readv_batch(
     plan allocation for an already registered pool. Raises ValueError if their
     count differs from the number of target tensors, or if supplied geometry
     belongs to a different pool or layout.
+    compact=True returns an owned XDSPagedReadvBatch instead of allocating a
+    plan and slices object per chunk; default preserves the list API.
     """
     if not chunks:
         return []
@@ -349,12 +493,19 @@ def plan_paged_readv_batch(
         # NumPy keeps 30K+ slot IDs in a compact CPU array instead of allocating
         # a Python integer for every token and a range list for every block.
         slot_array = slot_values.numpy()
-        rows = np.concatenate(
-            [
-                slot_array[start - base : end - base].reshape(-1, block_size)
-                for _, _, _, start, end in chunks
-            ],
-            axis=0,
+        rows = (
+            slot_array.reshape(-1, block_size)
+            if all(
+                left[4] == right[3]
+                for left, right in zip(chunks, chunks[1:], strict=False)
+            )
+            else np.concatenate(
+                [
+                    slot_array[start - base : end - base].reshape(-1, block_size)
+                    for _, _, _, start, end in chunks
+                ],
+                axis=0,
+            )
         )
         first_slots = rows[:, 0]
         if (
@@ -390,6 +541,20 @@ def plan_paged_readv_batch(
                 seen.add(block)
                 all_block_ids.append(block)
     owned_tensors = geometry.tensors
+    if compact:
+        offsets = [0]
+        for _, _, _, start, end in chunks:
+            offsets.append(offsets[-1] + (end - start) // block_size)
+        return XDSPagedReadvBatch(
+            geometry,
+            tuple(all_block_ids),
+            tuple(offsets),
+            tuple(
+                (end - start) * geometry.token_bytes for _, _, _, start, end in chunks
+            ),
+            registration_ranges,
+            buffer_refs,
+        )
     plans = []
     cursor = 0
     for shapes, _, _, start, end in chunks:

@@ -346,3 +346,40 @@ def test_native_plan_submission_preserves_byte_mapping(
         assert legacy_calls == [(17, 4096, plan.bind_slices(refs))]
         with pytest.raises(ValueError, match="reference count"):
             plan.submit(client, 17, 4096, refs + [99])
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        {"block_ids": ([],)},
+        {"block_ids": (4,)},
+        {"block_ids": (1, 1), "offsets": (0, 2), "sizes": (16384,)},
+        {"offsets": [0, 1]},
+        {"offsets": (0, 0)},
+        {"sizes": (8191,)},
+    ],
+)
+def test_compact_batch_rejects_invalid_owned_mapping(mapping: dict) -> None:
+    """Malformed immutable mappings must fail before any SDK submission."""
+    from lmcache.v1.gpu_connector.xds_readv import (
+        XDSPagedKVGeometry,
+        XDSPagedReadvBatch,
+    )
+
+    geometry = XDSPagedKVGeometry(
+        (torch.empty(1, device="cpu"),),
+        "2NB",
+        "cuda",
+        torch.float16,
+        1,
+        4,
+        16,
+        128,
+        4096,
+        512,
+        4096,
+    )
+    fields = {"block_ids": (1,), "offsets": (0, 1), "sizes": (8192,)}
+    fields.update(mapping)
+    with pytest.raises(ValueError, match="invalid compact readv"):
+        XDSPagedReadvBatch(geometry, **fields)

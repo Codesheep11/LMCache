@@ -275,3 +275,83 @@ def test_direct_mode_rejects_incompatible_lifetimes(stack, option):
     with pytest.raises(ValueError, match="synchronous stores"):
         XDSBackend(backend.config, backend.metadata, VectorClient(), "cpu")
     backend.close()
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize("failure", [None, "short", "timeout"])
+def test_compact_restore_preserves_payload_and_failure_ownership(
+    stack: tuple, native: bool, bound: bool, failure: str | None
+) -> None:
+    from lmcache.v1.gpu_connector.xds_readv import (
+        XDSPagedKVGeometry,
+        XDSPagedReadvBatch,
+    )
+
+    backend, client, connector, first = stack
+    backend.config.xds_io_queue_depth = 2
+    second = CacheEngineKey("test", 1, 0, 100, torch.float16)
+    keys = [first, second]
+    expected = tuple(t[1].clone() for t in connector.tensors)
+    backend.batched_put_from_gpu_blocking(keys, [0, 16], [16, 32], connector, block=1)
+    geometry = XDSPagedKVGeometry(
+        connector.tensors,
+        "SEPARATE",
+        "cpu",
+        torch.float16,
+        1,
+        4,
+        16,
+        128,
+        4096,
+        512,
+        4096,
+    )
+
+    def planner(chunks: list, io_unit: int, **kwargs: object) -> XDSPagedReadvBatch:
+        assert kwargs["xds_compact_batch"] is True and len(chunks) == 2
+        return XDSPagedReadvBatch(
+            geometry,
+            (2, 3),
+            (0, 1, 2),
+            (8192, 8192),
+            connector.pool.registration_ranges,
+            connector.pool.buffer_refs if bound else None,
+        )
+
+    connector.plan_xds_readv_batch = planner
+    for t in connector.tensors:
+        t[2:].fill_(-7)
+    groups_seen = []
+    if native:
+
+        def prepare(ids: tuple, groups: tuple, block_bytes: int) -> list:
+            groups_seen.append(groups)
+            return [
+                (ref, base + block * stride, block_bytes)
+                for ref, base, stride in groups
+                for block in ids
+            ]
+
+        client.prepare_indexed_readv = prepare
+        client.submit_readv_plan = client.submit_readv
+    client.failure = failure
+    if failure:
+        with pytest.raises((RuntimeError, TimeoutError)):
+            backend.batched_get_to_gpu_blocking(keys, [0, 16], [16, 32], connector)
+        if failure == "timeout":
+            assert not client.unregistered
+            with pytest.raises(RuntimeError, match="unresolved DMA"):
+                backend.close()
+        else:
+            assert not client.pending
+            backend.close()
+    else:
+        result = backend.batched_get_to_gpu_blocking(keys, [0, 16], [16, 32], connector)
+        assert result.completed == (True, True) and result.completed_bytes == 16384
+        assert result.peak_staging_bytes == 0 and len(client.buffers) == 2
+        for t, saved in zip(connector.tensors, expected, strict=True):
+            assert torch.equal(t[2], saved) and torch.equal(t[3], saved)
+        backend.close()
+    if native:
+        assert len(groups_seen) == 2 and groups_seen[0] is groups_seen[1]
