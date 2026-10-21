@@ -9,6 +9,7 @@ from typing import Any, Optional
 import ctypes
 
 # Third Party
+import numpy as np
 import torch
 
 # First Party
@@ -188,6 +189,7 @@ def plan_paged_readv_batch(
     layout: str,
     device_type: str = "cuda",
     registration_ranges: Optional[tuple[tuple[int, int], ...]] = None,
+    buffer_refs: Optional[tuple[int, ...]] = None,
 ) -> Optional[list[XDSReadvPlan]]:
     """Validate a whole restore before DMA, sharing target-pool validation.
 
@@ -198,9 +200,14 @@ def plan_paged_readv_batch(
     No descriptors or validation results are reused across calls. An optional
     registration_ranges tuple carries ranges validated by the connector for
     this call, so the backend need not repeat platform-specific validation.
+    Optional buffer_refs are attached during construction, avoiding a second
+    plan allocation for an already registered pool. Raises ValueError if their
+    count differs from the number of target tensors.
     """
     if not chunks:
         return []
+    if buffer_refs is not None and len(buffer_refs) != len(tensors):
+        raise ValueError("readv reference count differs from tensor count")
     if (
         not tensors
         or io_unit <= 0
@@ -265,26 +272,59 @@ def plan_paged_readv_batch(
     # mapping. Transfer only the span used by this batch, not the whole KV pool.
     base = min(chunk[3] for chunk in chunks)
     limit = max(chunk[4] for chunk in chunks)
-    values = slots[base:limit].detach().cpu().tolist()
-    seen: set[int] = set()
+    slot_values = slots[base:limit].detach().cpu()
+    if slot_values.dtype == torch.int64:
+        # Validate only selected spans: gaps may belong to other requests.
+        # NumPy keeps 30K+ slot IDs in a compact CPU array instead of allocating
+        # a Python integer for every token and a range list for every block.
+        slot_array = slot_values.numpy()
+        rows = np.concatenate(
+            [
+                slot_array[start - base : end - base].reshape(-1, block_size)
+                for _, _, _, start, end in chunks
+            ],
+            axis=0,
+        )
+        first_slots = rows[:, 0]
+        if (
+            np.any(first_slots < 0)
+            or np.any(first_slots % block_size)
+            or np.any(first_slots // block_size >= blocks)
+            or not np.all(
+                rows == first_slots[:, None] + np.arange(block_size, dtype=np.int64)
+            )
+        ):
+            return None
+        all_block_ids = (first_slots // block_size).tolist()
+        if len(set(all_block_ids)) != len(all_block_ids):
+            return None
+    else:
+        # Preserve the generic planner's existing behavior for other dtypes.
+        slot_list = slot_values.tolist()
+        seen: set[int] = set()
+        all_block_ids = []
+        for _, _, _, start, end in chunks:
+            for i in range(start - base, end - base, block_size):
+                slot = slot_list[i]
+                if not isinstance(slot, int) or slot < 0 or slot % block_size:
+                    return None
+                block = slot // block_size
+                if (
+                    block >= blocks
+                    or block in seen
+                    or slot_list[i : i + block_size]
+                    != list(range(slot, slot + block_size))
+                ):
+                    return None
+                seen.add(block)
+                all_block_ids.append(block)
     owned_tensors = tuple(tensors)
     plans = []
+    cursor = 0
     for shapes, _, _, start, end in chunks:
-        block_ids = []
-        for i in range(start - base, end - base, block_size):
-            slot = values[i]
-            if not isinstance(slot, int) or slot < 0 or slot % block_size:
-                return None
-            block = slot // block_size
-            if (
-                block >= blocks
-                or block in seen
-                or values[i : i + block_size] != list(range(slot, slot + block_size))
-            ):
-                return None
-            seen.add(block)
-            block_ids.append(block)
-        ids = tuple(block_ids)
+        count = (end - start) // block_size
+        ids = tuple(all_block_ids[cursor : cursor + count])
+        cursor += count
         plans.append(
             XDSReadvPlan(
                 owned_tensors,
@@ -292,6 +332,7 @@ def plan_paged_readv_batch(
                 shapes[0].numel() * element_size,
                 ids,
                 registration_ranges,
+                buffer_refs,
             )
         )
     return plans
