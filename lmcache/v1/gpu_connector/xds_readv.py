@@ -5,6 +5,7 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
+from math import gcd
 from typing import Any, Optional
 import ctypes
 
@@ -179,42 +180,40 @@ class XDSReadvPlan:
         return [(refs[i], offset, length) for i, offset, length in self.slices]
 
 
-def plan_paged_readv_batch(
-    tensors: list[torch.Tensor],
-    chunks: Sequence[
-        tuple[list[torch.Size], list[torch.dtype], MemoryFormat, int, int]
-    ],
-    slots: torch.Tensor,
-    io_unit: int,
-    layout: str,
-    device_type: str = "cuda",
-    registration_ranges: Optional[tuple[tuple[int, int], ...]] = None,
-    buffer_refs: Optional[tuple[int, ...]] = None,
-) -> Optional[list[XDSReadvPlan]]:
-    """Validate a whole restore before DMA, sharing target-pool validation.
+@dataclass(frozen=True)
+class XDSPagedKVGeometry:
+    """Validated immutable layout for a fixed, owned KV pool.
 
-    Each chunk supplies shapes, dtypes, format, start and end token positions.
-    Return lazy plans in chunk order, or None for unsupported layouts, invalid
-    metadata, unaligned spans or overlapping target blocks, including overlap
-    across chunks. The caller owns tensors and slot assignments until completion.
-    No descriptors or validation results are reused across calls. An optional
-    registration_ranges tuple carries ranges validated by the connector for
-    this call, so the backend need not repeat platform-specific validation.
-    Optional buffer_refs are attached during construction, avoiding a second
-    plan allocation for an already registered pool. Raises ValueError if their
-    count differs from the number of target tensors.
+    Tensor storage, shapes and strides must remain unchanged until the pool is
+    unregistered. Request-specific slots and block ownership are never cached.
     """
-    if not chunks:
-        return []
-    if buffer_refs is not None and len(buffer_refs) != len(tensors):
-        raise ValueError("readv reference count differs from tensor count")
-    if (
-        not tensors
-        or io_unit <= 0
-        or slots.ndim != 1
-        or layout not in ("2NB", "NB2", "SEPARATE")
-        or device_type not in ("cuda", "npu")
-    ):
+
+    tensors: tuple[torch.Tensor, ...]
+    layout: str
+    device_type: str
+    dtype: torch.dtype
+    layers: int
+    blocks: int
+    block_size: int
+    hidden_size: int
+    block_bytes: int
+    token_bytes: int
+    address_alignment: int
+
+
+def validate_paged_readv_pool(
+    tensors: Sequence[torch.Tensor], layout: str, device_type: str = "cuda"
+) -> Optional[XDSPagedKVGeometry]:
+    """Validate a fixed pool once before registration.
+
+    Return None for unsupported, noncontiguous, overlapping or mixed layouts.
+    A successful result owns the tensors and can be reused while the caller
+    guarantees that their storage and geometry remain fixed. I/O alignment and
+    all request-specific slot checks are still applied by the batch planner.
+    """
+    if not tensors or layout not in ("2NB", "NB2", "SEPARATE"):
+        return None
+    if device_type not in ("cuda", "npu"):
         return None
     separate = layout == "SEPARATE"
     if separate and len(tensors) % 2:
@@ -243,29 +242,101 @@ def plan_paged_readv_batch(
         return None
     element_size = first.element_size()
     block_bytes = block_size * heads * head_size * element_size
-    if block_bytes % io_unit:
-        return None
     spans = sorted(
         (t.data_ptr(), t.data_ptr() + t.numel() * element_size) for t in tensors
     )
-    registration_alignment = max(io_unit, 4096) if device_type == "npu" else io_unit
-    if any(
-        a % registration_alignment or (b - a) % registration_alignment for a, b in spans
-    ):
-        return None
     if any(b > c for (_, b), (c, _) in zip(spans, spans[1:], strict=False)):
         return None
+    alignment = 0
+    for begin, end in spans:
+        alignment = gcd(alignment, begin, end - begin)
+    return XDSPagedKVGeometry(
+        tuple(tensors),
+        layout,
+        device_type,
+        first.dtype,
+        layers,
+        blocks,
+        block_size,
+        heads * head_size,
+        block_bytes,
+        2 * layers * heads * head_size * element_size,
+        alignment,
+    )
+
+
+def plan_paged_readv_batch(
+    tensors: Sequence[torch.Tensor],
+    chunks: Sequence[
+        tuple[list[torch.Size], list[torch.dtype], MemoryFormat, int, int]
+    ],
+    slots: torch.Tensor,
+    io_unit: int,
+    layout: str,
+    device_type: str = "cuda",
+    registration_ranges: Optional[tuple[tuple[int, int], ...]] = None,
+    buffer_refs: Optional[tuple[int, ...]] = None,
+    geometry: Optional[XDSPagedKVGeometry] = None,
+) -> Optional[list[XDSReadvPlan]]:
+    """Validate a whole restore before DMA, sharing target-pool validation.
+
+    Each chunk supplies shapes, dtypes, format, start and end token positions.
+    Return lazy plans in chunk order, or None for unsupported layouts, invalid
+    metadata, unaligned spans or overlapping target blocks, including overlap
+    across chunks. The caller owns tensors and slot assignments until completion.
+    Request-specific slots and ownership are freshly validated. Optional
+    geometry caches the fixed pool layout validated before registration. An optional
+    registration_ranges tuple carries ranges validated by the connector for
+    this call, so the backend need not repeat platform-specific validation.
+    Optional buffer_refs are attached during construction, avoiding a second
+    plan allocation for an already registered pool. Raises ValueError if their
+    count differs from the number of target tensors, or if supplied geometry
+    belongs to a different pool or layout.
+    """
+    if not chunks:
+        return []
+    if buffer_refs is not None and len(buffer_refs) != len(tensors):
+        raise ValueError("readv reference count differs from tensor count")
+    if (
+        not tensors
+        or io_unit <= 0
+        or slots.ndim != 1
+        or layout not in ("2NB", "NB2", "SEPARATE")
+        or device_type not in ("cuda", "npu")
+    ):
+        return None
+    if geometry is None:
+        geometry = validate_paged_readv_pool(tensors, layout, device_type)
+        if geometry is None:
+            return None
+    elif (
+        geometry.tensors is not tensors
+        or geometry.layout != layout
+        or geometry.device_type != device_type
+    ):
+        raise ValueError("readv geometry does not belong to the target pool")
+    registration_alignment = max(io_unit, 4096) if device_type == "npu" else io_unit
+    if (
+        geometry.block_bytes % io_unit
+        or geometry.address_alignment % registration_alignment
+    ):
+        return None
+    layers = geometry.layers
+    blocks = geometry.blocks
+    block_size = geometry.block_size
+    block_bytes = geometry.block_bytes
+    slot_count = slots.numel()
     for shapes, dtypes, fmt, start, end in chunks:
         if (
             fmt != MemoryFormat.KV_2LTD
             or len(shapes) != 1
             or len(dtypes) != 1
-            or dtypes[0] != first.dtype
+            or dtypes[0] != geometry.dtype
             or start < 0
             or end <= start
-            or end > slots.numel()
+            or end > slot_count
             or (end - start) % block_size
-            or tuple(shapes[0]) != (2, layers, end - start, heads * head_size)
+            or tuple(shapes[0]) != (2, layers, end - start, geometry.hidden_size)
         ):
             return None
     # One device-to-host synchronization, if the caller did not provide the CPU
@@ -318,7 +389,7 @@ def plan_paged_readv_batch(
                     return None
                 seen.add(block)
                 all_block_ids.append(block)
-    owned_tensors = tuple(tensors)
+    owned_tensors = geometry.tensors
     plans = []
     cursor = 0
     for shapes, _, _, start, end in chunks:
@@ -329,7 +400,7 @@ def plan_paged_readv_batch(
             XDSReadvPlan(
                 owned_tensors,
                 _PagedSlices(layers, blocks, block_bytes, ids, layout),
-                shapes[0].numel() * element_size,
+                (end - start) * geometry.token_bytes,
                 ids,
                 registration_ranges,
                 buffer_refs,

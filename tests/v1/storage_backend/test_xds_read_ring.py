@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from threading import Thread
 import queue
 
+# Third Party
+import pytest
+
 # First Party
 from lmcache.v1.storage_backend.xds_read_ring import XDSReadRingPump
 
@@ -259,3 +262,112 @@ def test_batch_respects_sdk_maximum_with_large_queue_depth():
     assert not worker.is_alive()
     assert sizes == [64, 64, 2]
     assert [pump.get_completion().item for _ in range(130)] == list(range(130))
+
+
+@pytest.mark.parametrize("depth", [1, 4])
+@pytest.mark.parametrize("batched", [False, True])
+def test_synchronous_items_preserve_depth_and_completion_mapping(
+    depth: int, batched: bool
+) -> None:
+    client = FakeClient(completion_order=[2, 1] if depth > 1 else None)
+    pump = XDSReadRingPump(
+        depth,
+        client.submit,
+        client.wait_any_result,
+        1.0,
+        submit_batch=(lambda items: [client.submit(x) for x in items])
+        if batched
+        else None,
+    )
+    results = pump.run_items(list(range(9)))
+    assert sorted(r.item for r in results) == list(range(9))
+    assert all(r.error is None and r.safe_to_reuse for r in results)
+    assert client.peak_inflight == depth and not client.pending
+    assert pump.error is None
+    with pytest.raises(RuntimeError, match="closed"):
+        pump.put("late")
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_synchronous_timeout_retains_only_submitted_targets(batched: bool) -> None:
+    client = FailingWaitClient()
+    pump = XDSReadRingPump(
+        2,
+        client.submit,
+        client.wait_any_result,
+        1.0,
+        submit_batch=(lambda items: [client.submit(x) for x in items])
+        if batched
+        else None,
+    )
+    results = pump.run_items(["a", "b", "queued"])
+    assert {r.item: r.safe_to_reuse for r in results} == {
+        "a": False,
+        "b": False,
+        "queued": True,
+    }
+    assert isinstance(pump.error, TimeoutError)
+    assert not pump.is_safe_to_reuse("a") and not pump.is_safe_to_reuse("b")
+    assert pump.unsafe_request_id("a") == 1 and pump.unsafe_request_id("b") == 2
+
+
+def test_synchronous_submit_error_drains_accepted_requests() -> None:
+    client = FakeClient()
+
+    def submit(item: str) -> int:
+        if item == "bad":
+            raise OSError("submit failed")
+        return client.submit(item)
+
+    pump = XDSReadRingPump(2, submit, client.wait_any_result, 1.0)
+    results = pump.run_items(["accepted", "bad", "queued"])
+    assert not client.pending and isinstance(pump.error, OSError)
+    assert results[0].item == "accepted" and results[0].error is None
+    assert all(r.safe_to_reuse for r in results)
+    assert {r.item for r in results[1:]} == {"bad", "queued"}
+
+
+def test_synchronous_unknown_completion_preserves_terminal_error() -> None:
+    client = FakeClient(completion_order=[999, 2, 1])
+    pump = XDSReadRingPump(2, client.submit, client.wait_any_result, 1.0)
+    results = pump.run_items(["a", "b"])
+    assert not client.pending and "unknown completion" in str(pump.error)
+    assert {r.item for r in results if r.item is not None} == {"a", "b"}
+    assert any(r.item is None and r.error is pump.error for r in results)
+
+
+def test_synchronous_batch_exception_retains_unknown_dma_targets() -> None:
+    client = FakeClient()
+
+    def submit_batch(items: list[str]) -> list[int]:
+        client.submit(items[0])
+        raise MemoryError("unknown submitted IDs")
+
+    pump = XDSReadRingPump(
+        2, client.submit, client.wait_any_result, 1.0, submit_batch=submit_batch
+    )
+    results = pump.run_items(["maybe-live", "unknown", "queued"])
+    assert {r.item: r.safe_to_reuse for r in results} == {
+        "maybe-live": False,
+        "unknown": False,
+        "queued": True,
+    }
+    assert isinstance(pump.error, MemoryError)
+
+
+def test_synchronous_input_rejects_mixed_modes_without_losing_queued_item() -> None:
+    client = FakeClient()
+    pump = XDSReadRingPump(1, client.submit, client.wait_any_result, 1.0)
+    pump.put("original")
+    with pytest.raises(RuntimeError, match="fresh"):
+        pump.run_items(["new"])
+    pump.close_input()
+    pump.run()
+    assert pump.get_completion().item == "original"
+
+
+def test_synchronous_empty_input_completes_without_submissions() -> None:
+    client = FakeClient()
+    pump = XDSReadRingPump(1, client.submit, client.wait_any_result, 1.0)
+    assert pump.run_items([]) == [] and pump.error is None
+    assert not client.pending

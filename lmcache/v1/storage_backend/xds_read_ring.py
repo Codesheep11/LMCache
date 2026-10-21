@@ -2,6 +2,7 @@
 """Bounded request pump for xDS read completions."""
 
 # Standard
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 import queue
@@ -43,6 +44,8 @@ class XDSReadRingPump:
         self._completions: queue.Queue[ReadRingCompletion] = queue.Queue()
         self._state_lock = threading.Lock()
         self._input_closed = False
+        self._ready_items: Optional[Iterator[Any]] = None
+        self._ready_completions: Optional[list[ReadRingCompletion]] = None
         self._failed = threading.Event()
         self._terminal_error: Optional[BaseException] = None
         self._unsafe_item_ids: set[int] = set()
@@ -80,6 +83,34 @@ class XDSReadRingPump:
         with self._state_lock:
             return self._unsafe_request_ids.get(id(item))
 
+    def run_items(self, items: Sequence[Any]) -> list[ReadRingCompletion]:
+        """Run a complete input sequence synchronously without queue handoffs.
+
+        The pump must be fresh, with no queued or closed input. The rolling
+        queue-depth limit, error draining and unsafe-target tracking are the
+        same as run(). Results are returned directly instead of being placed
+        on the completion queue. Terminal errors may have item=None; callers
+        must also inspect error. Raises RuntimeError for mixed input modes.
+        """
+        ready = (*items, self._SENTINEL)
+        results: list[ReadRingCompletion] = []
+        with self._state_lock:
+            if (
+                self._input_closed
+                or self._failed.is_set()
+                or not self._submissions.empty()
+            ):
+                raise RuntimeError("synchronous xDS input requires a fresh read ring")
+            self._input_closed = True
+            self._ready_items = iter(ready)
+            self._ready_completions = results
+        try:
+            self.run()
+        finally:
+            self._ready_items = None
+            self._ready_completions = None
+        return results
+
     def run(self) -> None:
         """Run the rolling single path, or bounded groups for a batch submitter.
 
@@ -100,7 +131,7 @@ class XDSReadRingPump:
             if first_error is None and not input_drained:
                 while len(pending) < self._queue_depth:
                     try:
-                        item = self._submissions.get(block=not pending)
+                        item = self._take_submission(block=not pending)
                     except queue.Empty:
                         break
                     if item is self._SENTINEL:
@@ -159,7 +190,7 @@ class XDSReadRingPump:
                         )
                         self._failed.set()
                     continue
-                self._completions.put(
+                self._publish_completion(
                     ReadRingCompletion(item=item, completion=completion)
                 )
                 continue
@@ -167,19 +198,19 @@ class XDSReadRingPump:
             if first_error is not None:
                 while True:
                     try:
-                        item = self._submissions.get_nowait()
+                        item = self._take_submission(block=False)
                     except queue.Empty:
                         break
                     if item is not self._SENTINEL:
                         failed_items.append((item, True))
                 self._terminal_error = first_error
                 if not failed_items:
-                    self._completions.put(
+                    self._publish_completion(
                         ReadRingCompletion(item=None, error=first_error)
                     )
                 else:
                     for item, safe_to_reuse in failed_items:
-                        self._completions.put(
+                        self._publish_completion(
                             ReadRingCompletion(
                                 item=item,
                                 error=first_error,
@@ -221,7 +252,7 @@ class XDSReadRingPump:
                     capacity = min(capacity, 1)
                 while len(batch) < capacity:
                     try:
-                        item = self._submissions.get(block=not pending and not batch)
+                        item = self._take_submission(block=not pending and not batch)
                     except queue.Empty:
                         break
                     if item is self._SENTINEL:
@@ -278,7 +309,7 @@ class XDSReadRingPump:
                 and not input_drained
                 and len(pending) < min(64, self._queue_depth)
             ):
-                if not self._submissions.empty():
+                if self._ready_items is not None or not self._submissions.empty():
                     continue
 
             if pending:
@@ -310,7 +341,7 @@ class XDSReadRingPump:
                             )
                             self._failed.set()
                         continue
-                    self._completions.put(
+                    self._publish_completion(
                         ReadRingCompletion(item=item, completion=completion)
                     )
                 continue
@@ -318,19 +349,19 @@ class XDSReadRingPump:
             if first_error is not None:
                 while True:
                     try:
-                        item = self._submissions.get_nowait()
+                        item = self._take_submission(block=False)
                     except queue.Empty:
                         break
                     if item is not self._SENTINEL:
                         failed_items.append((item, True))
                 self._terminal_error = first_error
                 if not failed_items:
-                    self._completions.put(
+                    self._publish_completion(
                         ReadRingCompletion(item=None, error=first_error)
                     )
                 else:
                     for item, safe_to_reuse in failed_items:
-                        self._completions.put(
+                        self._publish_completion(
                             ReadRingCompletion(
                                 item=item,
                                 error=first_error,
@@ -340,3 +371,17 @@ class XDSReadRingPump:
                 return
             if input_drained:
                 return
+
+    def _take_submission(self, block: bool) -> Any:
+        if self._ready_items is None:
+            return self._submissions.get(block=block)
+        try:
+            return next(self._ready_items)
+        except StopIteration:
+            raise queue.Empty from None
+
+    def _publish_completion(self, completion: ReadRingCompletion) -> None:
+        if self._ready_completions is None:
+            self._completions.put(completion)
+        else:
+            self._ready_completions.append(completion)

@@ -3271,16 +3271,15 @@ class XDSBackend(AllocatorBackendInterface):
                     self.client.wait_any_result,
                     30.0,
                 )
-                for item in items:
-                    pump.put(item)
-                pump.close_input()
                 begin = time.perf_counter()
-                pump.run()
+                outcomes = pump.run_items(items)
                 completed = [False] * len(keys)
                 completed_bytes = 0
                 error = pump.error
-                for _ in items:
-                    outcome = pump.get_completion()
+                for outcome in outcomes:
+                    if outcome.item is None:
+                        error = error or outcome.error
+                        continue
                     index, entry, plan = outcome.item
                     if not outcome.safe_to_reuse:
                         unsafe[id(entry)] = unsafe.get(id(entry), 0) + 1
