@@ -323,7 +323,7 @@ def test_native_plan_submission_preserves_byte_mapping(
             assert len(requests) == 2
             for handle, offset, native in requests:
                 assert (handle, offset) == (17, 4096)
-                assert native.to_slices() == plan.bind_slices(refs)
+                assert pages(native.to_slices()) == pages(plan.bind_slices(refs))
             return [29, 30]
 
         client.submit_readv_plans = submit_batch
@@ -439,3 +439,59 @@ def test_cuda_dma_fence_waits_for_other_streams() -> None:
     assert done.query()
     connector.finish_xds_readv_dma(tensor.device)
     assert torch.all(tensor == 7)
+
+
+def test_cuda_registered_geometry_rejects_in_place_metadata_changes() -> None:
+    """A retained tensor object must not bypass registration validation."""
+    from lmcache.v1.gpu_connector.gpu_connectors import VLLMPagedMemGPUConnectorV2
+
+    tensor = torch.empty((2, 8, 16, 2, 128), dtype=torch.float16, device="cuda")
+    connector = VLLMPagedMemGPUConnectorV2(hidden_dim_size=256, num_layers=1)
+    pool = connector.initialize_xds_readv_pool([tensor])
+    assert pool.geometry is not None
+    tensor.transpose_(3, 4)
+    with pytest.raises(RuntimeError, match="replace"):
+        pool.validate_storage([tensor])
+
+
+def test_cuda_registered_geometry_is_reused_with_fresh_slot_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated restores reuse fixed geometry but still reject aliased slots."""
+    from lmcache.v1.gpu_connector import gpu_connectors
+    from lmcache.v1.gpu_connector import xds_readv
+
+    tensors = [torch.empty((2, 8, 16, 2, 128), dtype=torch.float16, device="cuda")]
+    connector = gpu_connectors.VLLMPagedMemGPUConnectorV2(256, 1)
+    pool = connector.initialize_xds_readv_pool(tensors)
+    pool.buffer_refs = (123,)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("fixed geometry must not be rediscovered per request")
+
+    monkeypatch.setattr(gpu_connectors, "discover_gpu_kv_format", unexpected)
+    monkeypatch.setattr(xds_readv, "validate_paged_readv_pool", unexpected)
+    chunk = (
+        [torch.Size([2, 1, 32, 256])],
+        [torch.float16],
+        MemoryFormat.KV_2LTD,
+        0,
+        32,
+    )
+    plans = connector.plan_xds_readv_batch(
+        [chunk],
+        4096,
+        kvcaches=tensors,
+        slot_mapping_cpu=torch.arange(32),
+        xds_compact_batch=True,
+    )
+    assert plans is not None and plans.geometry is pool.geometry
+    assert (
+        connector.plan_xds_readv_batch(
+            [chunk],
+            4096,
+            kvcaches=tensors,
+            slot_mapping_cpu=torch.arange(16).repeat(2),
+        )
+        is None
+    )

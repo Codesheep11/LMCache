@@ -3,7 +3,7 @@
 
 # Standard
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from math import gcd
 from typing import Any, Optional
@@ -26,6 +26,24 @@ class XDSKVPool:
     owner: Any = None
     buffer_refs: Optional[tuple[int, ...]] = None
     closed: bool = False
+    geometry: Optional["XDSPagedKVGeometry"] = None
+    tensor_metadata: tuple = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.tensor_metadata = self.storage_metadata(self.tensors)
+
+    @staticmethod
+    def storage_metadata(tensors: Sequence[torch.Tensor]) -> tuple:
+        """Snapshot storage and geometry without reading device data."""
+        return tuple(
+            (t.data_ptr(), t.numel(), t.shape, t.stride(), t.dtype, t.device)
+            for t in tensors
+        )
+
+    def validate_storage(self, tensors: Sequence[torch.Tensor]) -> None:
+        """Reject replaced or mutated storage before reusing registered geometry."""
+        if self.closed or self.storage_metadata(tensors) != self.tensor_metadata:
+            raise RuntimeError("cannot replace or reuse a closed xDS KV pool")
 
 
 @dataclass(frozen=True)

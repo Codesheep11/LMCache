@@ -32,6 +32,7 @@ from lmcache.v1.gpu_connector.xds_readv import (
     cuda_readv_flush_function,
     finish_readv_dma,
     plan_paged_readv_batch,
+    validate_paged_readv_pool,
 )
 from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import (
@@ -589,34 +590,26 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         ranges = tuple((t.data_ptr(), t.numel() * t.element_size()) for t in tensors)
         if self.xds_kv_pool is not None:
             pool = self.xds_kv_pool
-            if (
-                pool.closed
-                or ranges != pool.registration_ranges
-                or any(
-                    t.shape != old.shape
-                    or t.stride() != old.stride()
-                    or t.dtype != old.dtype
-                    or t.device != old.device
-                    for t, old in zip(tensors, pool.tensors, strict=True)
-                )
-            ):
-                raise RuntimeError("cannot replace or reuse a closed xDS KV pool")
+            pool.validate_storage(tensors)
             return pool
         if not tensors or self.use_mla or tensors[0].ndim != 5:
             raise ValueError("unsupported CUDA xDS KV pool")
-        block_size = tensors[0].shape[2]
-        shape = torch.Size(
-            (2, len(tensors), block_size, tensors[0].shape[3] * tensors[0].shape[4])
+        fmt_gpu = discover_gpu_kv_format(
+            list(tensors), EngineType.VLLM, layout_hints=self.layout_hints
         )
-        plans = self.plan_xds_readv_batch(
-            [([shape], [tensors[0].dtype], MemoryFormat.KV_2LTD, 0, block_size)],
-            4096,
-            kvcaches=list(tensors),
-            slot_mapping_cpu=torch.arange(block_size),
-        )
-        if plans is None:
+        layout = {
+            lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS: "2NB",
+            lmc_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS: "NB2",
+        }.get(fmt_gpu)
+        geometry = validate_paged_readv_pool(tensors, layout) if layout else None
+        if (
+            geometry is None
+            or geometry.block_bytes % 4096
+            or geometry.address_alignment % 4096
+        ):
             raise ValueError("unaligned or unsupported CUDA xDS KV pool")
-        self.xds_kv_pool = XDSKVPool(tensors, ranges)
+        self.kvcaches = list(tensors)
+        self.xds_kv_pool = XDSKVPool(tensors, ranges, geometry=geometry)
         return self.xds_kv_pool
 
     def plan_xds_readv_batch(
@@ -646,6 +639,22 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         slots = kwargs.get("slot_mapping_cpu", kwargs.get("slot_mapping"))
         if not isinstance(slots, torch.Tensor):
             return None
+        pool = self.xds_kv_pool
+        if pool is not None:
+            pool.validate_storage(self.kvcaches)
+            if pool.geometry is None:
+                raise RuntimeError("CUDA xDS KV pool has no validated geometry")
+            return plan_paged_readv_batch(
+                pool.tensors,
+                chunks,
+                slots,
+                io_unit,
+                pool.geometry.layout,
+                geometry=pool.geometry,
+                compact=kwargs.get("xds_compact_batch", False),
+                registration_ranges=pool.registration_ranges,
+                buffer_refs=pool.buffer_refs,
+            )
         fmt_gpu = discover_gpu_kv_format(
             self.kvcaches, EngineType.VLLM, layout_hints=self.layout_hints
         )
@@ -656,9 +665,6 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         layout = layouts.get(fmt_gpu)
         if layout is None:
             return None
-        pool = self.xds_kv_pool
-        if pool is not None:
-            self.initialize_xds_readv_pool(self.kvcaches)
         return plan_paged_readv_batch(
             self.kvcaches,
             chunks,
@@ -666,8 +672,6 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             io_unit,
             layout,
             compact=kwargs.get("xds_compact_batch", False),
-            registration_ranges=pool.registration_ranges if pool else None,
-            buffer_refs=pool.buffer_refs if pool else None,
         )
 
     def get_shape(self, num_tokens: int) -> torch.Size:
