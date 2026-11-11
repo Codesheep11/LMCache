@@ -5,6 +5,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import Any, Callable, Protocol, cast
+import importlib
 import os
 import threading
 
@@ -216,6 +217,16 @@ class TransferContext(ABC):
         self._registration_request_sent = False
         self._closed = False
         self._lifecycle_lock = threading.Lock()
+
+    def recover_registration(self) -> bool:
+        """Recover metadata while retaining device resources when supported.
+
+        Returns:
+            True when recovery completed in place. False requests the adapter's
+            existing context reconstruction path. Overrides must serialize
+            against transfers and shutdown and reject uncertain DMA completion.
+        """
+        return False
 
     def _submit_registration(
         self, submit: Callable[[], MessagingFuture[Any]]
@@ -1022,6 +1033,11 @@ def create_transfer_context(
     instance_id: int,
     req_client: RequestClient,
     mode: "str | MPTransferMode | None" = None,
+    worker_id: int = 0,
+    reader_id: int | None = None,
+    io_world_size: int | None = None,
+    num_readers: int = 1,
+    writer: bool = True,
     **_kwargs: Any,
 ) -> TransferContext:
     """Create a transfer context from KV cache device type.
@@ -1040,6 +1056,11 @@ def create_transfer_context(
         mode: Optional routing override. When ``None`` the value of
             ``LMCACHE_MP_TRANSFER_MODE`` is consulted, defaulting to
             :attr:`MPTransferMode.AUTO` (the device-declared default).
+        worker_id: Logical KV shard rank used by xDS metadata.
+        reader_id: Physical reader rank for xDS; defaults to the logical rank.
+        io_world_size: Physical xDS connection count; defaults to KV world size.
+        num_readers: Physical readers per logical KV shard for xDS.
+        writer: Whether this xDS worker owns the shard's SSD capacity.
         **kwargs: Unused placeholder for forward-compatible factory extension.
 
     Returns:
@@ -1071,6 +1092,37 @@ def create_transfer_context(
         device_type,
         resolved_mode.value,
     )
+    if resolved_mode is MPTransferMode.XDS_WORKER:
+        modules = {
+            "npu": "lmcache_ascend.v1.xds_transfer",
+            "cuda": "lmcache.v1.multiprocess.xds_transfer",
+        }
+        if device_type not in modules:
+            raise ValueError("xds_worker requires CUDA or Ascend KV pools")
+        module = importlib.import_module(modules[device_type])
+        replica_groups = None
+        if (
+            num_readers > 1
+            and os.environ.get("LMCACHE_XDS_MLA_READ_MODE", "leader") == "leader"
+        ):
+            # Third Party
+            from vllm.distributed import get_tp_group
+
+            # First Party
+            from lmcache.v1.multiprocess.xds_replica import ReplicaGroups
+
+            tp_group = get_tp_group()
+            replica_groups = ReplicaGroups(tp_group.device_group, tp_group.cpu_group)
+        return module.XDSWorkerTransferContext(
+            instance_id,
+            req_client,
+            worker_id,
+            reader_id=reader_id,
+            io_world_size=io_world_size,
+            num_readers=num_readers,
+            writer=writer,
+            replica_groups=replica_groups,
+        )
     if resolved_mode is MPTransferMode.LMCACHE_DRIVEN:
         return _build_lmcache_driven_context(device_type, instance_id, req_client)
     return _build_engine_driven_context(instance_id, req_client)

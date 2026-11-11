@@ -2,12 +2,12 @@
 """Mooncake Transfer Engine implementation of the transfer channel abstraction."""
 
 # Standard
-from typing import Union
+from typing import TYPE_CHECKING, Union
+import importlib
 import os
 import threading
 
 # Third Party
-from mooncake.engine import TransferEngine
 import msgspec
 import zmq
 
@@ -27,6 +27,10 @@ from lmcache.v1.distributed.transfer_channel.factory import (
     register_transfer_channel_factory,
 )
 from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
+
+if TYPE_CHECKING:
+    # Third Party
+    from mooncake.engine import TransferEngine
 
 logger = init_logger(__name__)
 
@@ -322,7 +326,10 @@ class MooncakeTeTransferChannelContext(TransferChannelContext):
         self._advertise_host = host
         host, port = _parse_url(listen_url)
         self._listen_host = host
-        self._mooncake_te_engine = TransferEngine()
+        # Native transport loading can initialize the accelerator runtime. Keep
+        # it out of metadata-only imports, before the worker selects its device.
+        engine_module = importlib.import_module("mooncake.engine")
+        self._mooncake_te_engine = engine_module.TransferEngine()
         self._protocol, self._device_id = collect_env_var()
         ret = self._mooncake_te_engine.initialize(
             self._listen_host,
@@ -369,7 +376,7 @@ class MooncakeTeTransferChannelContext(TransferChannelContext):
         return self._l1_memory_desc
 
     @property
-    def mooncake_te_engine(self) -> TransferEngine:
+    def mooncake_te_engine(self) -> "TransferEngine":
         """Return the Mooncake Transfer Engine owned by this context."""
         return self._mooncake_te_engine
 

@@ -18,6 +18,19 @@ pulls data from a remote; it never pushes).
 The abstraction is transport-agnostic; the only implementation today is
 [`nixl`](#nixl-implementation) (RDMA/UCX via the NIXL bindings).
 
+## Native backend loading
+
+Factory discovery must not initialize native transfer engines. The Mooncake
+package is detected with `find_spec`, and `mooncake.engine` is loaded only when
+constructing `MooncakeTeTransferChannelContext`, matching NIXL's deferred native
+loading. Importing metadata types or the MP request client therefore does not
+initialize a transport that the application has not selected.
+
+This matters on Ascend: the tested CANN 9.1 image's Mooncake binding reproduces a
+runtime-destructor heap error when imported before device initialization, even
+without any transfers. Deferring an unused binding fixes the xDS MP import path;
+it does not claim to repair Mooncake's own runtime compatibility.
+
 ## Architecture Overview
 
 ```

@@ -55,6 +55,8 @@ from lmcache.v1.multiprocess.transfer_context import (
 )
 from lmcache.v1.multiprocess.transport.base import RequestClient
 from lmcache.v1.multiprocess.transport.factory import RequestClientFactory
+from lmcache.v1.multiprocess.xds_client import xds_rpc
+from lmcache.v1.multiprocess.xds_protocol import SchedulerLookup
 from lmcache.v1.periodic_thread import PeriodicThread, ThreadLevel, ThreadRunSummary
 from lmcache.v1.platform.ipc_policy import set_ipc_policy
 
@@ -714,6 +716,14 @@ class LMCacheMPSchedulerAdapter:
         )
         assert len(server_urls) >= 1, "At least one server url required"
         self._server_urls: list[str] = list(server_urls)
+        configured_mode = (extra_config or {}).get(
+            _EXTRA_CONFIG_KEY_PREFIX + "mp_transfer_mode",
+            os.environ.get("LMCACHE_MP_TRANSFER_MODE", "auto"),
+        )
+        self._xds_worker = configured_mode == "xds_worker"
+        # Negative epochs distinguish scheduler heartbeats from worker IDs.
+        self._xds_scheduler_id = -(uuid.uuid4().int & ((1 << 63) - 1)) - 1
+        self._xds_lookup_futures: dict[str, dict[str, MessagingFuture[int]]] = {}
         self.req_clients: dict[str, RequestClient] = {
             url: RequestClientFactory.create(url, context=context)
             for url in self._server_urls
@@ -837,6 +847,7 @@ class LMCacheMPSchedulerAdapter:
                     req_client=client,
                     health_event=self._health_events[url],
                     interval=self._heartbeat_interval,
+                    instance_id=self._xds_scheduler_id if self._xds_worker else None,
                 )
                 hb.start()
                 heartbeats[url] = hb
@@ -903,9 +914,21 @@ class LMCacheMPSchedulerAdapter:
         ).no_worker_id_version()
 
         futures: dict[str, MessagingFuture[None]] = {
-            url: self.req_clients[url].lookup(key, self.tp_size)
+            url: (
+                xds_rpc(
+                    self.req_clients[url],
+                    "lookup_owned_tokens",
+                    SchedulerLookup(self._xds_scheduler_id, key),
+                    int,
+                )
+                if self._xds_worker
+                else self.req_clients[url].lookup(key, self.tp_size)
+            )
             for url in self._server_urls
         }
+
+        if self._xds_worker:
+            self._xds_lookup_futures[request_id] = futures
 
         # Do not wait for the acknowledgement here: that is a full server
         # round trip on the scheduler thread. check_lookup_result resolves
@@ -952,7 +975,12 @@ class LMCacheMPSchedulerAdapter:
                     cache_salt=cs or "",
                     request_configs=request_configs,
                 ).no_worker_id_version()
-                self.req_clients[url].free_lookup_locks(tail_key, self.tp_size)
+                if self._xds_worker:
+                    xds_rpc(
+                        self.req_clients[url], "release_tokens", tail_key, type(None)
+                    )
+                else:
+                    self.req_clients[url].free_lookup_locks(tail_key, self.tp_size)
 
     @_lmcache_nvtx_annotate
     def check_lookup_result(self, request_id: str) -> int | None:
@@ -1025,7 +1053,11 @@ class LMCacheMPSchedulerAdapter:
             # Keep the same future until its reply arrives; never restart a poll.
             if url not in futures:
                 futures[url] = (
-                    self.req_clients[url].query_prefetch_status(request_id),
+                    (
+                        self._xds_lookup_futures[request_id][url]
+                        if self._xds_worker
+                        else self.req_clients[url].query_prefetch_status(request_id)
+                    ),
                     time.monotonic(),
                 )
 
@@ -1089,6 +1121,7 @@ class LMCacheMPSchedulerAdapter:
         self._finished_lookup_results.pop(request_id, None)
         self._per_server_hits.pop(request_id, None)
         self._lookup_params.pop(request_id, None)
+        self._xds_lookup_futures.pop(request_id, None)
 
     def reset_cache(self) -> bool:
         """Ask every backing LMCache server to best-effort clear idle cache.
@@ -1106,7 +1139,11 @@ class LMCacheMPSchedulerAdapter:
         success = True
         for url in self._server_urls:
             try:
-                futures[url] = self.req_clients[url].clear(force=False)
+                futures[url] = (
+                    xds_rpc(self.req_clients[url], "clear_idle", None, int)
+                    if self._xds_worker
+                    else self.req_clients[url].clear(force=False)
+                )
             except Exception:
                 logger.warning("Failed to submit CLEAR to %s.", url, exc_info=True)
                 success = False
@@ -1181,7 +1218,10 @@ class LMCacheMPSchedulerAdapter:
             request_configs=request_configs,
         ).no_worker_id_version()
         for url in self._server_urls:
-            self.req_clients[url].free_lookup_locks(base_key, self.tp_size)
+            if self._xds_worker:
+                xds_rpc(self.req_clients[url], "release_tokens", base_key, type(None))
+            else:
+                self.req_clients[url].free_lookup_locks(base_key, self.tp_size)
 
     def end_session(self, request_id: str) -> None:
         """
@@ -1220,7 +1260,11 @@ class LMCacheMPSchedulerAdapter:
                 return
 
         for url in self._server_urls:
-            self.req_clients[url].end_session(request_id)
+            if self._xds_worker:
+                xds_rpc(self.req_clients[url], "cancel_lookup", request_id, type(None))
+            else:
+                self.req_clients[url].end_session(request_id)
+        self._xds_lookup_futures.pop(request_id, None)
 
     def report_block_allocations(
         self,
@@ -1655,6 +1699,11 @@ class LMCacheMPWorkerAdapter:
             instance_id=self.instance_id,
             req_client=self.req_client,
             mode=self._mp_transfer_mode,
+            worker_id=self.worker_id,
+            reader_id=self.parallel_strategy.vllm_worker_id,
+            io_world_size=self.parallel_strategy.vllm_world_size,
+            num_readers=self.parallel_strategy.num_kv_readers,
+            writer=self.parallel_strategy.is_kv_writer,
         )
         layout_hints = self._layout_hints
         self.transfer_ctx = transfer_ctx
@@ -1735,7 +1784,12 @@ class LMCacheMPWorkerAdapter:
             return False
 
         try:
-            self._send_register_kv_caches_request(self.kv_caches)
+            transfer_ctx = self.transfer_ctx
+            recovered = (
+                transfer_ctx is not None and transfer_ctx.recover_registration() is True
+            )
+            if not recovered:
+                self._send_register_kv_caches_request(self.kv_caches)
         except ConnectionError:
             logger.exception(
                 "Failed to re-register KV caches after server recovery; "

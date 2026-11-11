@@ -5,6 +5,7 @@ Overview
    :hidden:
 
    request_transport
+   xds_worker
    multi_l1
 
 LMCache multiprocess (MP) mode runs LMCache as a **standalone service** that

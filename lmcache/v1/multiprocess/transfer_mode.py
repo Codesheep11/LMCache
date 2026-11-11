@@ -25,6 +25,7 @@ class MPTransferMode(str, Enum):
       for the device.
     """
 
+    XDS_WORKER = "xds_worker"
     AUTO = "auto"
     ENGINE_DRIVEN = "engine_driven"
     LMCACHE_DRIVEN = "lmcache_driven"
