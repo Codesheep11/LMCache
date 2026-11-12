@@ -44,6 +44,12 @@ class CollectiveSimulator:
                 raise TimeoutError("Simulated control collective did not match")
             output[:] = [state[r] for r in range(self.ranks)]
 
+    def reduce(self, tensor: torch.Tensor, op: object, group: object) -> None:
+        values: list[object] = [None] * self.ranks
+        self.gather(values, tensor.item(), group)
+        assert op == replica.dist.ReduceOp.MAX
+        tensor.fill_(max(values))
+
     def broadcast(
         self, view: torch.Tensor, src: int, group: object, async_op: bool
     ) -> object:
@@ -80,6 +86,7 @@ class CollectiveSimulator:
         )
         monkeypatch.setattr(replica.dist, "all_gather_object", self.gather)
         monkeypatch.setattr(replica.dist, "broadcast", self.broadcast)
+        monkeypatch.setattr(replica.dist, "all_reduce", self.reduce)
 
 
 class FinalPlane:
@@ -323,3 +330,37 @@ def test_read_ahead_progresses_during_broadcast_and_joins_on_failure(
     if failure == "none":
         assert reads == list(range(6))
         assert torch.equal(planes[0][0].tensor, planes[1][0].tensor)
+
+
+@pytest.mark.parametrize("failures", [(), (0,), (3,), (1, 2)])
+def test_agreement_propagates_every_rank_failure(
+    monkeypatch: pytest.MonkeyPatch, failures: tuple[int, ...]
+) -> None:
+    """Every rank sees failures, including errors from a non-reader rank."""
+    sim = CollectiveSimulator(4, "nccl")
+    sim.install(monkeypatch)
+
+    def worker(rank: int) -> None:
+        sim.enter(rank)
+        transfer = replica.ReplicaBroadcast(
+            replica.ReplicaGroups("data", "cpu"),
+            (FinalPlane(4, "cuda"),),
+            rank == 0,
+            4,
+            lambda: None,
+        )
+        error = f"failure from rank {rank}" if rank in failures else None
+        if failures:
+            with pytest.raises(RuntimeError) as exc:
+                transfer.agree(error)
+            for failed_rank in failures:
+                assert f"failure from rank {failed_rank}" in str(exc.value)
+        else:
+            transfer.agree(error)
+        # A successful round after a failed round must not retain stale status.
+        transfer.agree(None)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(worker, rank) for rank in range(4)]
+        for future in futures:
+            future.result(timeout=20)

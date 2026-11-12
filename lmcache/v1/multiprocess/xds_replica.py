@@ -263,6 +263,13 @@ class ReplicaBroadcast:
         Raises:
             RuntimeError: Any replica reported a failure. No new broadcasts start.
         """
+        # Most batches succeed. Avoid pickling and exchanging variable-length
+        # Python objects on that path; retain full diagnostics on every rank
+        # when any preparation or SSD operation fails.
+        failed = torch.tensor([error is not None], dtype=torch.int32, device="cpu")
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=self.groups.control)
+        if not failed.item():
+            return
         statuses: list[str | None] = [None] * self.readers
         dist.all_gather_object(statuses, error, group=self.groups.control)
         if any(status is not None for status in statuses):
