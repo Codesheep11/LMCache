@@ -12,7 +12,10 @@ The experimental `xds_worker` mode now connects the vLLM scheduler's token
 lookup to the metadata extension and selects LMCache-Ascend's
 `XDSWorkerTransferContext`. Support includes dense NHD attention and MLA
 latent/RoPE plane pairs with one engine KV group. MLA uses one writer and explicit physical reader epochs for
-each logical KV rank. Hybrid/multi-group layouts are rejected. A chunk
+each logical KV rank. Multiple physical format groups are accepted only when
+they share engine group 0, identical token/block geometry and identical block
+maps on every transfer. Independent engine groups, recurrent state and
+sliding-window layouts are rejected. A chunk
 must fit one xDS blob. Four-card Qwen short-context restoration and four-card
 DeepSeek-V2-Lite 30K-token MLA restoration have passed NaN poisoning and exact
 KV-byte checks. General multi-request stress, APC-enabled inference and broader

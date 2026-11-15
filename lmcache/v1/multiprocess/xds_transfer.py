@@ -73,6 +73,7 @@ class XDSWorkerTransferContext(TransferContext):
         self._pool: KVPool | None = None
         self._blobs: list[int] = []
         self._timeout = 60.0
+        self._group_count = 1
         self._io_failed = False
         self._transfer_lock = RLock()
 
@@ -90,24 +91,26 @@ class XDSWorkerTransferContext(TransferContext):
         """Register owned NHD planes once and announce exact-size SSD extents.
 
         Dense NHD and MLA latent/RoPE planes share one block address space.
-        Hybrid, recurrent, and sliding-window groups raise ValueError.
+        Physical format groups may share one engine block address space.
+        Independent, recurrent, and sliding-window groups raise ValueError.
         """
         with self._transfer_lock:
             if self._pool is not None or self._is_closed():
                 raise RuntimeError("xDS worker is already registered or closed")
-            if len(engine_group_infos) > 1 or any(
-                g.recurrent_state or g.sw_size_tokens != -1 for g in engine_group_infos
+            if any(
+                g.engine_group_id != 0 or g.recurrent_state or g.sw_size_tokens != -1
+                for g in engine_group_infos
             ):
                 raise ValueError(
                     "xDS worker currently requires one dense attention group"
                 )
+            self._group_count = max(1, len(engine_group_infos))
             tensors = self.prepare_planes(kv_caches)
             self._tokens_per_block = tensors[0].shape[1]
             if any(t.shape[:2] != tensors[0].shape[:2] for t in tensors):
                 raise ValueError("KV planes must share block and token geometry")
-            if (
-                engine_group_infos
-                and engine_group_infos[0].tokens_per_block != self._tokens_per_block
+            if any(
+                g.tokens_per_block != self._tokens_per_block for g in engine_group_infos
             ):
                 raise ValueError(
                     "Physical NHD token dimension differs from engine block size"
@@ -537,7 +540,11 @@ class XDSWorkerTransferContext(TransferContext):
     ) -> list[list[int]]:
         if self._pool is None or self._is_closed() or self._io_failed:
             raise RuntimeError("xDS worker is not ready")
-        if len(block_ids) != 1 or blocks_in_chunk != self._blocks_in_chunk:
+        if (
+            len(block_ids) != self._group_count
+            or blocks_in_chunk != self._blocks_in_chunk
+            or any(ids != block_ids[0] for ids in block_ids[1:])
+        ):
             raise ValueError("Unexpected KV block group geometry")
         if (
             key.start < 0
